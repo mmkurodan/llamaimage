@@ -2,6 +2,7 @@
 
     <application
         android:label="llamaimage"
+        android:largeHeap="true"
         android:theme="@android:style/Theme.Material.Light">
 
         <activity

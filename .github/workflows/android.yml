@@ -40,6 +40,19 @@ jobs:
           gradle wrapper --gradle-version 8.7
           chmod +x ./gradlew
 
+      # ネイティブ層 (libsd_jni.so) のビルドに必要な NDK と CMake を導入する。
+      # build.gradle の ndkVersion と一致させ、AGP が確実に検出できるようにする。
+      - name: Install Android NDK & CMake
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      # 固定コミットの stable-diffusion.cpp + ggml を取得する (リポジトリには未コミット)。
+      # CMake configure 時にも自動取得されるが、明示ステップにして失敗を切り分けやすくする。
+      - name: Fetch stable-diffusion.cpp + ggml (pinned)
+        run: bash scripts/fetch-sdcpp.sh
+
       - name: Build Debug APK
         run: ./gradlew --no-daemon --console=plain assembleDebug
 

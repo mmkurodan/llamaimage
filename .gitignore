@@ -1,0 +1,18 @@
+# Native deps fetched at build time by scripts/fetch-sdcpp.sh (not committed)
+/app/src/main/cpp/sd/
+
+# Android / Gradle build outputs
+/.gradle/
+/build/
+/app/build/
+/app/.cxx/
+local.properties
+*.iml
+.idea/
+
+# Signing material restored in CI
+/app/keystore.jks
+
+# Local test/run artifacts
+/test_logs_*/
+/downloads/
