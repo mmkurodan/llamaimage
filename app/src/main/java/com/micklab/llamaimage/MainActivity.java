@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
@@ -28,12 +29,14 @@ import java.util.concurrent.Executors;
 /**
  * Minimal SD1.5 text2img PoC UI.
  *
- * Robustness notes (learned the hard way): the native library is arm64-v8a only, so on a
- * non-arm64 device/emulator {@code System.loadLibrary} fails. We therefore (1) wire all UI
- * listeners BEFORE touching native code so the screen is never dead, (2) initialise native
- * lazily on a worker thread wrapped in try/catch(Throwable) and surface any error on screen,
- * and (3) load the model straight from its content-URI file descriptor (no 1.5GB copy), with
- * a copy-to-internal-storage fallback.
+ * Layout: the model picker + status sit in a FIXED top header (never scrolled away); the
+ * prompt/params/result/log scroll below. The keyboard is kept closed on launch and the prompt
+ * EditText is not allowed to steal initial focus — otherwise the picker scrolls off-screen and
+ * the model can never be loaded (which is exactly what happened in the first builds).
+ *
+ * Robustness: the native lib is arm64-v8a only, so all native interaction is lazy, on a worker
+ * thread, wrapped in try/catch(Throwable), and surfaced on screen. The model is loaded straight
+ * from its content-URI file descriptor (no 1.5GB copy), with a copy-to-internal fallback.
  */
 public class MainActivity extends Activity {
 
@@ -46,6 +49,7 @@ public class MainActivity extends Activity {
     private volatile boolean nativeReady = false;
     private ParcelFileDescriptor modelPfd;       // kept open while a fd-backed model is loaded
 
+    private LinearLayout rootView;
     private TextView statusText;
     private TextView logText;
     private EditText promptEdit;
@@ -60,7 +64,12 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // Don't pop the soft keyboard on launch (it would scroll the picker out of view).
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+                | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+
         setContentView(buildUi());
+        rootView.requestFocus();   // keep focus off the prompt EditText so the keyboard stays closed
 
         // Wire listeners FIRST — the UI must stay responsive even if native init fails.
         pickButton.setOnClickListener(v -> pickModel());
@@ -81,9 +90,9 @@ public class MainActivity extends Activity {
             String info = m.systemInfo();
             manager = m;
             nativeReady = true;
+            runOnUiThread(() -> statusText.setText("準備完了 — 上の「モデル選択」を押してください"));
             appendLogUi("ネイティブ準備完了");
             appendLogUi(info);
-            runOnUiThread(() -> statusText.setText("準備完了 — モデルを選択してください"));
         } catch (Throwable t) {
             appendLogUi("ネイティブ初期化失敗: " + t);
             appendLogUi("この端末の ABI が arm64-v8a でない可能性があります（エミュレータ等）。");
@@ -91,29 +100,46 @@ public class MainActivity extends Activity {
         }
     }
 
-    // --- UI construction (no XML, mirrors the scaffold style) ---
+    // --- UI construction (no XML). Fixed header + scrollable body. ---
     private View buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(12);
-        root.setPadding(pad, pad, pad, pad);
+
+        rootView = new LinearLayout(this);
+        rootView.setOrientation(LinearLayout.VERTICAL);
+        rootView.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        // Let the container hold initial focus instead of the prompt EditText.
+        rootView.setFocusable(true);
+        rootView.setFocusableInTouchMode(true);
+
+        // --- fixed header: picker + status (always visible) ---
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setPadding(pad, pad, pad, pad);
 
         pickButton = new Button(this);
-        pickButton.setText("モデル選択 (.gguf を Download から)");
-        root.addView(pickButton);
+        pickButton.setText("① モデル選択 (.gguf を Download から)");
+        header.addView(pickButton);
 
         statusText = new TextView(this);
         statusText.setText("起動中…");
-        root.addView(statusText);
+        header.addView(statusText);
+
+        rootView.addView(header);
+
+        // --- scrollable body ---
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(pad, 0, pad, pad);
 
         promptEdit = new EditText(this);
         promptEdit.setHint("プロンプト");
         promptEdit.setText("a photo of a cat");
-        root.addView(promptEdit);
+        body.addView(promptEdit);
 
         negativeEdit = new EditText(this);
         negativeEdit.setHint("ネガティブプロンプト (任意)");
-        root.addView(negativeEdit);
+        body.addView(negativeEdit);
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -127,25 +153,29 @@ public class MainActivity extends Activity {
         sizeEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         row.addView(stepsEdit);
         row.addView(sizeEdit);
-        root.addView(row);
+        body.addView(row);
 
         generateButton = new Button(this);
-        generateButton.setText("生成");
-        root.addView(generateButton);
+        generateButton.setText("② 生成");
+        body.addView(generateButton);
 
         imageView = new ImageView(this);
         imageView.setAdjustViewBounds(true);
         imageView.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        root.addView(imageView);
+        body.addView(imageView);
 
         logText = new TextView(this);
         logText.setTextSize(11);
-        root.addView(logText);
+        body.addView(logText);
 
         ScrollView scroll = new ScrollView(this);
-        scroll.addView(root);
-        return scroll;
+        scroll.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        scroll.addView(body);
+        rootView.addView(scroll);
+
+        return rootView;
     }
 
     // --- model picking + load ---
@@ -232,7 +262,7 @@ public class MainActivity extends Activity {
     private void onModelLoaded() {
         appendLogUi("モデル読込成功");
         runOnUiThread(() -> {
-            statusText.setText("モデル読込済み — 生成できます");
+            statusText.setText("モデル読込済み — ②「生成」できます");
             setBusyUi(false);
         });
     }
@@ -279,7 +309,7 @@ public class MainActivity extends Activity {
     // --- generation ---
     private void generate() {
         if (manager == null || !manager.isModelLoaded()) {
-            Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "先に①でモデルを読み込んでください", Toast.LENGTH_SHORT).show();
             return;
         }
         final String prompt = promptEdit.getText().toString();
