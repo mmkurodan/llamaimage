@@ -1,8 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- We talk to the com.micklab.llama Ollama-compatible server (loopback) and may launch it. -->
+    <queries>
+        <package android:name="com.micklab.llama" />
+    </queries>
+
     <application
         android:label="llamaimage"
         android:largeHeap="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">
 
         <activity
