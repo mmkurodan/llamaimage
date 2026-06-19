@@ -6,6 +6,7 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.view.View;
 import android.view.ViewGroup;
@@ -27,9 +28,12 @@ import java.util.concurrent.Executors;
 /**
  * Minimal SD1.5 text2img PoC UI.
  *
- * Flow: pick the GGUF already sitting in the device Download folder via the Storage Access
- * Framework -> copy it once into app-private storage -> load it into the native engine ->
- * type a prompt -> generate -> show the resulting bitmap. CPU backend, single image.
+ * Robustness notes (learned the hard way): the native library is arm64-v8a only, so on a
+ * non-arm64 device/emulator {@code System.loadLibrary} fails. We therefore (1) wire all UI
+ * listeners BEFORE touching native code so the screen is never dead, (2) initialise native
+ * lazily on a worker thread wrapped in try/catch(Throwable) and surface any error on screen,
+ * and (3) load the model straight from its content-URI file descriptor (no 1.5GB copy), with
+ * a copy-to-internal-storage fallback.
  */
 public class MainActivity extends Activity {
 
@@ -37,7 +41,10 @@ public class MainActivity extends Activity {
     private static final String MODEL_FILENAME = "model.gguf";
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private SdModelManager manager;
+
+    private volatile SdModelManager manager;     // null until native init succeeds
+    private volatile boolean nativeReady = false;
+    private ParcelFileDescriptor modelPfd;       // kept open while a fd-backed model is loaded
 
     private TextView statusText;
     private TextView logText;
@@ -55,16 +62,33 @@ public class MainActivity extends Activity {
 
         setContentView(buildUi());
 
-        manager = SdModelManager.get();
-        manager.setLogPath(new File(getFilesDir(), "sd.log").getAbsolutePath());
-        manager.setProgressListener((step, steps) ->
-                runOnUiThread(() -> statusText.setText("生成中… step " + step + "/" + steps)));
-
-        appendLog(manager.systemInfo());
-        refreshButtons();
-
+        // Wire listeners FIRST — the UI must stay responsive even if native init fails.
         pickButton.setOnClickListener(v -> pickModel());
         generateButton.setOnClickListener(v -> generate());
+        generateButton.setEnabled(false);
+
+        statusText.setText("ネイティブ初期化中…");
+        worker.submit(this::initNative);
+    }
+
+    /** Load libsd_jni.so and query the engine. Any failure is shown, never crashes the app. */
+    private void initNative() {
+        try {
+            SdModelManager m = SdModelManager.get();   // triggers System.loadLibrary("sd_jni")
+            m.setLogPath(new File(getFilesDir(), "sd.log").getAbsolutePath());
+            m.setProgressListener((step, steps) ->
+                    runOnUiThread(() -> statusText.setText("生成中… step " + step + "/" + steps)));
+            String info = m.systemInfo();
+            manager = m;
+            nativeReady = true;
+            appendLogUi("ネイティブ準備完了");
+            appendLogUi(info);
+            runOnUiThread(() -> statusText.setText("準備完了 — モデルを選択してください"));
+        } catch (Throwable t) {
+            appendLogUi("ネイティブ初期化失敗: " + t);
+            appendLogUi("この端末の ABI が arm64-v8a でない可能性があります（エミュレータ等）。");
+            runOnUiThread(() -> statusText.setText("ネイティブ初期化失敗: " + t.getClass().getSimpleName()));
+        }
     }
 
     // --- UI construction (no XML, mirrors the scaffold style) ---
@@ -79,7 +103,7 @@ public class MainActivity extends Activity {
         root.addView(pickButton);
 
         statusText = new TextView(this);
-        statusText.setText("モデル未ロード");
+        statusText.setText("起動中…");
         root.addView(statusText);
 
         promptEdit = new EditText(this);
@@ -124,12 +148,22 @@ public class MainActivity extends Activity {
         return scroll;
     }
 
-    // --- model picking + copy + load ---
+    // --- model picking + load ---
     private void pickModel() {
+        if (!nativeReady) {
+            Toast.makeText(this, "ネイティブ初期化が完了していません（ログ参照）", Toast.LENGTH_SHORT).show();
+            return;
+        }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        // Best-effort: open the picker already in the Download folder (API 26+, ignored otherwise).
+        try {
+            intent.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,
+                    Uri.parse("content://com.android.externalstorage.documents/document/primary:Download"));
+        } catch (Throwable ignore) {
+        }
         startActivityForResult(intent, REQ_PICK_MODEL);
     }
 
@@ -145,37 +179,62 @@ public class MainActivity extends Activity {
         }
         setBusyUi(true);
         statusText.setText("モデルを準備中…");
-        worker.submit(() -> prepareAndLoad(uri));
+        worker.submit(() -> loadModel(uri));
     }
 
-    private void prepareAndLoad(Uri uri) {
+    private void loadModel(Uri uri) {
         try {
+            // Primary path: hand the engine the file descriptor directly via /proc/self/fd,
+            // so no 1.5GB copy and no app-storage space requirement.
+            ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r");
+            if (pfd != null) {
+                String fdPath = "/proc/self/fd/" + pfd.getFd();
+                appendLogUi("fd 経由で読込: " + fdPath);
+                String err = manager.load(fdPath, 0);
+                if (err.isEmpty()) {
+                    closePfd();
+                    modelPfd = pfd;   // keep open while loaded
+                    onModelLoaded();
+                    return;
+                }
+                appendLogUi("fd 経由の読込失敗: " + err + " → コピー方式にフォールバック");
+                pfd.close();
+            }
+
+            // Fallback: copy into app-private storage, then load from the real path.
             long srcSize = querySize(uri);
             File dest = new File(getFilesDir(), MODEL_FILENAME);
-
             if (dest.exists() && srcSize > 0 && dest.length() == srcSize) {
-                appendLogUi("既存のコピーを再利用: " + dest.getName() + " (" + srcSize + " bytes)");
+                appendLogUi("既存コピーを再利用: " + dest.getName());
             } else {
                 appendLogUi("コピー開始 (" + srcSize + " bytes)…");
                 copyUriToFile(uri, dest, srcSize);
-                appendLogUi("コピー完了: " + dest.getAbsolutePath());
             }
-
-            runOnUiThread(() -> statusText.setText("モデル読込中…"));
-            String err = manager.load(dest.getAbsolutePath(), 0 /* native picks physical cores */);
+            String err = manager.load(dest.getAbsolutePath(), 0);
             if (err.isEmpty()) {
-                appendLogUi("モデル読込成功");
-                runOnUiThread(() -> statusText.setText("モデル読込済み: " + dest.getName()));
+                onModelLoaded();
             } else {
                 appendLogUi("モデル読込失敗: " + err);
-                runOnUiThread(() -> statusText.setText("読込失敗: " + err));
+                runOnUiThread(() -> {
+                    statusText.setText("読込失敗: " + err);
+                    setBusyUi(false);
+                });
             }
-        } catch (Exception e) {
-            appendLogUi("エラー: " + e);
-            runOnUiThread(() -> statusText.setText("エラー: " + e.getMessage()));
-        } finally {
-            runOnUiThread(() -> setBusyUi(false));
+        } catch (Throwable t) {
+            appendLogUi("モデル準備エラー: " + t);
+            runOnUiThread(() -> {
+                statusText.setText("エラー: " + t.getClass().getSimpleName());
+                setBusyUi(false);
+            });
         }
+    }
+
+    private void onModelLoaded() {
+        appendLogUi("モデル読込成功");
+        runOnUiThread(() -> {
+            statusText.setText("モデル読込済み — 生成できます");
+            setBusyUi(false);
+        });
     }
 
     private long querySize(Uri uri) {
@@ -219,7 +278,7 @@ public class MainActivity extends Activity {
 
     // --- generation ---
     private void generate() {
-        if (!manager.isModelLoaded()) {
+        if (manager == null || !manager.isModelLoaded()) {
             Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -231,25 +290,33 @@ public class MainActivity extends Activity {
         setBusyUi(true);
         statusText.setText("生成中…");
         worker.submit(() -> {
-            long t0 = System.currentTimeMillis();
-            byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
-            long ms = System.currentTimeMillis() - t0;
-            if (rgb == null) {
-                appendLogUi("生成失敗");
+            try {
+                long t0 = System.currentTimeMillis();
+                byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
+                long ms = System.currentTimeMillis() - t0;
+                if (rgb == null) {
+                    appendLogUi("生成失敗");
+                    runOnUiThread(() -> {
+                        statusText.setText("生成失敗");
+                        setBusyUi(false);
+                    });
+                    return;
+                }
+                final Bitmap bmp = rgbToBitmap(rgb, size, size);
+                final long seed = manager.getLastSeed();
+                appendLogUi("生成完了 seed=" + seed + " " + ms + "ms");
                 runOnUiThread(() -> {
-                    statusText.setText("生成失敗");
+                    imageView.setImageBitmap(bmp);
+                    statusText.setText("完了 (seed=" + seed + ", " + ms + "ms)");
                     setBusyUi(false);
                 });
-                return;
+            } catch (Throwable t) {
+                appendLogUi("生成エラー: " + t);
+                runOnUiThread(() -> {
+                    statusText.setText("生成エラー: " + t.getClass().getSimpleName());
+                    setBusyUi(false);
+                });
             }
-            final Bitmap bmp = rgbToBitmap(rgb, size, size);
-            final long seed = manager.getLastSeed();
-            appendLogUi("生成完了 seed=" + seed + " " + ms + "ms");
-            runOnUiThread(() -> {
-                imageView.setImageBitmap(bmp);
-                statusText.setText("完了 (seed=" + seed + ", " + ms + "ms)");
-                setBusyUi(false);
-            });
         });
     }
 
@@ -266,12 +333,8 @@ public class MainActivity extends Activity {
 
     // --- helpers ---
     private void setBusyUi(boolean busy) {
-        pickButton.setEnabled(!busy);
-        generateButton.setEnabled(!busy && manager.isModelLoaded());
-    }
-
-    private void refreshButtons() {
-        setBusyUi(false);
+        pickButton.setEnabled(!busy && nativeReady);
+        generateButton.setEnabled(!busy && manager != null && manager.isModelLoaded());
     }
 
     private static int parseInt(String s, int def) {
@@ -294,6 +357,16 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> appendLog(msg));
     }
 
+    private void closePfd() {
+        if (modelPfd != null) {
+            try {
+                modelPfd.close();
+            } catch (Exception ignore) {
+            }
+            modelPfd = null;
+        }
+    }
+
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density);
     }
@@ -301,6 +374,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        closePfd();
         worker.shutdownNow();
     }
 }
