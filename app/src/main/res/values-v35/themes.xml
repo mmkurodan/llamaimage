@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 15 (API 35): opt out of forced edge-to-edge so content is not drawn under the
+         status bar / ActionBar (which made the top prompt overlap the title bar). -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light">
+        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
+    </style>
+</resources>

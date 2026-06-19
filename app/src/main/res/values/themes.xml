@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base app theme. The v35 override opts out of Android 15 edge-to-edge enforcement
+         so the content is inset below the status bar / ActionBar instead of drawing under them. -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light" />
+</resources>
