@@ -1,12 +1,15 @@
 package com.micklab.llamaimage;
 
 import android.app.Activity;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
-import android.os.ParcelFileDescriptor;
+import android.os.Environment;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -17,6 +20,7 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -31,14 +35,14 @@ import java.util.concurrent.Executors;
 /**
  * Minimal SD1.5 text2img PoC UI.
  *
- * Layout: the model picker + status sit in a FIXED top header (never scrolled away); the
- * prompt/params/result/log scroll below. The keyboard is kept closed on launch and the prompt
- * EditText is not allowed to steal initial focus — otherwise the picker scrolls off-screen and
- * the model can never be loaded (which is exactly what happened in the first builds).
+ * Actions live in the ActionBar (model picker / generate / save) and the file picker auto-opens
+ * after init — this is resilient to ROMs that render an in-layout header oddly (observed). Live
+ * status + per-step progress go to the ActionBar subtitle and a visible progress bar, since CPU
+ * SD1.5 generation takes minutes and the user needs to see it advancing.
  *
- * Robustness: the native lib is arm64-v8a only, so all native interaction is lazy, on a worker
- * thread, wrapped in try/catch(Throwable), and surfaced on screen. The model is loaded straight
- * from its content-URI file descriptor (no 1.5GB copy), with a copy-to-internal fallback.
+ * Native interaction is lazy, on a worker thread, wrapped in try/catch(Throwable). The model is
+ * copied once into app storage (cached by size) and loaded from there — loading straight from a
+ * content-URI fd does not work with this engine.
  */
 public class MainActivity extends Activity {
 
@@ -49,36 +53,32 @@ public class MainActivity extends Activity {
 
     private volatile SdModelManager manager;     // null until native init succeeds
     private volatile boolean nativeReady = false;
-    private ParcelFileDescriptor modelPfd;       // kept open while a fd-backed model is loaded
+    private volatile long genStart = 0;          // generation start time for elapsed/ETA
 
-    private LinearLayout rootView;
-    private TextView statusText;
-    private TextView logText;
     private EditText promptEdit;
     private EditText negativeEdit;
     private EditText stepsEdit;
     private EditText sizeEdit;
-    private Button pickButton;
     private Button generateButton;
+    private ProgressBar progressBar;
     private ImageView imageView;
+    private TextView logText;
+    private Bitmap lastBitmap;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Don't pop the soft keyboard on launch (it would scroll the picker out of view).
+        // Keep the keyboard closed on launch.
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
                 | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
         setContentView(buildUi());
-        rootView.requestFocus();   // keep focus off the prompt EditText so the keyboard stays closed
 
-        // Wire listeners FIRST — the UI must stay responsive even if native init fails.
-        pickButton.setOnClickListener(v -> pickModel());
         generateButton.setOnClickListener(v -> generate());
         generateButton.setEnabled(false);
 
-        statusText.setText("ネイティブ初期化中…");
+        setStatus("ネイティブ初期化中…");
         worker.submit(this::initNative);
     }
 
@@ -87,59 +87,51 @@ public class MainActivity extends Activity {
         try {
             SdModelManager m = SdModelManager.get();   // triggers System.loadLibrary("sd_jni")
             m.setLogPath(new File(getFilesDir(), "sd.log").getAbsolutePath());
-            m.setProgressListener((step, steps) ->
-                    runOnUiThread(() -> statusText.setText("生成中… step " + step + "/" + steps)));
+            m.setProgressListener(this::onGenProgress);
             String info = m.systemInfo();
             manager = m;
             nativeReady = true;
             appendLogUi("ネイティブ準備完了");
             appendLogUi(info);
             runOnUiThread(() -> {
-                statusText.setText("準備完了 — 「モデル選択」(上部メニュー)を押してください");
-                // Open the file picker automatically so the user never has to hunt for the
-                // button (some devices/ROMs render the in-layout header oddly).
+                setStatus("準備完了 — モデルを選択してください");
                 if (manager != null && !manager.isModelLoaded()) {
-                    pickModel();
+                    pickModel();   // auto-open the picker; no button to hunt for
                 }
             });
         } catch (Throwable t) {
             appendLogUi("ネイティブ初期化失敗: " + t);
             appendLogUi("この端末の ABI が arm64-v8a でない可能性があります（エミュレータ等）。");
-            runOnUiThread(() -> statusText.setText("ネイティブ初期化失敗: " + t.getClass().getSimpleName()));
+            runOnUiThread(() -> setStatus("ネイティブ初期化失敗: " + t.getClass().getSimpleName()));
         }
     }
 
-    // --- UI construction (no XML). Fixed header + scrollable body. ---
+    /** Per-diffusion-step progress callback (called from the worker/native thread). */
+    private void onGenProgress(int step, int steps) {
+        runOnUiThread(() -> {
+            if (steps > 0) {
+                progressBar.setVisibility(View.VISIBLE);
+                progressBar.setMax(steps);
+                progressBar.setProgress(step);
+            }
+            long el = (System.currentTimeMillis() - genStart) / 1000;
+            String eta = "";
+            if (step > 0 && step < steps) {
+                eta = " 残り~" + (el * (steps - step) / step) + "s";
+            }
+            setStatus("生成中 " + step + "/" + steps + " (" + el + "s" + eta + ")");
+        });
+    }
+
+    // --- UI construction (no XML). Single scrolling body; actions are in the ActionBar. ---
     private View buildUi() {
         int pad = dp(12);
 
-        rootView = new LinearLayout(this);
-        rootView.setOrientation(LinearLayout.VERTICAL);
-        rootView.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        // Let the container hold initial focus instead of the prompt EditText.
-        rootView.setFocusable(true);
-        rootView.setFocusableInTouchMode(true);
-
-        // --- fixed header: picker + status (always visible) ---
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(pad, pad, pad, pad);
-
-        pickButton = new Button(this);
-        pickButton.setText("① モデル選択 (.gguf を Download から)");
-        header.addView(pickButton);
-
-        statusText = new TextView(this);
-        statusText.setText("起動中…");
-        header.addView(statusText);
-
-        rootView.addView(header);
-
-        // --- scrollable body ---
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(pad, 0, pad, pad);
+        body.setPadding(pad, pad, pad, pad);
+        body.setFocusable(true);
+        body.setFocusableInTouchMode(true);   // hold focus so the prompt doesn't open the keyboard
 
         promptEdit = new EditText(this);
         promptEdit.setHint("プロンプト");
@@ -168,6 +160,10 @@ public class MainActivity extends Activity {
         generateButton.setText("② 生成");
         body.addView(generateButton);
 
+        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.setVisibility(View.GONE);
+        body.addView(progressBar);
+
         imageView = new ImageView(this);
         imageView.setAdjustViewBounds(true);
         imageView.setLayoutParams(new LinearLayout.LayoutParams(
@@ -179,35 +175,27 @@ public class MainActivity extends Activity {
         body.addView(logText);
 
         ScrollView scroll = new ScrollView(this);
-        scroll.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         scroll.addView(body);
-        rootView.addView(scroll);
-
-        return rootView;
+        return scroll;
     }
 
-    // ActionBar menu — always visible in the top bar, independent of the content layout.
+    // ActionBar menu — always visible, independent of the content layout.
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
-        MenuItem pick = menu.add(0, 1, 0, "モデル選択");
-        pick.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
-        MenuItem gen = menu.add(0, 2, 1, "生成");
-        gen.setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
+        menu.add(0, 1, 0, "モデル選択").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+        menu.add(0, 2, 1, "生成").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
+        menu.add(0, 3, 2, "画像を保存").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
         return true;
     }
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == 1) {
-            pickModel();
-            return true;
+        switch (item.getItemId()) {
+            case 1: pickModel(); return true;
+            case 2: generate(); return true;
+            case 3: saveImage(); return true;
+            default: return super.onOptionsItemSelected(item);
         }
-        if (item.getItemId() == 2) {
-            generate();
-            return true;
-        }
-        return super.onOptionsItemSelected(item);
     }
 
     // --- model picking + load ---
@@ -220,7 +208,6 @@ public class MainActivity extends Activity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        // Best-effort: open the picker already in the Download folder (API 26+, ignored otherwise).
         try {
             intent.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,
                     Uri.parse("content://com.android.externalstorage.documents/document/primary:Download"));
@@ -240,30 +227,14 @@ public class MainActivity extends Activity {
             return;
         }
         setBusyUi(true);
-        statusText.setText("モデルを準備中…");
+        setStatus("モデルを準備中…");
         worker.submit(() -> loadModel(uri));
     }
 
     private void loadModel(Uri uri) {
         try {
-            // Primary path: hand the engine the file descriptor directly via /proc/self/fd,
-            // so no 1.5GB copy and no app-storage space requirement.
-            ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r");
-            if (pfd != null) {
-                String fdPath = "/proc/self/fd/" + pfd.getFd();
-                appendLogUi("fd 経由で読込: " + fdPath);
-                String err = manager.load(fdPath, 0);
-                if (err.isEmpty()) {
-                    closePfd();
-                    modelPfd = pfd;   // keep open while loaded
-                    onModelLoaded();
-                    return;
-                }
-                appendLogUi("fd 経由の読込失敗: " + err + " → コピー方式にフォールバック");
-                pfd.close();
-            }
-
-            // Fallback: copy into app-private storage, then load from the real path.
+            // Copy once into app storage (cached by size), then load from the real path.
+            // (Loading from a /proc/self/fd path is not supported by this engine.)
             long srcSize = querySize(uri);
             File dest = new File(getFilesDir(), MODEL_FILENAME);
             if (dest.exists() && srcSize > 0 && dest.length() == srcSize) {
@@ -271,32 +242,30 @@ public class MainActivity extends Activity {
             } else {
                 appendLogUi("コピー開始 (" + srcSize + " bytes)…");
                 copyUriToFile(uri, dest, srcSize);
+                appendLogUi("コピー完了");
             }
+            setStatusUi("モデル読込中…");
             String err = manager.load(dest.getAbsolutePath(), 0);
             if (err.isEmpty()) {
-                onModelLoaded();
+                appendLogUi("モデル読込成功");
+                runOnUiThread(() -> {
+                    setStatus("モデル読込済み — 「② 生成」できます");
+                    setBusyUi(false);
+                });
             } else {
                 appendLogUi("モデル読込失敗: " + err);
                 runOnUiThread(() -> {
-                    statusText.setText("読込失敗: " + err);
+                    setStatus("読込失敗: " + err);
                     setBusyUi(false);
                 });
             }
         } catch (Throwable t) {
             appendLogUi("モデル準備エラー: " + t);
             runOnUiThread(() -> {
-                statusText.setText("エラー: " + t.getClass().getSimpleName());
+                setStatus("エラー: " + t.getClass().getSimpleName());
                 setBusyUi(false);
             });
         }
-    }
-
-    private void onModelLoaded() {
-        appendLogUi("モデル読込成功");
-        runOnUiThread(() -> {
-            statusText.setText("モデル読込済み — ②「生成」できます");
-            setBusyUi(false);
-        });
     }
 
     private long querySize(Uri uri) {
@@ -329,8 +298,7 @@ public class MainActivity extends Activity {
                     int pct = (int) (copied * 100 / total);
                     if (pct != lastPct && pct % 5 == 0) {
                         lastPct = pct;
-                        final int p = pct;
-                        runOnUiThread(() -> statusText.setText("コピー中… " + p + "%"));
+                        setStatusUi("コピー中… " + pct + "%");
                     }
                 }
             }
@@ -341,7 +309,7 @@ public class MainActivity extends Activity {
     // --- generation ---
     private void generate() {
         if (manager == null || !manager.isModelLoaded()) {
-            Toast.makeText(this, "先に①でモデルを読み込んでください", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
             return;
         }
         final String prompt = promptEdit.getText().toString();
@@ -350,32 +318,41 @@ public class MainActivity extends Activity {
         final int size = parseInt(sizeEdit.getText().toString(), 512);
 
         setBusyUi(true);
-        statusText.setText("生成中…");
+        genStart = System.currentTimeMillis();
+        progressBar.setVisibility(View.VISIBLE);
+        progressBar.setMax(steps);
+        progressBar.setProgress(0);
+        setStatus("生成開始… (CPU: " + size + "px/" + steps + "step は数分かかります)");
+        appendLog("生成開始: \"" + prompt + "\" " + size + "px " + steps + "step");
+
         worker.submit(() -> {
             try {
-                long t0 = System.currentTimeMillis();
                 byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
-                long ms = System.currentTimeMillis() - t0;
+                long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     appendLogUi("生成失敗");
                     runOnUiThread(() -> {
-                        statusText.setText("生成失敗");
+                        setStatus("生成失敗");
+                        progressBar.setVisibility(View.GONE);
                         setBusyUi(false);
                     });
                     return;
                 }
                 final Bitmap bmp = rgbToBitmap(rgb, size, size);
                 final long seed = manager.getLastSeed();
-                appendLogUi("生成完了 seed=" + seed + " " + ms + "ms");
+                appendLogUi("生成完了 seed=" + seed + " " + (ms / 1000) + "s");
                 runOnUiThread(() -> {
+                    lastBitmap = bmp;
                     imageView.setImageBitmap(bmp);
-                    statusText.setText("完了 (seed=" + seed + ", " + ms + "ms)");
+                    progressBar.setProgress(progressBar.getMax());
+                    setStatus("完了 seed=" + seed + " (" + (ms / 1000) + "s)");
                     setBusyUi(false);
                 });
             } catch (Throwable t) {
                 appendLogUi("生成エラー: " + t);
                 runOnUiThread(() -> {
-                    statusText.setText("生成エラー: " + t.getClass().getSimpleName());
+                    setStatus("生成エラー: " + t.getClass().getSimpleName());
+                    progressBar.setVisibility(View.GONE);
                     setBusyUi(false);
                 });
             }
@@ -393,10 +370,56 @@ public class MainActivity extends Activity {
         return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888);
     }
 
+    // --- save the last generated image to the gallery ---
+    private void saveImage() {
+        final Bitmap bmp = lastBitmap;
+        if (bmp == null) {
+            Toast.makeText(this, "保存できる画像がありません", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        worker.submit(() -> {
+            try {
+                String name = "llamaimage_" + System.currentTimeMillis() + ".png";
+                if (Build.VERSION.SDK_INT >= 29) {
+                    ContentValues cv = new ContentValues();
+                    cv.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+                    cv.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+                    cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/llamaimage");
+                    Uri u = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                    try (OutputStream os = getContentResolver().openOutputStream(u)) {
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, os);
+                    }
+                    appendLogUi("保存: Pictures/llamaimage/" + name);
+                } else {
+                    File dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+                    File f = new File(dir, name);
+                    try (OutputStream os = new FileOutputStream(f)) {
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, os);
+                    }
+                    appendLogUi("保存: " + f.getAbsolutePath());
+                }
+                runOnUiThread(() -> Toast.makeText(this, "画像を保存しました", Toast.LENGTH_SHORT).show());
+            } catch (Throwable t) {
+                appendLogUi("保存失敗: " + t);
+                runOnUiThread(() -> Toast.makeText(this, "保存失敗", Toast.LENGTH_SHORT).show());
+            }
+        });
+    }
+
     // --- helpers ---
     private void setBusyUi(boolean busy) {
-        pickButton.setEnabled(!busy && nativeReady);
         generateButton.setEnabled(!busy && manager != null && manager.isModelLoaded());
+    }
+
+    /** Live status shown in the always-visible ActionBar subtitle. */
+    private void setStatus(String s) {
+        if (getActionBar() != null) {
+            getActionBar().setSubtitle(s);
+        }
+    }
+
+    private void setStatusUi(String s) {
+        runOnUiThread(() -> setStatus(s));
     }
 
     private static int parseInt(String s, int def) {
@@ -419,16 +442,6 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> appendLog(msg));
     }
 
-    private void closePfd() {
-        if (modelPfd != null) {
-            try {
-                modelPfd.close();
-            } catch (Exception ignore) {
-            }
-            modelPfd = null;
-        }
-    }
-
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density);
     }
@@ -436,7 +449,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        closePfd();
         worker.shutdownNow();
     }
 }
