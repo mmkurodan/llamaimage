@@ -55,6 +55,7 @@ public class MainActivity extends Activity {
     private volatile boolean nativeReady = false;
     private volatile long genStart = 0;          // generation start time for elapsed/ETA
 
+    private LinearLayout rootBody;
     private EditText promptEdit;
     private EditText negativeEdit;
     private EditText stepsEdit;
@@ -69,11 +70,13 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Keep the keyboard closed on launch.
-        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+        // Keep the keyboard closed on launch, but allow it to open when the user taps a field
+        // (STATE_HIDDEN, not STATE_ALWAYS_HIDDEN — the latter blocks input entirely).
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
                 | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
         setContentView(buildUi());
+        rootBody.requestFocus();   // hold initial focus off the prompt (no auto-scroll under the title bar)
 
         generateButton.setOnClickListener(v -> generate());
         generateButton.setEnabled(false);
@@ -93,16 +96,53 @@ public class MainActivity extends Activity {
             nativeReady = true;
             appendLogUi("ネイティブ準備完了");
             appendLogUi(info);
-            runOnUiThread(() -> {
-                setStatus("準備完了 — モデルを選択してください");
-                if (manager != null && !manager.isModelLoaded()) {
-                    pickModel();   // auto-open the picker; no button to hunt for
-                }
-            });
+            setStatusUi("準備完了");
+            autoStartModel();
         } catch (Throwable t) {
             appendLogUi("ネイティブ初期化失敗: " + t);
             appendLogUi("この端末の ABI が arm64-v8a でない可能性があります（エミュレータ等）。");
             runOnUiThread(() -> setStatus("ネイティブ初期化失敗: " + t.getClass().getSimpleName()));
+        }
+    }
+
+    /**
+     * After native init: if a model was already copied in a previous run, load that cached copy
+     * automatically (no picker). Only the first time (no cached file) do we open the picker.
+     * Runs on the worker thread (called from initNative).
+     */
+    private void autoStartModel() {
+        File cached = new File(getFilesDir(), MODEL_FILENAME);
+        if (cached.exists() && cached.length() > 0) {
+            appendLogUi("キャッシュ済みモデルを自動ロード (" + cached.length() + " bytes)");
+            runOnUiThread(() -> {
+                setStatus("モデル読込中（キャッシュ）…");
+                setBusyUi(true);
+            });
+            try {
+                String err = manager.load(cached.getAbsolutePath(), 0);
+                if (err.isEmpty()) {
+                    appendLogUi("モデル読込成功（キャッシュ）");
+                    runOnUiThread(() -> {
+                        setStatus("モデル読込済み — 「② 生成」できます");
+                        setBusyUi(false);
+                    });
+                } else {
+                    appendLogUi("キャッシュ読込失敗: " + err);
+                    runOnUiThread(() -> {
+                        setStatus("キャッシュ読込失敗 — モデルを選択してください");
+                        setBusyUi(false);
+                        pickModel();
+                    });
+                }
+            } catch (Throwable t) {
+                appendLogUi("キャッシュ読込エラー: " + t);
+                runOnUiThread(() -> {
+                    setBusyUi(false);
+                    pickModel();
+                });
+            }
+        } else {
+            runOnUiThread(this::pickModel);   // first run: open the picker
         }
     }
 
@@ -132,6 +172,13 @@ public class MainActivity extends Activity {
         body.setPadding(pad, pad, pad, pad);
         body.setFocusable(true);
         body.setFocusableInTouchMode(true);   // hold focus so the prompt doesn't open the keyboard
+        rootBody = body;
+
+        // Non-focusable header line — also keeps the first input clear of the title bar.
+        TextView guide = new TextView(this);
+        guide.setText("プロンプトを入力して「② 生成」。モデル選択は上部メニューから。");
+        guide.setPadding(0, 0, 0, dp(8));
+        body.addView(guide);
 
         promptEdit = new EditText(this);
         promptEdit.setHint("プロンプト");
