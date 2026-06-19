@@ -24,13 +24,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEST="${1:-$REPO_ROOT/app/src/main/cpp/sd}"
 
-# Idempotent: nothing to do if both trees are already materialized.
+# Idempotent: skip the network fetch if both trees are already materialized,
+# but always run the patch step below so local modifications are applied.
+SKIP_FETCH=0
 if [ -f "$DEST/stable-diffusion.h" ] && [ -f "$DEST/ggml/CMakeLists.txt" ]; then
-  echo "[fetch-sdcpp] already present at $DEST — skipping"
-  exit 0
+  echo "[fetch-sdcpp] already present at $DEST — skipping fetch"
+  SKIP_FETCH=1
 fi
-
-echo "[fetch-sdcpp] fetching stable-diffusion.cpp @ ${SDCPP_COMMIT:0:12} -> $DEST"
 
 # Fetch a single commit by SHA (GitHub allows reachable-SHA fetches). This keeps the
 # download tiny compared to a full clone.
@@ -45,10 +45,16 @@ fetch_commit() {
   rm -rf "$dir/.git"
 }
 
-fetch_commit "$SDCPP_REPO" "$SDCPP_COMMIT" "$DEST"
+if [ "$SKIP_FETCH" -eq 0 ]; then
+  echo "[fetch-sdcpp] fetching stable-diffusion.cpp @ ${SDCPP_COMMIT:0:12} -> $DEST"
+  fetch_commit "$SDCPP_REPO" "$SDCPP_COMMIT" "$DEST"
 
-echo "[fetch-sdcpp] fetching ggml @ ${GGML_COMMIT:0:12} -> $DEST/ggml"
-# sd.cpp leaves an empty 'ggml' gitlink dir on a non-submodule checkout; replace it.
-fetch_commit "$GGML_REPO" "$GGML_COMMIT" "$DEST/ggml"
+  echo "[fetch-sdcpp] fetching ggml @ ${GGML_COMMIT:0:12} -> $DEST/ggml"
+  # sd.cpp leaves an empty 'ggml' gitlink dir on a non-submodule checkout; replace it.
+  fetch_commit "$GGML_REPO" "$GGML_COMMIT" "$DEST/ggml"
 
-echo "[fetch-sdcpp] done."
+  echo "[fetch-sdcpp] done."
+fi
+
+# Always apply local patches (idempotent — already-patched files are skipped).
+bash "$SCRIPT_DIR/patch-sdcpp.sh" "$DEST"
