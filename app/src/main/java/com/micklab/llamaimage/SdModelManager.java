@@ -39,6 +39,10 @@ public final class SdModelManager {
         sd.setProgressListener(l);
     }
 
+    public void setPreviewListener(StableDiffusionNative.PreviewListener l) {
+        sd.setPreviewListener(l);
+    }
+
     public String systemInfo() {
         return sd.systemInfo();
     }

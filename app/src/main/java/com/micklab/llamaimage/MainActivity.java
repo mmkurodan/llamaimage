@@ -67,9 +67,6 @@ public class MainActivity extends Activity {
     private volatile SdModelManager manager;
     private volatile boolean nativeReady = false;
     private volatile long genStart = 0;
-    private volatile long imgStart = 0;
-    private volatile int currentImageIndex = 0;
-    private volatile int totalImages = 1;
 
     private String llmBaseUrl = DEFAULT_LLM_BASE_URL;
     private String llmModel = "";
@@ -79,7 +76,6 @@ public class MainActivity extends Activity {
     private EditText negativeEdit;
     private EditText stepsEdit;
     private EditText sizeEdit;
-    private EditText countEdit;
     private Button generateButton;
     private Button translateButton;
     private ProgressBar progressBar;
@@ -111,6 +107,7 @@ public class MainActivity extends Activity {
             SdModelManager m = SdModelManager.get();
             m.setLogPath(new File(getFilesDir(), "sd.log").getAbsolutePath());
             m.setProgressListener(this::onGenProgress);
+            m.setPreviewListener(this::onGenPreview);
             String info = m.systemInfo();
             manager = m;
             nativeReady = true;
@@ -169,14 +166,19 @@ public class MainActivity extends Activity {
                 progressBar.setMax(steps);
                 progressBar.setProgress(step);
             }
-            long el = (System.currentTimeMillis() - imgStart) / 1000;
+            long el = (System.currentTimeMillis() - genStart) / 1000;
             String eta = "";
             if (step > 0 && step < steps) {
                 eta = " 残り~" + (el * (steps - step) / step) + "s";
             }
-            String imgInfo = (totalImages > 1) ? " (" + (currentImageIndex + 1) + "/" + totalImages + ")" : "";
-            setStatus("生成中" + imgInfo + " " + step + "/" + steps + " (" + el + "s" + eta + ")");
+            setStatus("生成中 " + step + "/" + steps + " (" + el + "s" + eta + ")");
         });
+    }
+
+    /** Latent-approximation preview — fires alongside each progress step (step > 0). */
+    private void onGenPreview(byte[] rgb, int w, int h) {
+        final Bitmap bmp = rgbToBitmap(rgb, w, h);
+        runOnUiThread(() -> imageView.setImageBitmap(bmp));
     }
 
     private View buildUi() {
@@ -216,14 +218,8 @@ public class MainActivity extends Activity {
         sizeEdit.setText("512");
         sizeEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        countEdit = new EditText(this);
-        countEdit.setHint("回数");
-        countEdit.setText("1");
-        countEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
         paramRow.addView(stepsEdit);
         paramRow.addView(sizeEdit);
-        paramRow.addView(countEdit);
         body.addView(paramRow);
 
         LinearLayout btnRow = new LinearLayout(this);
@@ -380,7 +376,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // --- image generation (supports count > 1, shows each image as it completes) ---
+    // --- image generation ---
 
     private void generate() {
         if (manager == null || !manager.isModelLoaded()) {
@@ -391,70 +387,45 @@ public class MainActivity extends Activity {
         final String negative = negativeEdit.getText().toString();
         final int steps = parseInt(stepsEdit.getText().toString(), 20);
         final int size = parseInt(sizeEdit.getText().toString(), 512);
-        final int count = Math.max(1, parseInt(countEdit.getText().toString(), 1));
 
         setBusyUi(true);
-        totalImages = count;
-        currentImageIndex = 0;
         genStart = System.currentTimeMillis();
         progressBar.setVisibility(View.VISIBLE);
         progressBar.setMax(steps);
         progressBar.setProgress(0);
-        setStatus("生成開始… (" + size + "px/" + steps + "step" + (count > 1 ? " x" + count + "枚" : "") + ")");
-        appendLog("生成開始: \"" + prompt + "\" " + size + "px " + steps + "step" + (count > 1 ? " x" + count : ""));
+        setStatus("生成開始… (" + size + "px/" + steps + "step)");
+        appendLog("生成開始: \"" + prompt + "\" " + size + "px " + steps + "step");
 
         worker.submit(() -> {
-            for (int i = 0; i < count; i++) {
-                final int imgIdx = i;
-                currentImageIndex = i;
-                imgStart = System.currentTimeMillis();
-                // Reset progress bar for each image so onGenProgress starts fresh
-                runOnUiThread(() -> {
-                    progressBar.setMax(steps);
-                    progressBar.setProgress(0);
-                });
-                try {
-                    byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
-                    long ms = System.currentTimeMillis() - imgStart;
-                    if (rgb == null) {
-                        appendLogUi("生成失敗 (" + (imgIdx + 1) + "/" + count + ")");
-                        if (imgIdx == count - 1) {
-                            runOnUiThread(() -> {
-                                setStatus("生成失敗");
-                                progressBar.setVisibility(View.GONE);
-                                setBusyUi(false);
-                            });
-                        }
-                        continue;
-                    }
-                    final Bitmap bmp = rgbToBitmap(rgb, size, size);
-                    final long seed = manager.getLastSeed();
-                    final long imgMs = ms;
-                    appendLogUi("生成完了 (" + (imgIdx + 1) + "/" + count + ") seed=" + seed + " " + (ms / 1000) + "s");
-                    final boolean isLast = (imgIdx == count - 1);
+            try {
+                byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
+                long ms = System.currentTimeMillis() - genStart;
+                if (rgb == null) {
+                    appendLogUi("生成失敗");
                     runOnUiThread(() -> {
-                        lastBitmap = bmp;
-                        imageView.setImageBitmap(bmp);
-                        progressBar.setProgress(progressBar.getMax());
-                        if (isLast) {
-                            long totalMs = System.currentTimeMillis() - genStart;
-                            setStatus("完了" + (count > 1 ? " " + count + "枚" : "")
-                                    + " seed=" + seed + " (" + (totalMs / 1000) + "s)");
-                            setBusyUi(false);
-                        } else {
-                            setStatus("完了 (" + (imgIdx + 1) + "/" + count + ") seed=" + seed
-                                    + " (" + (imgMs / 1000) + "s) — 次を生成中…");
-                        }
-                    });
-                } catch (Throwable t) {
-                    appendLogUi("生成エラー (" + (imgIdx + 1) + "/" + count + "): " + t);
-                    runOnUiThread(() -> {
-                        setStatus("生成エラー: " + t.getClass().getSimpleName());
+                        setStatus("生成失敗");
                         progressBar.setVisibility(View.GONE);
                         setBusyUi(false);
                     });
                     return;
                 }
+                final Bitmap bmp = rgbToBitmap(rgb, size, size);
+                final long seed = manager.getLastSeed();
+                appendLogUi("生成完了 seed=" + seed + " " + (ms / 1000) + "s");
+                runOnUiThread(() -> {
+                    lastBitmap = bmp;
+                    imageView.setImageBitmap(bmp);
+                    progressBar.setProgress(progressBar.getMax());
+                    setStatus("完了 seed=" + seed + " (" + (ms / 1000) + "s)");
+                    setBusyUi(false);
+                });
+            } catch (Throwable t) {
+                appendLogUi("生成エラー: " + t);
+                runOnUiThread(() -> {
+                    setStatus("生成エラー: " + t.getClass().getSimpleName());
+                    progressBar.setVisibility(View.GONE);
+                    setBusyUi(false);
+                });
             }
         });
     }

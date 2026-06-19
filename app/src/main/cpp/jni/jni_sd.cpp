@@ -18,6 +18,8 @@
 #include <string>
 
 #include "stable-diffusion.h"
+#include "util.h"                     // g_sd_step_latent
+#include "ggml/include/ggml.h"        // ggml_tensor for latent preview
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -38,7 +40,20 @@ static int64_t      g_last_seed = -1;
 
 static JavaVM*      g_vm      = nullptr;
 static jobject      g_progress_listener = nullptr;  // global ref, may be null
+static jobject      g_preview_listener  = nullptr;  // global ref, may be null
 static std::string  g_log_path;                     // optional log file
+
+// ---------------------------------------------------------------------------
+// Latent → RGB approximation coefficients (A1111 "cheap approximation").
+// Maps the 4 SD1.5 latent channels to RGB at latent resolution (W/8 x H/8).
+// ---------------------------------------------------------------------------
+static const float kLatentRgbCoeff[4][3] = {
+    //    R        G        B
+    { 0.298f,  0.207f,  0.208f },   // L0
+    { 0.187f,  0.286f,  0.173f },   // L1
+    {-0.158f,  0.189f,  0.264f },   // L2
+    {-0.184f, -0.271f, -0.473f },   // L3
+};
 
 // ---------------------------------------------------------------------------
 // Logging: forward sd.cpp log lines to logcat and (optionally) a file, matching
@@ -69,16 +84,17 @@ static void sd_log_cb(enum sd_log_level_t level, const char* text, void* /*data*
 
 // ---------------------------------------------------------------------------
 // Progress: sd.cpp invokes this synchronously on the generating thread (the Java
-// worker thread that called txt2img), so we can reach the JVM via that thread.
+// worker thread that called txt2img). g_sd_step_latent is set by stable-diffusion.cpp
+// to the current denoised latent tensor just before this callback fires (step > 0).
+// We use it to produce a lightweight RGB preview via linear approximation.
 // ---------------------------------------------------------------------------
 static void sd_progress_cb(int step, int steps, float /*time*/, void* /*data*/) {
-    if (g_vm == nullptr || g_progress_listener == nullptr) {
+    if (g_vm == nullptr) {
         return;
     }
     JNIEnv* env = nullptr;
     bool attached = false;
     if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        // NDK's AttachCurrentThread takes JNIEnv**, desktop OpenJDK's takes void**.
 #ifdef __ANDROID__
         jint rc = g_vm->AttachCurrentThread(&env, nullptr);
 #else
@@ -89,15 +105,73 @@ static void sd_progress_cb(int step, int steps, float /*time*/, void* /*data*/) 
         }
         attached = true;
     }
-    jclass cls = env->GetObjectClass(g_progress_listener);
-    jmethodID mid = env->GetMethodID(cls, "onProgress", "(II)V");
-    if (mid != nullptr) {
-        env->CallVoidMethod(g_progress_listener, mid, step, steps);
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
+
+    // --- 1. Fire step progress to ProgressListener ---
+    if (g_progress_listener != nullptr) {
+        jclass cls = env->GetObjectClass(g_progress_listener);
+        jmethodID mid = env->GetMethodID(cls, "onProgress", "(II)V");
+        if (mid != nullptr) {
+            env->CallVoidMethod(g_progress_listener, mid, step, steps);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+
+    // --- 2. Build latent preview and fire PreviewListener ---
+    struct ggml_tensor* lat = g_sd_step_latent;
+    if (g_preview_listener != nullptr && lat != nullptr && lat->type == GGML_TYPE_F32) {
+        const int W = (int)lat->ne[0];  // latent width  (image_w / 8)
+        const int H = (int)lat->ne[1];  // latent height (image_h / 8)
+        const int C = (int)lat->ne[2];  // should be 4 for SD1.5
+
+        if (W > 0 && H > 0 && C >= 4) {
+            const int n_px = W * H;
+            jbyteArray rgb_arr = env->NewByteArray(n_px * 3);
+            if (rgb_arr != nullptr) {
+                jbyte* rgb = env->GetByteArrayElements(rgb_arr, nullptr);
+                if (rgb != nullptr) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            // Read the 4 latent channels for this pixel
+                            float L[4];
+                            for (int c = 0; c < 4; ++c) {
+                                L[c] = *(const float*)((const char*)lat->data
+                                        + c * lat->nb[2]
+                                        + h * lat->nb[1]
+                                        + w * lat->nb[0]);
+                            }
+                            // Apply approximation coefficients + bias
+                            for (int ch = 0; ch < 3; ++ch) {
+                                float val = 0.5f;
+                                for (int c = 0; c < 4; ++c) {
+                                    val += kLatentRgbCoeff[c][ch] * L[c];
+                                }
+                                int iv = (int)(val * 255.0f + 0.5f);
+                                if (iv < 0) iv = 0;
+                                if (iv > 255) iv = 255;
+                                rgb[(h * W + w) * 3 + ch] = (jbyte)iv;
+                            }
+                        }
+                    }
+                    env->ReleaseByteArrayElements(rgb_arr, rgb, 0);
+
+                    jclass pcls = env->GetObjectClass(g_preview_listener);
+                    jmethodID pmid = env->GetMethodID(pcls, "onPreview", "([BII)V");
+                    if (pmid != nullptr) {
+                        env->CallVoidMethod(g_preview_listener, pmid, rgb_arr, W, H);
+                        if (env->ExceptionCheck()) {
+                            env->ExceptionClear();
+                        }
+                    }
+                    env->DeleteLocalRef(pcls);
+                }
+                env->DeleteLocalRef(rgb_arr);
+            }
         }
     }
-    env->DeleteLocalRef(cls);
+
     if (attached) {
         g_vm->DetachCurrentThread();
     }
@@ -145,6 +219,18 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetProgressListener(JNIE
     }
     if (listener != nullptr) {
         g_progress_listener = env->NewGlobalRef(listener);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetPreviewListener(JNIEnv* env, jobject, jobject listener) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (g_preview_listener != nullptr) {
+        env->DeleteGlobalRef(g_preview_listener);
+        g_preview_listener = nullptr;
+    }
+    if (listener != nullptr) {
+        g_preview_listener = env->NewGlobalRef(listener);
     }
 }
 

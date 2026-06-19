@@ -19,6 +19,17 @@ public class StableDiffusionNative {
         void onProgress(int step, int steps);
     }
 
+    /**
+     * Preview callback, invoked alongside each progress step.
+     * {@code rgb} is a W*H*3 byte array (unsigned values stored as signed bytes);
+     * use {@code b & 0xFF} to recover [0,255]. W and H are the latent dimensions
+     * (image_width/8 × image_height/8), typically 64×64 for a 512×512 image.
+     * The image is a lightweight linear approximation — not a full VAE decode.
+     */
+    public interface PreviewListener {
+        void onPreview(byte[] rgb, int w, int h);
+    }
+
     static {
         System.loadLibrary("sd_jni");
     }
@@ -27,6 +38,7 @@ public class StableDiffusionNative {
     private native String nativeSystemInfo();
     private native void nativeSetLogPath(String path);
     private native void nativeSetProgressListener(ProgressListener listener);
+    private native void nativeSetPreviewListener(PreviewListener listener);
     private native String nativeInit(String modelPath, int nThreads);
     private native byte[] nativeTxt2img(String prompt, String negativePrompt,
                                         int width, int height, int steps,
@@ -46,6 +58,10 @@ public class StableDiffusionNative {
 
     public void setProgressListener(ProgressListener listener) {
         nativeSetProgressListener(listener);
+    }
+
+    public void setPreviewListener(PreviewListener listener) {
+        nativeSetPreviewListener(listener);
     }
 
     /** Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message. */
