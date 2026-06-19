@@ -8,6 +8,8 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -90,9 +92,16 @@ public class MainActivity extends Activity {
             String info = m.systemInfo();
             manager = m;
             nativeReady = true;
-            runOnUiThread(() -> statusText.setText("準備完了 — 上の「モデル選択」を押してください"));
             appendLogUi("ネイティブ準備完了");
             appendLogUi(info);
+            runOnUiThread(() -> {
+                statusText.setText("準備完了 — 「モデル選択」(上部メニュー)を押してください");
+                // Open the file picker automatically so the user never has to hunt for the
+                // button (some devices/ROMs render the in-layout header oddly).
+                if (manager != null && !manager.isModelLoaded()) {
+                    pickModel();
+                }
+            });
         } catch (Throwable t) {
             appendLogUi("ネイティブ初期化失敗: " + t);
             appendLogUi("この端末の ABI が arm64-v8a でない可能性があります（エミュレータ等）。");
@@ -176,6 +185,29 @@ public class MainActivity extends Activity {
         rootView.addView(scroll);
 
         return rootView;
+    }
+
+    // ActionBar menu — always visible in the top bar, independent of the content layout.
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        MenuItem pick = menu.add(0, 1, 0, "モデル選択");
+        pick.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+        MenuItem gen = menu.add(0, 2, 1, "生成");
+        gen.setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == 1) {
+            pickModel();
+            return true;
+        }
+        if (item.getItemId() == 2) {
+            generate();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
     }
 
     // --- model picking + load ---
