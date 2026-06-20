@@ -13,6 +13,12 @@ public class StableDiffusionNative {
     /** Sampler ids — must match enum sample_method_t in stable-diffusion.h. */
     public static final int SAMPLE_EULER_A = 0;
     public static final int SAMPLE_EULER   = 1;
+    public static final int SAMPLE_DPMPP2M = 5;
+
+    /** Weight types — must match enum sd_type_t in stable-diffusion.h. */
+    public static final int WTYPE_DEFAULT = -1;   // keep the model's original types
+    public static final int WTYPE_Q4_0    = 2;
+    public static final int WTYPE_Q8_0    = 8;
 
     /** Progress callback, invoked once per diffusion step from native. */
     public interface ProgressListener {
@@ -39,7 +45,7 @@ public class StableDiffusionNative {
     private native void nativeSetLogPath(String path);
     private native void nativeSetProgressListener(ProgressListener listener);
     private native void nativeSetPreviewListener(PreviewListener listener);
-    private native String nativeInit(String modelPath, int nThreads);
+    private native String nativeInit(String modelPath, int nThreads, int wtype);
     private native byte[] nativeTxt2img(String prompt, String negativePrompt,
                                         int width, int height, int steps,
                                         float cfgScale, long seed, int sampleMethod, int clipSkip);
@@ -70,9 +76,13 @@ public class StableDiffusionNative {
         nativeSetPreviewListener(listener);
     }
 
-    /** Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message. */
-    public String init(String modelPath, int nThreads) {
-        return nativeInit(modelPath, nThreads);
+    /**
+     * Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message.
+     * {@code wtype} re-quantizes weights at load (e.g. {@link #WTYPE_Q4_0}) for faster CPU
+     * matmul; {@link #WTYPE_DEFAULT} keeps the model's original types.
+     */
+    public String init(String modelPath, int nThreads, int wtype) {
+        return nativeInit(modelPath, nThreads, wtype);
     }
 
     /**

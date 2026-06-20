@@ -237,8 +237,10 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetPreviewListener(JNIEn
 }
 
 // Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message.
+// wtype: an sd_type_t value to re-quantize the weights to at load (e.g. Q4_0/Q8_0 for
+// faster CPU matmul); pass <0 (or out of range) to keep the model's original types.
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath, jint nThreads) {
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath, jint nThreads, jint wtype) {
     std::lock_guard<std::mutex> lk(g_mutex);
     std::string model = jstr(env, modelPath);
     if (model.empty()) {
@@ -258,6 +260,9 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
             threads = get_num_physical_cores();
         }
 
+        // <0 or out-of-range -> keep original weight types (SD_TYPE_COUNT).
+        sd_type_t wt = (wtype >= 0 && wtype < SD_TYPE_COUNT) ? (sd_type_t)wtype : SD_TYPE_COUNT;
+
         // Single-file SD1.5 GGUF: only model_path is set, everything else is empty.
         // vae_decode_only=false so the VAE encoder is available for img2img.
         g_ctx = new_sd_ctx(
@@ -276,7 +281,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
             false,         // vae_tiling
             false,         // free_params_immediately
             threads,       // n_threads
-            SD_TYPE_COUNT, // wtype: keep the model's native weight types
+            wt,            // wtype: original types, or Q4_0/Q8_0 to speed up CPU matmul
             STD_DEFAULT_RNG,
             DEFAULT,       // schedule
             false,         // keep_clip_on_cpu

@@ -59,13 +59,17 @@ public final class SdModelManager {
         return loadedModelPath;
     }
 
-    /** Load (or reload) the model. Returns "" on success or an error message. Blocking. */
-    public synchronized String load(String modelPath, int nThreads) {
+    /**
+     * Load (or reload) the model. Returns "" on success or an error message. Blocking.
+     * {@code wtype} re-quantizes weights at load (e.g. {@code WTYPE_Q4_0}); use
+     * {@code WTYPE_DEFAULT} to keep the original types.
+     */
+    public synchronized String load(String modelPath, int nThreads, int wtype) {
         busy = true;
         try {
             modelLoaded = false;
             loadedModelPath = null;
-            String err = sd.init(modelPath, nThreads);
+            String err = sd.init(modelPath, nThreads, wtype);
             if (err != null && err.isEmpty()) {
                 modelLoaded = true;
                 loadedModelPath = modelPath;
@@ -79,14 +83,14 @@ public final class SdModelManager {
 
     /** Generate one image (RGB w*h*3) or {@code null} on failure. Blocking. */
     public synchronized byte[] generate(String prompt, String negativePrompt, int width, int height,
-                                        int steps, float cfgScale, long seed) {
+                                        int steps, float cfgScale, long seed, int sampleMethod) {
         if (!modelLoaded) {
             return null;
         }
         busy = true;
         try {
             return sd.txt2img(prompt, negativePrompt, width, height, steps,
-                    cfgScale, seed, StableDiffusionNative.SAMPLE_EULER_A, -1);
+                    cfgScale, seed, sampleMethod, -1);
         } finally {
             busy = false;
         }
@@ -95,14 +99,15 @@ public final class SdModelManager {
     /** Generate from an existing image (img2img). Returns RGB w*h*3 or {@code null}. Blocking. */
     public synchronized byte[] img2img(byte[] initRgb, int initW, int initH,
                                        String prompt, String negativePrompt, int width, int height,
-                                       int steps, float cfgScale, float strength, long seed) {
+                                       int steps, float cfgScale, float strength, long seed,
+                                       int sampleMethod) {
         if (!modelLoaded) {
             return null;
         }
         busy = true;
         try {
             return sd.img2img(initRgb, initW, initH, prompt, negativePrompt, width, height,
-                    steps, cfgScale, strength, seed, StableDiffusionNative.SAMPLE_EULER_A, -1);
+                    steps, cfgScale, strength, seed, sampleMethod, -1);
         } finally {
             busy = false;
         }

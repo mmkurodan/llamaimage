@@ -16,6 +16,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
+import android.text.InputType;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
@@ -57,6 +58,9 @@ public class MainActivity extends Activity {
     private static final String PREFS_NAME = "llamaimage_prefs";
     private static final String PREFS_LLM_URL = "llm_base_url";
     private static final String PREFS_LLM_MODEL = "llm_model";
+    private static final String PREFS_WTYPE = "wtype";
+    private static final String PREFS_SAMPLER = "sampler";
+    private static final String PREFS_THREADS = "threads";
     private static final String DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434";
     private static final String LLM_PACKAGE = "com.micklab.llama";
     private static final String LLM_SERVICE_CLASS = "com.micklab.llama.OllamaForegroundService";
@@ -72,6 +76,10 @@ public class MainActivity extends Activity {
 
     private String llmBaseUrl = DEFAULT_LLM_BASE_URL;
     private String llmModel = "";
+    // Generation settings (load-time: wtype/threads need a model reload; sampler is per-run).
+    private int wtype = StableDiffusionNative.WTYPE_DEFAULT;
+    private int sampler = StableDiffusionNative.SAMPLE_DPMPP2M;
+    private int nThreads = 0;                 // 0 = auto (physical cores)
 
     private LinearLayout rootBody;
     private EditText promptEdit;
@@ -141,9 +149,9 @@ public class MainActivity extends Activity {
                 setBusyUi(true);
             });
             try {
-                String err = manager.load(cached.getAbsolutePath(), 0);
+                String err = manager.load(cached.getAbsolutePath(), nThreads, wtype);
                 if (err.isEmpty()) {
-                    appendLogUi("モデル読込成功（キャッシュ）");
+                    appendLogUi("モデル読込成功（キャッシュ）" + wtypeSuffix());
                     runOnUiThread(() -> {
                         setStatus("モデル読込済み — 「生成」できます");
                         setBusyUi(false);
@@ -202,7 +210,7 @@ public class MainActivity extends Activity {
         rootBody = body;
 
         TextView guide = new TextView(this);
-        guide.setText("プロンプトを入力（日本語可）→「翻訳」で英語化→「生成」。モデル・LLM設定は上部メニューから。");
+        guide.setText("プロンプトを入力（日本語可）→「翻訳」で英語化→「生成」。モデル・LLM・生成設定は上部メニューから。");
         guide.setPadding(0, 0, 0, dp(8));
         body.addView(guide);
 
@@ -220,7 +228,7 @@ public class MainActivity extends Activity {
 
         stepsEdit = new EditText(this);
         stepsEdit.setHint("steps");
-        stepsEdit.setText("20");
+        stepsEdit.setText("15");
         stepsEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         sizeEdit = new EditText(this);
@@ -302,6 +310,7 @@ public class MainActivity extends Activity {
         menu.add(0, 2, 1, "生成").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
         menu.add(0, 3, 2, "画像を保存").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
         menu.add(0, 4, 3, "LLM設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+        menu.add(0, 5, 4, "生成設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         return true;
     }
 
@@ -312,6 +321,7 @@ public class MainActivity extends Activity {
             case 2: generate(); return true;
             case 3: saveImage(); return true;
             case 4: showLlmSettingsDialog(); return true;
+            case 5: showGenSettingsDialog(); return true;
             default: return super.onOptionsItemSelected(item);
         }
     }
@@ -364,9 +374,9 @@ public class MainActivity extends Activity {
                 appendLogUi("コピー完了");
             }
             setStatusUi("モデル読込中…");
-            String err = manager.load(dest.getAbsolutePath(), 0);
+            String err = manager.load(dest.getAbsolutePath(), nThreads, wtype);
             if (err.isEmpty()) {
-                appendLogUi("モデル読込成功");
+                appendLogUi("モデル読込成功" + wtypeSuffix());
                 runOnUiThread(() -> {
                     setStatus("モデル読込済み — 「生成」できます");
                     setBusyUi(false);
@@ -444,7 +454,7 @@ public class MainActivity extends Activity {
 
         worker.submit(() -> {
             try {
-                byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
+                byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1, sampler);
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -547,7 +557,7 @@ public class MainActivity extends Activity {
                 Bitmap scaled = Bitmap.createScaledBitmap(src, size, size, true);
                 byte[] init = bitmapToRgb(scaled);
                 byte[] rgb = manager.img2img(init, size, size, prompt, negative,
-                        size, size, steps, 7.0f, strength, -1);
+                        size, size, steps, 7.0f, strength, -1, sampler);
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -578,6 +588,131 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    // --- generation settings (weight precision / sampler / threads) ---
+
+    private void showGenSettingsDialog() {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(16);
+        container.setPadding(pad, pad, pad, pad);
+
+        final int[] selWtype = {wtype};
+        TextView precLabel = new TextView(this);
+        precLabel.setText("重み精度（量子化）");
+        container.addView(precLabel);
+        Button precBtn = new Button(this);
+        precBtn.setText("精度: " + wtypeLabel(selWtype[0]));
+        precBtn.setOnClickListener(v -> {
+            selWtype[0] = nextWtype(selWtype[0]);
+            precBtn.setText("精度: " + wtypeLabel(selWtype[0]));
+        });
+        container.addView(precBtn);
+        TextView precHint = new TextView(this);
+        precHint.setText("Q4_0=最速・省メモリ / Q8_0=高品質 / 元のまま。変更時はモデル再読込");
+        precHint.setTextSize(11);
+        container.addView(precHint);
+
+        final int[] selSampler = {sampler};
+        TextView samLabel = new TextView(this);
+        samLabel.setText("サンプラー");
+        samLabel.setPadding(0, dp(12), 0, 0);
+        container.addView(samLabel);
+        Button samBtn = new Button(this);
+        samBtn.setText("サンプラー: " + samplerLabel(selSampler[0]));
+        samBtn.setOnClickListener(v -> {
+            selSampler[0] = (selSampler[0] == StableDiffusionNative.SAMPLE_DPMPP2M)
+                    ? StableDiffusionNative.SAMPLE_EULER_A : StableDiffusionNative.SAMPLE_DPMPP2M;
+            samBtn.setText("サンプラー: " + samplerLabel(selSampler[0]));
+        });
+        container.addView(samBtn);
+        TextView samHint = new TextView(this);
+        samHint.setText("DPM++ 2M は少ないステップ（〜15）で収束しやすい");
+        samHint.setTextSize(11);
+        container.addView(samHint);
+
+        TextView thLabel = new TextView(this);
+        thLabel.setText("スレッド数（0=自動）");
+        thLabel.setPadding(0, dp(12), 0, 0);
+        container.addView(thLabel);
+        EditText thInput = new EditText(this);
+        thInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        thInput.setText(String.valueOf(nThreads));
+        container.addView(thInput);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(container);
+
+        new AlertDialog.Builder(this)
+                .setTitle("生成設定")
+                .setView(scroll)
+                .setPositiveButton("保存", (d, w) -> {
+                    int newThreads = Math.max(0, parseInt(thInput.getText().toString(), 0));
+                    boolean reloadNeeded = (selWtype[0] != wtype) || (newThreads != nThreads);
+                    wtype = selWtype[0];
+                    sampler = selSampler[0];
+                    nThreads = newThreads;
+                    saveGenSettings();
+                    if (reloadNeeded) {
+                        reloadModel();
+                    } else {
+                        Toast.makeText(this, "生成設定を保存しました", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("キャンセル", null)
+                .show();
+    }
+
+    /** Reload the cached model with the current weight precision / thread count. */
+    private void reloadModel() {
+        File cached = new File(getFilesDir(), MODEL_FILENAME);
+        if (!cached.exists() || cached.length() == 0) {
+            Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        setBusyUi(true);
+        setStatus("設定変更のため再読込中…" + wtypeSuffix());
+        worker.submit(() -> {
+            try {
+                String err = manager.load(cached.getAbsolutePath(), nThreads, wtype);
+                runOnUiThread(() -> {
+                    if (err.isEmpty()) {
+                        setStatus("再読込完了" + wtypeSuffix());
+                        appendLog("再読込完了" + wtypeSuffix());
+                    } else {
+                        setStatus("再読込失敗: " + err);
+                    }
+                    setBusyUi(false);
+                });
+            } catch (Throwable t) {
+                appendLogUi("再読込エラー: " + t);
+                runOnUiThread(() -> {
+                    setStatus("再読込エラー: " + t.getClass().getSimpleName());
+                    setBusyUi(false);
+                });
+            }
+        });
+    }
+
+    private String wtypeSuffix() {
+        return wtype == StableDiffusionNative.WTYPE_DEFAULT ? "" : " [" + wtypeLabel(wtype) + "]";
+    }
+
+    private static String wtypeLabel(int w) {
+        if (w == StableDiffusionNative.WTYPE_Q4_0) return "Q4_0";
+        if (w == StableDiffusionNative.WTYPE_Q8_0) return "Q8_0";
+        return "元のまま";
+    }
+
+    private static int nextWtype(int w) {
+        if (w == StableDiffusionNative.WTYPE_DEFAULT) return StableDiffusionNative.WTYPE_Q8_0;
+        if (w == StableDiffusionNative.WTYPE_Q8_0) return StableDiffusionNative.WTYPE_Q4_0;
+        return StableDiffusionNative.WTYPE_DEFAULT;
+    }
+
+    private static String samplerLabel(int s) {
+        return s == StableDiffusionNative.SAMPLE_DPMPP2M ? "DPM++ 2M" : "Euler a";
     }
 
     // --- Japanese → English prompt translation via LLM API ---
@@ -878,12 +1013,23 @@ public class MainActivity extends Activity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         llmBaseUrl = prefs.getString(PREFS_LLM_URL, DEFAULT_LLM_BASE_URL);
         llmModel = prefs.getString(PREFS_LLM_MODEL, "");
+        wtype = prefs.getInt(PREFS_WTYPE, StableDiffusionNative.WTYPE_DEFAULT);
+        sampler = prefs.getInt(PREFS_SAMPLER, StableDiffusionNative.SAMPLE_DPMPP2M);
+        nThreads = prefs.getInt(PREFS_THREADS, 0);
     }
 
     private void saveLlmSettings() {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString(PREFS_LLM_URL, llmBaseUrl)
                 .putString(PREFS_LLM_MODEL, llmModel)
+                .apply();
+    }
+
+    private void saveGenSettings() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putInt(PREFS_WTYPE, wtype)
+                .putInt(PREFS_SAMPLER, sampler)
+                .putInt(PREFS_THREADS, nThreads)
                 .apply();
     }
 
