@@ -29,7 +29,24 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17"
-                arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+                def cmakeArgs = ["-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"]
+                // GPU (Vulkan) build is enabled only when CI provides the toolchain
+                // (host shader generator + glslc + Vulkan-Hpp headers + loader stub).
+                // Without these env vars the build stays CPU-only (e.g. local builds).
+                def vkGen = System.getenv("SD_VK_SHADERS_GEN")
+                def vkGlslc = System.getenv("SD_GLSLC")
+                def vkHeaders = System.getenv("SD_VK_HEADERS")
+                def vkLibrary = System.getenv("SD_VK_LIBRARY")
+                if (vkGen && vkGlslc && vkHeaders && vkLibrary) {
+                    cmakeArgs += [
+                        "-DSD_VULKAN=ON",
+                        "-DGGML_VK_HOST_SHADERS_GEN=" + vkGen,
+                        "-DVulkan_GLSLC_EXECUTABLE=" + vkGlslc,
+                        "-DVulkan_INCLUDE_DIR=" + vkHeaders,
+                        "-DVulkan_LIBRARY=" + vkLibrary,
+                    ]
+                }
+                arguments(*cmakeArgs)
             }
         }
     }
