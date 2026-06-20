@@ -51,6 +51,7 @@ public class StableDiffusionNative {
     private native void nativeSetUseGpu(boolean useGpu);
     private native boolean nativeIsGpuActive();
     private native long nativeGetLastSeed();
+    private native String nativeLastError();
     private native void nativeFree();
 
     // --- thin public wrappers ---
@@ -112,6 +113,11 @@ public class StableDiffusionNative {
     /** Seed actually used by the most recent {@link #txt2img}. */
     public long getLastSeed() {
         return nativeGetLastSeed();
+    }
+
+    /** Last native error message (e.g. a GPU exception), or "" if none. */
+    public String getLastError() {
+        return nativeLastError();
     }
 
     public void free() {

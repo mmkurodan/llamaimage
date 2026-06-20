@@ -451,9 +451,10 @@ public class MainActivity extends Activity {
                 byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
-                    appendLogUi("生成失敗");
+                    final String nativeErr = manager.getLastError();
+                    appendLogUi("生成失敗" + (nativeErr.isEmpty() ? "" : ": " + nativeErr));
                     runOnUiThread(() -> {
-                        setStatus("生成失敗");
+                        setStatus("生成失敗" + (nativeErr.isEmpty() ? "" : " — " + nativeErr));
                         progressBar.setVisibility(View.GONE);
                         setBusyUi(false);
                     });
@@ -553,9 +554,10 @@ public class MainActivity extends Activity {
                         size, size, steps, 7.0f, strength, -1);
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
-                    appendLogUi("img2img 失敗");
+                    final String nativeErr = manager.getLastError();
+                    appendLogUi("img2img 失敗" + (nativeErr.isEmpty() ? "" : ": " + nativeErr));
                     runOnUiThread(() -> {
-                        setStatus("img2img 失敗");
+                        setStatus("img2img 失敗" + (nativeErr.isEmpty() ? "" : " — " + nativeErr));
                         progressBar.setVisibility(View.GONE);
                         setBusyUi(false);
                     });

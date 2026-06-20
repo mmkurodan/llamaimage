@@ -122,6 +122,11 @@ public final class SdModelManager {
         return sd.getLastSeed();
     }
 
+    /** Last native error message (e.g. a GPU exception), or "" if none. */
+    public String getLastError() {
+        return sd.getLastError();
+    }
+
     public synchronized void release() {
         sd.free();
         modelLoaded = false;

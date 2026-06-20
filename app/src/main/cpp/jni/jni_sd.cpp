@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <mutex>
 #include <string>
 
@@ -37,6 +38,7 @@
 static std::mutex   g_mutex;          // serializes init / generate / free
 static sd_ctx_t*    g_ctx     = nullptr;
 static int64_t      g_last_seed = -1;
+static std::string  g_last_error;     // last native error (e.g. a GPU exception)
 
 static JavaVM*      g_vm      = nullptr;
 static jobject      g_progress_listener = nullptr;  // global ref, may be null
@@ -313,6 +315,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
         jint width, jint height, jint steps,
         jfloat cfgScale, jlong seed, jint sampleMethod, jint clipSkip) {
     std::lock_guard<std::mutex> lk(g_mutex);
+    g_last_error.clear();
     if (g_ctx == nullptr) {
         ALOGE("nativeTxt2img called before init");
         return nullptr;
@@ -333,29 +336,45 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
         method = (sample_method_t)sampleMethod;
     }
 
-    sd_image_t* results = txt2img(
-        g_ctx,
-        p.c_str(),
-        n.c_str(),
-        clipSkip,          // clip_skip (<=0 == unspecified)
-        cfgScale,          // cfg_scale
-        3.5f,              // guidance (flux-only; ignored by SD1.5)
-        width,
-        height,
-        method,
-        steps,
-        used_seed,
-        1,                 // batch_count
-        nullptr,           // control_cond
-        0.9f,              // control_strength
-        20.0f,             // style_strength (pmid-only)
-        false,             // normalize_input
-        "",                // input_id_images_path
-        nullptr,           // skip_layers
-        0,                 // skip_layers_count
-        0.0f,              // slg_scale
-        0.01f,             // skip_layer_start
-        0.2f);             // skip_layer_end
+    // The GPU (Vulkan) path can throw (e.g. out-of-device-memory / device-lost on
+    // mobile GPUs); let it unwind here into a clean error+null instead of crashing
+    // the process by escaping the JNI boundary.
+    sd_image_t* results = nullptr;
+    try {
+        results = txt2img(
+            g_ctx,
+            p.c_str(),
+            n.c_str(),
+            clipSkip,          // clip_skip (<=0 == unspecified)
+            cfgScale,          // cfg_scale
+            3.5f,              // guidance (flux-only; ignored by SD1.5)
+            width,
+            height,
+            method,
+            steps,
+            used_seed,
+            1,                 // batch_count
+            nullptr,           // control_cond
+            0.9f,              // control_strength
+            20.0f,             // style_strength (pmid-only)
+            false,             // normalize_input
+            "",                // input_id_images_path
+            nullptr,           // skip_layers
+            0,                 // skip_layers_count
+            0.0f,              // slg_scale
+            0.01f,             // skip_layer_start
+            0.2f);             // skip_layer_end
+    } catch (const std::exception& e) {
+        g_last_error = std::string("txt2img 例外: ") + e.what();
+        ALOGE("%s", g_last_error.c_str());
+        sd_log_to_file((g_last_error + "\n").c_str());
+        return nullptr;
+    } catch (...) {
+        g_last_error = "txt2img 不明な例外（GPUバックエンドの可能性）";
+        ALOGE("%s", g_last_error.c_str());
+        sd_log_to_file((g_last_error + "\n").c_str());
+        return nullptr;
+    }
 
     if (results == nullptr || results[0].data == nullptr) {
         ALOGE("txt2img returned no image");
@@ -392,6 +411,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
         jint width, jint height, jint steps,
         jfloat cfgScale, jfloat strength, jlong seed, jint sampleMethod, jint clipSkip) {
     std::lock_guard<std::mutex> lk(g_mutex);
+    g_last_error.clear();
     if (g_ctx == nullptr) {
         ALOGE("nativeImg2img called before init");
         return nullptr;
@@ -428,31 +448,46 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
     init_image.channel = 3;
     init_image.data    = reinterpret_cast<uint8_t*>(init_data);
 
-    sd_image_t* results = img2img(
-        g_ctx,
-        init_image,
-        p.c_str(),
-        n.c_str(),
-        clipSkip,
-        cfgScale,
-        3.5f,              // guidance (flux-only; ignored by SD1.5)
-        width,
-        height,
-        method,
-        steps,
-        strength,
-        used_seed,
-        1,                 // batch_count
-        nullptr,           // control_cond
-        0.9f,              // control_strength
-        20.0f,             // style_strength
-        false,             // normalize_input
-        "",                // input_id_images_path
-        nullptr,           // skip_layers
-        0,                 // skip_layers_count
-        0.0f,              // slg_scale
-        0.01f,             // skip_layer_start
-        0.2f);             // skip_layer_end
+    sd_image_t* results = nullptr;
+    try {
+        results = img2img(
+            g_ctx,
+            init_image,
+            p.c_str(),
+            n.c_str(),
+            clipSkip,
+            cfgScale,
+            3.5f,              // guidance (flux-only; ignored by SD1.5)
+            width,
+            height,
+            method,
+            steps,
+            strength,
+            used_seed,
+            1,                 // batch_count
+            nullptr,           // control_cond
+            0.9f,              // control_strength
+            20.0f,             // style_strength
+            false,             // normalize_input
+            "",                // input_id_images_path
+            nullptr,           // skip_layers
+            0,                 // skip_layers_count
+            0.0f,              // slg_scale
+            0.01f,             // skip_layer_start
+            0.2f);             // skip_layer_end
+    } catch (const std::exception& e) {
+        g_last_error = std::string("img2img 例外: ") + e.what();
+        ALOGE("%s", g_last_error.c_str());
+        sd_log_to_file((g_last_error + "\n").c_str());
+        env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);
+        return nullptr;
+    } catch (...) {
+        g_last_error = "img2img 不明な例外（GPUバックエンドの可能性）";
+        ALOGE("%s", g_last_error.c_str());
+        sd_log_to_file((g_last_error + "\n").c_str());
+        env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);
+        return nullptr;
+    }
 
     env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);  // read-only, discard changes
 
@@ -482,6 +517,12 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeGetLastSeed(JNIEnv*, jobject) {
     return (jlong)g_last_seed;
+}
+
+// Last native error message (empty if none). Set when a generate call throws.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeLastError(JNIEnv* env, jobject) {
+    return env->NewStringUTF(g_last_error.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL
