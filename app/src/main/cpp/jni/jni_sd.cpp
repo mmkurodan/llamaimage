@@ -38,7 +38,7 @@
 static std::mutex   g_mutex;          // serializes init / generate / free
 static sd_ctx_t*    g_ctx     = nullptr;
 static int64_t      g_last_seed = -1;
-static std::string  g_last_error;     // last native error (e.g. a GPU exception)
+static std::string  g_last_error;     // last native error (e.g. out-of-memory)
 
 static JavaVM*      g_vm      = nullptr;
 static jobject      g_progress_listener = nullptr;  // global ref, may be null
@@ -236,21 +236,6 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetPreviewListener(JNIEn
     }
 }
 
-// Request GPU (Vulkan) for the NEXT model load. Takes effect on the following
-// nativeInit only — the backend is chosen at context-creation time. In a CPU-only
-// build (SD_USE_VULKAN undefined) this is recorded but has no effect.
-extern "C" JNIEXPORT void JNICALL
-Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetUseGpu(JNIEnv*, jobject, jboolean useGpu) {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_sd_use_gpu = (useGpu == JNI_TRUE);
-}
-
-// Whether the currently-loaded context actually initialised on a GPU backend.
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_micklab_llamaimage_StableDiffusionNative_nativeIsGpuActive(JNIEnv*, jobject) {
-    return g_sd_active_gpu ? JNI_TRUE : JNI_FALSE;
-}
-
 // Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath, jint nThreads) {
@@ -260,17 +245,13 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
         return env->NewStringUTF("model path is empty");
     }
 
-    // Free + recreate inside try/catch: when the previous context's GPU device was
-    // lost, teardown/re-init must not crash the process (lets us recover onto CPU).
+    // Free + recreate inside try/catch so a failure (e.g. std::bad_alloc on a large
+    // model) surfaces as an error string instead of crashing the process.
     try {
         if (g_ctx != nullptr) {
             free_sd_ctx(g_ctx);
             g_ctx = nullptr;
         }
-
-        // Reset before ctx creation; the patched backend selector sets it to 1 if a GPU
-        // (Vulkan) backend actually initialised. Lets the UI report the real backend.
-        g_sd_active_gpu = 0;
 
         int threads = nThreads;
         if (threads <= 0) {
@@ -295,7 +276,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
             false,         // vae_tiling
             false,         // free_params_immediately
             threads,       // n_threads
-            SD_TYPE_COUNT, // wtype: keep the model's native (Q4_0) types
+            SD_TYPE_COUNT, // wtype: keep the model's native weight types
             STD_DEFAULT_RNG,
             DEFAULT,       // schedule
             false,         // keep_clip_on_cpu
@@ -304,13 +285,11 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
             false);        // diffusion_flash_attn
     } catch (const std::exception& e) {
         g_ctx = nullptr;
-        g_sd_active_gpu = 0;
         g_last_error = std::string("init 例外: ") + e.what();
         ALOGE("%s", g_last_error.c_str());
         return env->NewStringUTF(g_last_error.c_str());
     } catch (...) {
         g_ctx = nullptr;
-        g_sd_active_gpu = 0;
         g_last_error = "init 不明な例外";
         ALOGE("%s", g_last_error.c_str());
         return env->NewStringUTF(g_last_error.c_str());
@@ -351,9 +330,8 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
         method = (sample_method_t)sampleMethod;
     }
 
-    // The GPU (Vulkan) path can throw (e.g. out-of-device-memory / device-lost on
-    // mobile GPUs); let it unwind here into a clean error+null instead of crashing
-    // the process by escaping the JNI boundary.
+    // Generation can throw (e.g. std::bad_alloc on a large request); catch it here so it
+    // becomes a clean error+null instead of crashing by escaping the JNI boundary.
     sd_image_t* results = nullptr;
     try {
         results = txt2img(
@@ -385,7 +363,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
         sd_log_to_file((g_last_error + "\n").c_str());
         return nullptr;
     } catch (...) {
-        g_last_error = "txt2img 不明な例外（GPUバックエンドの可能性）";
+        g_last_error = "txt2img 不明な例外";
         ALOGE("%s", g_last_error.c_str());
         sd_log_to_file((g_last_error + "\n").c_str());
         return nullptr;
@@ -497,7 +475,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
         env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);
         return nullptr;
     } catch (...) {
-        g_last_error = "img2img 不明な例外（GPUバックエンドの可能性）";
+        g_last_error = "img2img 不明な例外";
         ALOGE("%s", g_last_error.c_str());
         sd_log_to_file((g_last_error + "\n").c_str());
         env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);
@@ -551,5 +529,4 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeFree(JNIEnv*, jobject) {
     } catch (...) {
         g_ctx = nullptr;
     }
-    g_sd_active_gpu = 0;
 }

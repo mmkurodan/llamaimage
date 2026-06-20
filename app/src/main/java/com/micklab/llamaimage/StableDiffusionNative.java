@@ -48,8 +48,6 @@ public class StableDiffusionNative {
                                         int width, int height, int steps,
                                         float cfgScale, float strength, long seed,
                                         int sampleMethod, int clipSkip);
-    private native void nativeSetUseGpu(boolean useGpu);
-    private native boolean nativeIsGpuActive();
     private native long nativeGetLastSeed();
     private native String nativeLastError();
     private native void nativeFree();
@@ -100,22 +98,12 @@ public class StableDiffusionNative {
                 steps, cfgScale, strength, seed, sampleMethod, clipSkip);
     }
 
-    /** Choose GPU (Vulkan) vs CPU for the NEXT {@link #init}. CPU-only builds ignore this. */
-    public void setUseGpu(boolean useGpu) {
-        nativeSetUseGpu(useGpu);
-    }
-
-    /** Whether the currently-loaded context actually initialised on a GPU backend. */
-    public boolean isGpuActive() {
-        return nativeIsGpuActive();
-    }
-
     /** Seed actually used by the most recent {@link #txt2img}. */
     public long getLastSeed() {
         return nativeGetLastSeed();
     }
 
-    /** Last native error message (e.g. a GPU exception), or "" if none. */
+    /** Last native error message (e.g. on out-of-memory), or "" if none. */
     public String getLastError() {
         return nativeLastError();
     }

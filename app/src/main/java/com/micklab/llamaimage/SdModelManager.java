@@ -43,16 +43,6 @@ public final class SdModelManager {
         sd.setPreviewListener(l);
     }
 
-    /** Select GPU (Vulkan) vs CPU for the next {@link #load}. CPU-only builds ignore this. */
-    public void setUseGpu(boolean useGpu) {
-        sd.setUseGpu(useGpu);
-    }
-
-    /** Whether the currently-loaded model is running on a GPU backend. */
-    public boolean isGpuActive() {
-        return modelLoaded && sd.isGpuActive();
-    }
-
     public String systemInfo() {
         return sd.systemInfo();
     }
@@ -122,7 +112,7 @@ public final class SdModelManager {
         return sd.getLastSeed();
     }
 
-    /** Last native error message (e.g. a GPU exception), or "" if none. */
+    /** Last native error message (e.g. on out-of-memory), or "" if none. */
     public String getLastError() {
         return sd.getLastError();
     }

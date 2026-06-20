@@ -57,7 +57,6 @@ public class MainActivity extends Activity {
     private static final String PREFS_NAME = "llamaimage_prefs";
     private static final String PREFS_LLM_URL = "llm_base_url";
     private static final String PREFS_LLM_MODEL = "llm_model";
-    private static final String PREFS_USE_GPU = "use_gpu";
     private static final String DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434";
     private static final String LLM_PACKAGE = "com.micklab.llama";
     private static final String LLM_SERVICE_CLASS = "com.micklab.llama.OllamaForegroundService";
@@ -73,7 +72,6 @@ public class MainActivity extends Activity {
 
     private String llmBaseUrl = DEFAULT_LLM_BASE_URL;
     private String llmModel = "";
-    private boolean useGpu = false;          // GPU(Vulkan) vs CPU; applied at next model load
 
     private LinearLayout rootBody;
     private EditText promptEdit;
@@ -143,11 +141,11 @@ public class MainActivity extends Activity {
                 setBusyUi(true);
             });
             try {
-                String err = loadModelFile(cached.getAbsolutePath());
+                String err = manager.load(cached.getAbsolutePath(), 0);
                 if (err.isEmpty()) {
-                    appendLogUi("モデル読込成功（キャッシュ）" + backendSuffix());
+                    appendLogUi("モデル読込成功（キャッシュ）");
                     runOnUiThread(() -> {
-                        setStatus("モデル読込済み — 「生成」できます" + backendSuffix());
+                        setStatus("モデル読込済み — 「生成」できます");
                         setBusyUi(false);
                     });
                 } else {
@@ -304,7 +302,6 @@ public class MainActivity extends Activity {
         menu.add(0, 2, 1, "生成").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
         menu.add(0, 3, 2, "画像を保存").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
         menu.add(0, 4, 3, "LLM設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
-        menu.add(0, 5, 4, "演算バックエンド").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         return true;
     }
 
@@ -315,7 +312,6 @@ public class MainActivity extends Activity {
             case 2: generate(); return true;
             case 3: saveImage(); return true;
             case 4: showLlmSettingsDialog(); return true;
-            case 5: showBackendDialog(); return true;
             default: return super.onOptionsItemSelected(item);
         }
     }
@@ -368,11 +364,11 @@ public class MainActivity extends Activity {
                 appendLogUi("コピー完了");
             }
             setStatusUi("モデル読込中…");
-            String err = loadModelFile(dest.getAbsolutePath());
+            String err = manager.load(dest.getAbsolutePath(), 0);
             if (err.isEmpty()) {
-                appendLogUi("モデル読込成功" + backendSuffix());
+                appendLogUi("モデル読込成功");
                 runOnUiThread(() -> {
-                    setStatus("モデル読込済み — 「生成」できます" + backendSuffix());
+                    setStatus("モデル読込済み — 「生成」できます");
                     setBusyUi(false);
                 });
             } else {
@@ -448,14 +444,7 @@ public class MainActivity extends Activity {
 
         worker.submit(() -> {
             try {
-                boolean wasGpu = manager.isGpuActive();
                 byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
-                if (rgb == null && wasGpu && recoverToCpu()) {
-                    genStart = System.currentTimeMillis();
-                    runOnUiThread(() -> progressBar.setProgress(0));
-                    setStatusUi("CPUで再生成中…");
-                    rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
-                }
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -557,16 +546,8 @@ public class MainActivity extends Activity {
             try {
                 Bitmap scaled = Bitmap.createScaledBitmap(src, size, size, true);
                 byte[] init = bitmapToRgb(scaled);
-                boolean wasGpu = manager.isGpuActive();
                 byte[] rgb = manager.img2img(init, size, size, prompt, negative,
                         size, size, steps, 7.0f, strength, -1);
-                if (rgb == null && wasGpu && recoverToCpu()) {
-                    genStart = System.currentTimeMillis();
-                    runOnUiThread(() -> progressBar.setProgress(0));
-                    setStatusUi("CPUで再生成中…");
-                    rgb = manager.img2img(init, size, size, prompt, negative,
-                            size, size, steps, 7.0f, strength, -1);
-                }
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -593,103 +574,6 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     setStatus("img2img エラー: " + t.getClass().getSimpleName());
                     progressBar.setVisibility(View.GONE);
-                    setBusyUi(false);
-                });
-            }
-        });
-    }
-
-    // --- compute backend (CPU / GPU Vulkan) ---
-
-    /** Apply the selected backend, then (re)load the model from {@code path}. Blocking. */
-    private String loadModelFile(String path) {
-        manager.setUseGpu(useGpu);
-        return manager.load(path, 0);
-    }
-
-    /** " [GPU]" / " [CPU]" tag reflecting the backend the loaded model actually uses. */
-    private String backendSuffix() {
-        if (manager == null || !manager.isModelLoaded()) return "";
-        return manager.isGpuActive() ? " [GPU]" : " [CPU]";
-    }
-
-    /**
-     * A GPU generate just failed (e.g. ErrorDeviceLost). Persist CPU, reload the model on
-     * CPU, and report whether CPU is now ready to retry. Runs on the worker thread.
-     */
-    private boolean recoverToCpu() {
-        String gpuErr = manager.getLastError();
-        appendLogUi("GPU生成に失敗" + (gpuErr.isEmpty() ? "" : " (" + gpuErr + ")")
-                + " → CPUに切替えて再読込します");
-        useGpu = false;
-        saveBackendPref();
-        setStatusUi("GPU失敗 → CPUで再読込中…");
-        File cached = new File(getFilesDir(), MODEL_FILENAME);
-        if (!cached.exists() || cached.length() == 0) {
-            return false;
-        }
-        try {
-            String err = loadModelFile(cached.getAbsolutePath());
-            if (!err.isEmpty()) {
-                appendLogUi("CPU再読込失敗: " + err);
-                return false;
-            }
-            appendLogUi("CPUで再読込しました");
-            return true;
-        } catch (Throwable t) {
-            appendLogUi("CPU再読込エラー: " + t);
-            return false;
-        }
-    }
-
-    private void showBackendDialog() {
-        final String[] opts = {"CPU", "GPU (Vulkan)"};
-        final boolean[] sel = {useGpu};
-        new AlertDialog.Builder(this)
-                .setTitle("演算バックエンド")
-                .setSingleChoiceItems(opts, useGpu ? 1 : 0, (d, which) -> sel[0] = (which == 1))
-                .setPositiveButton("適用して再読込", (d, w) -> {
-                    boolean changed = (sel[0] != useGpu);
-                    useGpu = sel[0];
-                    saveBackendPref();
-                    if (changed) {
-                        reloadModelForBackend();
-                    }
-                })
-                .setNegativeButton("閉じる", null)
-                .show();
-    }
-
-    private void reloadModelForBackend() {
-        File cached = new File(getFilesDir(), MODEL_FILENAME);
-        if (!cached.exists() || cached.length() == 0) {
-            Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        setBusyUi(true);
-        setStatus("バックエンド切替のため再読込中… (" + (useGpu ? "GPU" : "CPU") + ")");
-        worker.submit(() -> {
-            try {
-                String err = loadModelFile(cached.getAbsolutePath());
-                runOnUiThread(() -> {
-                    if (err.isEmpty()) {
-                        boolean gpu = manager.isGpuActive();
-                        if (useGpu && !gpu) {
-                            setStatus("GPU要求 → CPUで動作中（このビルド/端末はVulkan不可）");
-                            appendLog("GPU要求しましたがCPUにフォールバックしました");
-                        } else {
-                            setStatus("再読込完了 — バックエンド: " + (gpu ? "GPU(Vulkan)" : "CPU"));
-                            appendLog("バックエンド: " + (gpu ? "GPU(Vulkan)" : "CPU"));
-                        }
-                    } else {
-                        setStatus("再読込失敗: " + err);
-                    }
-                    setBusyUi(false);
-                });
-            } catch (Throwable t) {
-                appendLogUi("再読込エラー: " + t);
-                runOnUiThread(() -> {
-                    setStatus("再読込エラー: " + t.getClass().getSimpleName());
                     setBusyUi(false);
                 });
             }
@@ -994,19 +878,12 @@ public class MainActivity extends Activity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         llmBaseUrl = prefs.getString(PREFS_LLM_URL, DEFAULT_LLM_BASE_URL);
         llmModel = prefs.getString(PREFS_LLM_MODEL, "");
-        useGpu = prefs.getBoolean(PREFS_USE_GPU, false);
     }
 
     private void saveLlmSettings() {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString(PREFS_LLM_URL, llmBaseUrl)
                 .putString(PREFS_LLM_MODEL, llmModel)
-                .apply();
-    }
-
-    private void saveBackendPref() {
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putBoolean(PREFS_USE_GPU, useGpu)
                 .apply();
     }
 
