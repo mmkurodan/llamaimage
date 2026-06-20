@@ -47,6 +47,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -61,12 +62,21 @@ public class MainActivity extends Activity {
     private static final String PREFS_WTYPE = "wtype";
     private static final String PREFS_SAMPLER = "sampler";
     private static final String PREFS_THREADS = "threads";
+    private static final String PREFS_NSFW = "nsfw_restriction";
     private static final String DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434";
     private static final String LLM_PACKAGE = "com.micklab.llama";
     private static final String LLM_SERVICE_CLASS = "com.micklab.llama.OllamaForegroundService";
     private static final String LLM_SERVICE_ACTION = "com.micklab.llama.START_SERVICE";
     private static final String LLM_PLAY_STORE_URL =
             "https://play.google.com/store/apps/details?id=com.micklab.llama";
+
+    private static final String[] NSFW_WORDS = {
+        "nsfw", "nude", "naked", "nipple", "nipples", "penis", "vagina",
+        "breast", "genitalia", "genitals", "erotic", "pornographic",
+        "pornography", "porn", "xxx", "hentai", "topless", "bottomless",
+        "pussy", "cock", "dick", "boobs", "tits", "genital",
+        "masturbat", "lewd", "obscene", "intercourse", "fetish"
+    };
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
@@ -80,15 +90,16 @@ public class MainActivity extends Activity {
     private int wtype = StableDiffusionNative.WTYPE_DEFAULT;
     private int sampler = StableDiffusionNative.SAMPLE_DPMPP2M;
     private int nThreads = 0;                 // 0 = auto (physical cores)
+    private boolean nsfwRestriction = false;
 
     private LinearLayout rootBody;
     private EditText promptEdit;
+    private TextView translatedPromptView;
     private EditText negativeEdit;
     private EditText stepsEdit;
     private EditText sizeEdit;
     private EditText strengthEdit;
     private Button generateButton;
-    private Button translateButton;
     private Button pickInitButton;
     private Button img2imgButton;
     private ImageView initThumb;
@@ -111,7 +122,6 @@ public class MainActivity extends Activity {
 
         generateButton.setOnClickListener(v -> generate());
         generateButton.setEnabled(false);
-        translateButton.setOnClickListener(v -> translatePrompt());
         pickInitButton.setOnClickListener(v -> pickInitImage());
         img2imgButton.setOnClickListener(v -> generateImg2img());
         img2imgButton.setEnabled(false);
@@ -210,7 +220,7 @@ public class MainActivity extends Activity {
         rootBody = body;
 
         TextView guide = new TextView(this);
-        guide.setText("プロンプトを入力（日本語可）→「翻訳」で英語化→「生成」。モデル・LLM・生成設定は上部メニューから。");
+        guide.setText("プロンプトを入力（日本語可）→「生成」で自動翻訳＆画像生成（LLM設定時）。モデル・LLM・生成設定は上部メニューから。");
         guide.setPadding(0, 0, 0, dp(8));
         body.addView(guide);
 
@@ -218,6 +228,13 @@ public class MainActivity extends Activity {
         promptEdit.setHint("プロンプト（日本語・英語）");
         promptEdit.setText("a photo of a cat");
         body.addView(promptEdit);
+
+        translatedPromptView = new TextView(this);
+        translatedPromptView.setTextSize(11);
+        translatedPromptView.setTextColor(0xFF888888);
+        translatedPromptView.setPadding(0, dp(2), 0, dp(4));
+        translatedPromptView.setVisibility(View.GONE);
+        body.addView(translatedPromptView);
 
         negativeEdit = new EditText(this);
         negativeEdit.setHint("ネガティブプロンプト (任意)");
@@ -246,20 +263,11 @@ public class MainActivity extends Activity {
         paramRow.addView(strengthEdit);
         body.addView(paramRow);
 
-        LinearLayout btnRow = new LinearLayout(this);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-
-        translateButton = new Button(this);
-        translateButton.setText("翻訳");
-        translateButton.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
         generateButton = new Button(this);
         generateButton.setText("生成");
-        generateButton.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f));
-
-        btnRow.addView(translateButton);
-        btnRow.addView(generateButton);
-        body.addView(btnRow);
+        generateButton.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        body.addView(generateButton);
 
         // img2img row: input-image thumbnail + pick + generate-from-image.
         LinearLayout img2imgRow = new LinearLayout(this);
@@ -439,20 +447,38 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
             return;
         }
-        final String prompt = promptEdit.getText().toString();
+        final String rawPrompt = promptEdit.getText().toString().trim();
         final String negative = negativeEdit.getText().toString();
         final int steps = parseInt(stepsEdit.getText().toString(), 20);
         final int size = parseInt(sizeEdit.getText().toString(), 512);
 
         setBusyUi(true);
-        genStart = System.currentTimeMillis();
-        progressBar.setVisibility(View.VISIBLE);
-        progressBar.setMax(steps);
-        progressBar.setProgress(0);
-        setStatus("生成開始… (" + size + "px/" + steps + "step)");
-        appendLog("生成開始: \"" + prompt + "\" " + size + "px " + steps + "step");
+        translatedPromptView.setVisibility(View.GONE);
+        setStatus("準備中…");
 
         worker.submit(() -> {
+            final String prompt = translateOrOriginal(rawPrompt);
+
+            if (nsfwRestriction && isNsfwContent(prompt)) {
+                runOnUiThread(() -> {
+                    setStatus("生成中止: 性的コンテンツを検出");
+                    Toast.makeText(this,
+                            "コンテンツがモデレートされました（性的表現を検出）。生成を中止します。",
+                            Toast.LENGTH_LONG).show();
+                    setBusyUi(false);
+                });
+                return;
+            }
+
+            genStart = System.currentTimeMillis();
+            runOnUiThread(() -> {
+                progressBar.setVisibility(View.VISIBLE);
+                progressBar.setMax(steps);
+                progressBar.setProgress(0);
+                setStatus("生成開始… (" + size + "px/" + steps + "step)");
+            });
+            appendLogUi("生成開始: \"" + prompt + "\" " + size + "px " + steps + "step");
+
             try {
                 byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1, sampler);
                 long ms = System.currentTimeMillis() - genStart;
@@ -537,7 +563,7 @@ public class MainActivity extends Activity {
             pickInitImage();
             return;
         }
-        final String prompt = promptEdit.getText().toString();
+        final String rawPrompt = promptEdit.getText().toString().trim();
         final String negative = negativeEdit.getText().toString();
         final int steps = parseInt(stepsEdit.getText().toString(), 20);
         final int size = snapTo64(parseInt(sizeEdit.getText().toString(), 512));
@@ -545,14 +571,32 @@ public class MainActivity extends Activity {
         final Bitmap src = initBitmap;
 
         setBusyUi(true);
-        genStart = System.currentTimeMillis();
-        progressBar.setVisibility(View.VISIBLE);
-        progressBar.setMax(steps);
-        progressBar.setProgress(0);
-        setStatus("img2img 生成開始… (" + size + "px/" + steps + "step, strength=" + strength + ")");
-        appendLog("img2img生成: \"" + prompt + "\" " + size + "px " + steps + "step strength=" + strength);
+        translatedPromptView.setVisibility(View.GONE);
+        setStatus("準備中…");
 
         worker.submit(() -> {
+            final String prompt = translateOrOriginal(rawPrompt);
+
+            if (nsfwRestriction && isNsfwContent(prompt)) {
+                runOnUiThread(() -> {
+                    setStatus("生成中止: 性的コンテンツを検出");
+                    Toast.makeText(this,
+                            "コンテンツがモデレートされました（性的表現を検出）。生成を中止します。",
+                            Toast.LENGTH_LONG).show();
+                    setBusyUi(false);
+                });
+                return;
+            }
+
+            genStart = System.currentTimeMillis();
+            runOnUiThread(() -> {
+                progressBar.setVisibility(View.VISIBLE);
+                progressBar.setMax(steps);
+                progressBar.setProgress(0);
+                setStatus("img2img 生成開始… (" + size + "px/" + steps + "step, strength=" + strength + ")");
+            });
+            appendLogUi("img2img生成: \"" + prompt + "\" " + size + "px " + steps + "step strength=" + strength);
+
             try {
                 Bitmap scaled = Bitmap.createScaledBitmap(src, size, size, true);
                 byte[] init = bitmapToRgb(scaled);
@@ -590,7 +634,53 @@ public class MainActivity extends Activity {
         });
     }
 
-    // --- generation settings (weight precision / sampler / threads) ---
+    // --- translation helpers (called from worker thread) ---
+
+    private String translateOrOriginal(String rawPrompt) {
+        String baseUrl = normalizeBaseUrl(llmBaseUrl);
+        if (baseUrl.isEmpty()) return rawPrompt;
+        String model = llmModel.isEmpty() ? "default" : llmModel;
+        try {
+            String result = requestLlmText(baseUrl, model, buildTranslationPrompt(rawPrompt), 30000);
+            if (result == null || result.isEmpty()) {
+                appendLogUi("翻訳スキップ: LLMからの応答が空");
+                return rawPrompt;
+            }
+            String translated = result.trim();
+            appendLogUi("翻訳: \"" + rawPrompt + "\" → \"" + translated + "\"");
+            runOnUiThread(() -> {
+                translatedPromptView.setText("英訳: " + translated);
+                translatedPromptView.setVisibility(View.VISIBLE);
+            });
+            return translated;
+        } catch (Throwable t) {
+            appendLogUi("翻訳エラー（スキップ）: " + t.getMessage());
+            return rawPrompt;
+        }
+    }
+
+    private String buildTranslationPrompt(String input) {
+        StringBuilder sb = new StringBuilder(
+            "Translate the following text to English for use as a Stable Diffusion image generation prompt. "
+            + "Output ONLY the English translation — no preamble, no explanation, no extra text.");
+        if (nsfwRestriction) {
+            sb.append(" If the input contains sexual or adult content, output only the single word: NSFW");
+        }
+        sb.append('\n').append(input);
+        return sb.toString();
+    }
+
+    private boolean isNsfwContent(String prompt) {
+        if (prompt == null || prompt.isEmpty()) return false;
+        if ("nsfw".equalsIgnoreCase(prompt.trim())) return true;
+        String lower = prompt.toLowerCase(Locale.US);
+        for (String word : NSFW_WORDS) {
+            if (lower.contains(word)) return true;
+        }
+        return false;
+    }
+
+    // --- generation settings (weight precision / sampler / threads / NSFW) ---
 
     private void showGenSettingsDialog() {
         LinearLayout container = new LinearLayout(this);
@@ -641,6 +731,23 @@ public class MainActivity extends Activity {
         thInput.setText(String.valueOf(nThreads));
         container.addView(thInput);
 
+        final boolean[] selNsfw = {nsfwRestriction};
+        TextView nsfwLabel = new TextView(this);
+        nsfwLabel.setText("性表現制限");
+        nsfwLabel.setPadding(0, dp(12), 0, 0);
+        container.addView(nsfwLabel);
+        Button nsfwBtn = new Button(this);
+        nsfwBtn.setText("性表現制限: " + (selNsfw[0] ? "ON" : "OFF"));
+        nsfwBtn.setOnClickListener(v -> {
+            selNsfw[0] = !selNsfw[0];
+            nsfwBtn.setText("性表現制限: " + (selNsfw[0] ? "ON" : "OFF"));
+        });
+        container.addView(nsfwBtn);
+        TextView nsfwHint = new TextView(this);
+        nsfwHint.setText("ONの場合、LLMへ「性的表現があればNSFWとだけ返す」よう指示します。また生成プロンプトにNSFWワードが含まれていれば生成を中止します。");
+        nsfwHint.setTextSize(11);
+        container.addView(nsfwHint);
+
         ScrollView scroll = new ScrollView(this);
         scroll.addView(container);
 
@@ -653,6 +760,7 @@ public class MainActivity extends Activity {
                     wtype = selWtype[0];
                     sampler = selSampler[0];
                     nThreads = newThreads;
+                    nsfwRestriction = selNsfw[0];
                     saveGenSettings();
                     if (reloadNeeded) {
                         reloadModel();
@@ -715,57 +823,7 @@ public class MainActivity extends Activity {
         return s == StableDiffusionNative.SAMPLE_DPMPP2M ? "DPM++ 2M" : "Euler a";
     }
 
-    // --- Japanese → English prompt translation via LLM API ---
-
-    private void translatePrompt() {
-        String baseUrl = normalizeBaseUrl(llmBaseUrl);
-        if (baseUrl.isEmpty()) {
-            Toast.makeText(this, "上部メニュー「LLM設定」でURLを設定してください", Toast.LENGTH_LONG).show();
-            return;
-        }
-        String input = promptEdit.getText().toString().trim();
-        if (input.isEmpty()) {
-            Toast.makeText(this, "プロンプトを入力してください", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        String model = llmModel.isEmpty() ? "default" : llmModel;
-
-        setBusyUi(true);
-        setStatus("翻訳中…");
-
-        final String translationPrompt =
-                "Translate the following Japanese text into English for use as a Stable Diffusion "
-                + "image generation prompt. Output only the English translation, nothing else:\n"
-                + input;
-
-        worker.submit(() -> {
-            try {
-                String result = requestLlmText(baseUrl, model, translationPrompt, 30000);
-                if (result == null || result.isEmpty()) {
-                    appendLogUi("翻訳失敗: 空のレスポンス");
-                    runOnUiThread(() -> {
-                        setStatus("翻訳失敗 — LLMからの応答が空です");
-                        setBusyUi(false);
-                    });
-                    return;
-                }
-                appendLogUi("翻訳: \"" + input + "\" → \"" + result + "\"");
-                runOnUiThread(() -> {
-                    promptEdit.setText(result);
-                    setStatus("翻訳完了 — 内容を確認して「生成」を押してください");
-                    setBusyUi(false);
-                });
-            } catch (Throwable t) {
-                String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
-                appendLogUi("翻訳エラー: " + t);
-                runOnUiThread(() -> {
-                    setStatus("翻訳エラー: " + msg);
-                    Toast.makeText(this, "翻訳エラー: " + msg, Toast.LENGTH_LONG).show();
-                    setBusyUi(false);
-                });
-            }
-        });
-    }
+    // --- LLM API ---
 
     private String requestLlmText(String baseUrl, String model, String prompt, int timeoutMs) throws Exception {
         HttpURLConnection conn = null;
@@ -1007,7 +1065,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // --- SharedPreferences for LLM config ---
+    // --- SharedPreferences ---
 
     private void loadSettings() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -1016,6 +1074,7 @@ public class MainActivity extends Activity {
         wtype = prefs.getInt(PREFS_WTYPE, StableDiffusionNative.WTYPE_DEFAULT);
         sampler = prefs.getInt(PREFS_SAMPLER, StableDiffusionNative.SAMPLE_DPMPP2M);
         nThreads = prefs.getInt(PREFS_THREADS, 0);
+        nsfwRestriction = prefs.getBoolean(PREFS_NSFW, false);
     }
 
     private void saveLlmSettings() {
@@ -1030,6 +1089,7 @@ public class MainActivity extends Activity {
                 .putInt(PREFS_WTYPE, wtype)
                 .putInt(PREFS_SAMPLER, sampler)
                 .putInt(PREFS_THREADS, nThreads)
+                .putBoolean(PREFS_NSFW, nsfwRestriction)
                 .apply();
     }
 
@@ -1076,7 +1136,6 @@ public class MainActivity extends Activity {
         boolean modelReady = manager != null && manager.isModelLoaded();
         generateButton.setEnabled(!busy && modelReady);
         img2imgButton.setEnabled(!busy && modelReady);
-        translateButton.setEnabled(!busy);
         pickInitButton.setEnabled(!busy);
     }
 
