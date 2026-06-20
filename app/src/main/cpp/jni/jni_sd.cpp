@@ -260,46 +260,61 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
         return env->NewStringUTF("model path is empty");
     }
 
-    if (g_ctx != nullptr) {
-        free_sd_ctx(g_ctx);
+    // Free + recreate inside try/catch: when the previous context's GPU device was
+    // lost, teardown/re-init must not crash the process (lets us recover onto CPU).
+    try {
+        if (g_ctx != nullptr) {
+            free_sd_ctx(g_ctx);
+            g_ctx = nullptr;
+        }
+
+        // Reset before ctx creation; the patched backend selector sets it to 1 if a GPU
+        // (Vulkan) backend actually initialised. Lets the UI report the real backend.
+        g_sd_active_gpu = 0;
+
+        int threads = nThreads;
+        if (threads <= 0) {
+            threads = get_num_physical_cores();
+        }
+
+        // Single-file SD1.5 GGUF: only model_path is set, everything else is empty.
+        // vae_decode_only=false so the VAE encoder is available for img2img.
+        g_ctx = new_sd_ctx(
+            model.c_str(),
+            "",            // clip_l_path
+            "",            // clip_g_path
+            "",            // t5xxl_path
+            "",            // diffusion_model_path
+            "",            // vae_path
+            "",            // taesd_path
+            "",            // control_net_path
+            "",            // lora_model_dir
+            "",            // embed_dir
+            "",            // stacked_id_embed_dir
+            false,         // vae_decode_only=false: load the VAE encoder too, so img2img works
+            false,         // vae_tiling
+            false,         // free_params_immediately
+            threads,       // n_threads
+            SD_TYPE_COUNT, // wtype: keep the model's native (Q4_0) types
+            STD_DEFAULT_RNG,
+            DEFAULT,       // schedule
+            false,         // keep_clip_on_cpu
+            false,         // keep_control_net_cpu
+            false,         // keep_vae_on_cpu
+            false);        // diffusion_flash_attn
+    } catch (const std::exception& e) {
         g_ctx = nullptr;
+        g_sd_active_gpu = 0;
+        g_last_error = std::string("init 例外: ") + e.what();
+        ALOGE("%s", g_last_error.c_str());
+        return env->NewStringUTF(g_last_error.c_str());
+    } catch (...) {
+        g_ctx = nullptr;
+        g_sd_active_gpu = 0;
+        g_last_error = "init 不明な例外";
+        ALOGE("%s", g_last_error.c_str());
+        return env->NewStringUTF(g_last_error.c_str());
     }
-
-    // Reset before ctx creation; the patched backend selector sets it to 1 if a GPU
-    // (Vulkan) backend actually initialised. Lets the UI report the real backend.
-    g_sd_active_gpu = 0;
-
-    int threads = nThreads;
-    if (threads <= 0) {
-        threads = get_num_physical_cores();
-    }
-
-    // Single-file SD1.5 GGUF: only model_path is set, everything else is empty.
-    // vae_decode_only=true (txt2img only, no encode), keep weights on the (CPU)
-    // compute buffer, no tiling, no flash-attn.
-    g_ctx = new_sd_ctx(
-        model.c_str(),
-        "",            // clip_l_path
-        "",            // clip_g_path
-        "",            // t5xxl_path
-        "",            // diffusion_model_path
-        "",            // vae_path
-        "",            // taesd_path
-        "",            // control_net_path
-        "",            // lora_model_dir
-        "",            // embed_dir
-        "",            // stacked_id_embed_dir
-        false,         // vae_decode_only=false: load the VAE encoder too, so img2img works
-        false,         // vae_tiling
-        false,         // free_params_immediately
-        threads,       // n_threads
-        SD_TYPE_COUNT, // wtype: keep the model's native (Q4_0) types
-        STD_DEFAULT_RNG,
-        DEFAULT,       // schedule
-        false,         // keep_clip_on_cpu
-        false,         // keep_control_net_cpu
-        false,         // keep_vae_on_cpu
-        false);        // diffusion_flash_attn
 
     if (g_ctx == nullptr) {
         return env->NewStringUTF("new_sd_ctx failed (see log)");
@@ -528,8 +543,13 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeLastError(JNIEnv* env, j
 extern "C" JNIEXPORT void JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeFree(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (g_ctx != nullptr) {
-        free_sd_ctx(g_ctx);
+    try {
+        if (g_ctx != nullptr) {
+            free_sd_ctx(g_ctx);
+            g_ctx = nullptr;
+        }
+    } catch (...) {
         g_ctx = nullptr;
     }
+    g_sd_active_gpu = 0;
 }

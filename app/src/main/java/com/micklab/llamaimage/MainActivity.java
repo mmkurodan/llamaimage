@@ -448,7 +448,14 @@ public class MainActivity extends Activity {
 
         worker.submit(() -> {
             try {
+                boolean wasGpu = manager.isGpuActive();
                 byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
+                if (rgb == null && wasGpu && recoverToCpu()) {
+                    genStart = System.currentTimeMillis();
+                    runOnUiThread(() -> progressBar.setProgress(0));
+                    setStatusUi("CPUで再生成中…");
+                    rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1);
+                }
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -550,8 +557,16 @@ public class MainActivity extends Activity {
             try {
                 Bitmap scaled = Bitmap.createScaledBitmap(src, size, size, true);
                 byte[] init = bitmapToRgb(scaled);
+                boolean wasGpu = manager.isGpuActive();
                 byte[] rgb = manager.img2img(init, size, size, prompt, negative,
                         size, size, steps, 7.0f, strength, -1);
+                if (rgb == null && wasGpu && recoverToCpu()) {
+                    genStart = System.currentTimeMillis();
+                    runOnUiThread(() -> progressBar.setProgress(0));
+                    setStatusUi("CPUで再生成中…");
+                    rgb = manager.img2img(init, size, size, prompt, negative,
+                            size, size, steps, 7.0f, strength, -1);
+                }
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -596,6 +611,35 @@ public class MainActivity extends Activity {
     private String backendSuffix() {
         if (manager == null || !manager.isModelLoaded()) return "";
         return manager.isGpuActive() ? " [GPU]" : " [CPU]";
+    }
+
+    /**
+     * A GPU generate just failed (e.g. ErrorDeviceLost). Persist CPU, reload the model on
+     * CPU, and report whether CPU is now ready to retry. Runs on the worker thread.
+     */
+    private boolean recoverToCpu() {
+        String gpuErr = manager.getLastError();
+        appendLogUi("GPU生成に失敗" + (gpuErr.isEmpty() ? "" : " (" + gpuErr + ")")
+                + " → CPUに切替えて再読込します");
+        useGpu = false;
+        saveBackendPref();
+        setStatusUi("GPU失敗 → CPUで再読込中…");
+        File cached = new File(getFilesDir(), MODEL_FILENAME);
+        if (!cached.exists() || cached.length() == 0) {
+            return false;
+        }
+        try {
+            String err = loadModelFile(cached.getAbsolutePath());
+            if (!err.isEmpty()) {
+                appendLogUi("CPU再読込失敗: " + err);
+                return false;
+            }
+            appendLogUi("CPUで再読込しました");
+            return true;
+        } catch (Throwable t) {
+            appendLogUi("CPU再読込エラー: " + t);
+            return false;
+        }
     }
 
     private void showBackendDialog() {
