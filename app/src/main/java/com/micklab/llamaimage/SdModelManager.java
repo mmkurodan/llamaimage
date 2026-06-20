@@ -43,6 +43,16 @@ public final class SdModelManager {
         sd.setPreviewListener(l);
     }
 
+    /** Select GPU (Vulkan) vs CPU for the next {@link #load}. CPU-only builds ignore this. */
+    public void setUseGpu(boolean useGpu) {
+        sd.setUseGpu(useGpu);
+    }
+
+    /** Whether the currently-loaded model is running on a GPU backend. */
+    public boolean isGpuActive() {
+        return modelLoaded && sd.isGpuActive();
+    }
+
     public String systemInfo() {
         return sd.systemInfo();
     }
@@ -87,6 +97,22 @@ public final class SdModelManager {
         try {
             return sd.txt2img(prompt, negativePrompt, width, height, steps,
                     cfgScale, seed, StableDiffusionNative.SAMPLE_EULER_A, -1);
+        } finally {
+            busy = false;
+        }
+    }
+
+    /** Generate from an existing image (img2img). Returns RGB w*h*3 or {@code null}. Blocking. */
+    public synchronized byte[] img2img(byte[] initRgb, int initW, int initH,
+                                       String prompt, String negativePrompt, int width, int height,
+                                       int steps, float cfgScale, float strength, long seed) {
+        if (!modelLoaded) {
+            return null;
+        }
+        busy = true;
+        try {
+            return sd.img2img(initRgb, initW, initH, prompt, negativePrompt, width, height,
+                    steps, cfgScale, strength, seed, StableDiffusionNative.SAMPLE_EULER_A, -1);
         } finally {
             busy = false;
         }

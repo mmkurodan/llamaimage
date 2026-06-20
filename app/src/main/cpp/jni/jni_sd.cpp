@@ -234,6 +234,21 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetPreviewListener(JNIEn
     }
 }
 
+// Request GPU (Vulkan) for the NEXT model load. Takes effect on the following
+// nativeInit only — the backend is chosen at context-creation time. In a CPU-only
+// build (SD_USE_VULKAN undefined) this is recorded but has no effect.
+extern "C" JNIEXPORT void JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetUseGpu(JNIEnv*, jobject, jboolean useGpu) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_sd_use_gpu = (useGpu == JNI_TRUE);
+}
+
+// Whether the currently-loaded context actually initialised on a GPU backend.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeIsGpuActive(JNIEnv*, jobject) {
+    return g_sd_active_gpu ? JNI_TRUE : JNI_FALSE;
+}
+
 // Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath, jint nThreads) {
@@ -247,6 +262,10 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
         free_sd_ctx(g_ctx);
         g_ctx = nullptr;
     }
+
+    // Reset before ctx creation; the patched backend selector sets it to 1 if a GPU
+    // (Vulkan) backend actually initialised. Lets the UI report the real backend.
+    g_sd_active_gpu = 0;
 
     int threads = nThreads;
     if (threads <= 0) {
@@ -268,7 +287,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
         "",            // lora_model_dir
         "",            // embed_dir
         "",            // stacked_id_embed_dir
-        true,          // vae_decode_only
+        false,         // vae_decode_only=false: load the VAE encoder too, so img2img works
         false,         // vae_tiling
         false,         // free_params_immediately
         threads,       // n_threads
@@ -340,6 +359,105 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
 
     if (results == nullptr || results[0].data == nullptr) {
         ALOGE("txt2img returned no image");
+        if (results) {
+            free(results);
+        }
+        return nullptr;
+    }
+
+    const uint32_t w = results[0].width;
+    const uint32_t h = results[0].height;
+    const uint32_t c = results[0].channel;
+    const jsize n_bytes = (jsize)(w * h * c);
+
+    jbyteArray arr = env->NewByteArray(n_bytes);
+    if (arr != nullptr) {
+        env->SetByteArrayRegion(arr, 0, n_bytes, reinterpret_cast<const jbyte*>(results[0].data));
+    }
+
+    free(results[0].data);
+    free(results);
+    return arr;
+}
+
+// img2img -> returns width*height*3 RGB bytes, or null on failure.
+// initRgb is an initW*initH*3 RGB image; strength in [0,1] controls how far the
+// result departs from it (higher = more change). Requires a context loaded with
+// vae_decode_only=false (so the VAE encoder is available).
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
+        JNIEnv* env, jobject,
+        jbyteArray initRgb, jint initW, jint initH,
+        jstring prompt, jstring negativePrompt,
+        jint width, jint height, jint steps,
+        jfloat cfgScale, jfloat strength, jlong seed, jint sampleMethod, jint clipSkip) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (g_ctx == nullptr) {
+        ALOGE("nativeImg2img called before init");
+        return nullptr;
+    }
+    if (initRgb == nullptr) {
+        ALOGE("nativeImg2img: init image is null");
+        return nullptr;
+    }
+
+    std::string p = jstr(env, prompt);
+    std::string n = jstr(env, negativePrompt);
+
+    int64_t used_seed = seed;
+    if (used_seed < 0) {
+        srand((unsigned)time(nullptr));
+        used_seed = rand();
+    }
+    g_last_seed = used_seed;
+
+    sample_method_t method = EULER_A;
+    if (sampleMethod >= 0 && sampleMethod < N_SAMPLE_METHODS) {
+        method = (sample_method_t)sampleMethod;
+    }
+
+    jbyte* init_data = env->GetByteArrayElements(initRgb, nullptr);
+    if (init_data == nullptr) {
+        ALOGE("nativeImg2img: failed to access init image bytes");
+        return nullptr;
+    }
+
+    sd_image_t init_image;
+    init_image.width   = (uint32_t)initW;
+    init_image.height  = (uint32_t)initH;
+    init_image.channel = 3;
+    init_image.data    = reinterpret_cast<uint8_t*>(init_data);
+
+    sd_image_t* results = img2img(
+        g_ctx,
+        init_image,
+        p.c_str(),
+        n.c_str(),
+        clipSkip,
+        cfgScale,
+        3.5f,              // guidance (flux-only; ignored by SD1.5)
+        width,
+        height,
+        method,
+        steps,
+        strength,
+        used_seed,
+        1,                 // batch_count
+        nullptr,           // control_cond
+        0.9f,              // control_strength
+        20.0f,             // style_strength
+        false,             // normalize_input
+        "",                // input_id_images_path
+        nullptr,           // skip_layers
+        0,                 // skip_layers_count
+        0.0f,              // slg_scale
+        0.01f,             // skip_layer_start
+        0.2f);             // skip_layer_end
+
+    env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);  // read-only, discard changes
+
+    if (results == nullptr || results[0].data == nullptr) {
+        ALOGE("img2img returned no image");
         if (results) {
             free(results);
         }

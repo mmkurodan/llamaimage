@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -51,10 +52,12 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
 
     private static final int REQ_PICK_MODEL = 1001;
+    private static final int REQ_PICK_INIT_IMAGE = 1002;
     private static final String MODEL_FILENAME = "model.gguf";
     private static final String PREFS_NAME = "llamaimage_prefs";
     private static final String PREFS_LLM_URL = "llm_base_url";
     private static final String PREFS_LLM_MODEL = "llm_model";
+    private static final String PREFS_USE_GPU = "use_gpu";
     private static final String DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434";
     private static final String LLM_PACKAGE = "com.micklab.llama";
     private static final String LLM_SERVICE_CLASS = "com.micklab.llama.OllamaForegroundService";
@@ -70,18 +73,24 @@ public class MainActivity extends Activity {
 
     private String llmBaseUrl = DEFAULT_LLM_BASE_URL;
     private String llmModel = "";
+    private boolean useGpu = false;          // GPU(Vulkan) vs CPU; applied at next model load
 
     private LinearLayout rootBody;
     private EditText promptEdit;
     private EditText negativeEdit;
     private EditText stepsEdit;
     private EditText sizeEdit;
+    private EditText strengthEdit;
     private Button generateButton;
     private Button translateButton;
+    private Button pickInitButton;
+    private Button img2imgButton;
+    private ImageView initThumb;
     private ProgressBar progressBar;
     private ImageView imageView;
     private TextView logText;
     private Bitmap lastBitmap;
+    private Bitmap initBitmap;               // selected img2img input, null until picked
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -90,13 +99,16 @@ public class MainActivity extends Activity {
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
                 | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
-        loadLlmSettings();
+        loadSettings();
         setContentView(buildUi());
         rootBody.requestFocus();
 
         generateButton.setOnClickListener(v -> generate());
         generateButton.setEnabled(false);
         translateButton.setOnClickListener(v -> translatePrompt());
+        pickInitButton.setOnClickListener(v -> pickInitImage());
+        img2imgButton.setOnClickListener(v -> generateImg2img());
+        img2imgButton.setEnabled(false);
 
         setStatus("ネイティブ初期化中…");
         worker.submit(this::initNative);
@@ -131,11 +143,11 @@ public class MainActivity extends Activity {
                 setBusyUi(true);
             });
             try {
-                String err = manager.load(cached.getAbsolutePath(), 0);
+                String err = loadModelFile(cached.getAbsolutePath());
                 if (err.isEmpty()) {
-                    appendLogUi("モデル読込成功（キャッシュ）");
+                    appendLogUi("モデル読込成功（キャッシュ）" + backendSuffix());
                     runOnUiThread(() -> {
-                        setStatus("モデル読込済み — 「生成」できます");
+                        setStatus("モデル読込済み — 「生成」できます" + backendSuffix());
                         setBusyUi(false);
                     });
                 } else {
@@ -218,8 +230,14 @@ public class MainActivity extends Activity {
         sizeEdit.setText("512");
         sizeEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+        strengthEdit = new EditText(this);
+        strengthEdit.setHint("strength");
+        strengthEdit.setText("0.6");
+        strengthEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
         paramRow.addView(stepsEdit);
         paramRow.addView(sizeEdit);
+        paramRow.addView(strengthEdit);
         body.addView(paramRow);
 
         LinearLayout btnRow = new LinearLayout(this);
@@ -236,6 +254,30 @@ public class MainActivity extends Activity {
         btnRow.addView(translateButton);
         btnRow.addView(generateButton);
         body.addView(btnRow);
+
+        // img2img row: input-image thumbnail + pick + generate-from-image.
+        LinearLayout img2imgRow = new LinearLayout(this);
+        img2imgRow.setOrientation(LinearLayout.HORIZONTAL);
+        img2imgRow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+
+        initThumb = new ImageView(this);
+        initThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(dp(48), dp(48));
+        thumbParams.rightMargin = dp(8);
+        initThumb.setLayoutParams(thumbParams);
+
+        pickInitButton = new Button(this);
+        pickInitButton.setText("入力画像");
+        pickInitButton.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        img2imgButton = new Button(this);
+        img2imgButton.setText("画像から生成");
+        img2imgButton.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        img2imgRow.addView(initThumb);
+        img2imgRow.addView(pickInitButton);
+        img2imgRow.addView(img2imgButton);
+        body.addView(img2imgRow);
 
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setVisibility(View.GONE);
@@ -261,7 +303,8 @@ public class MainActivity extends Activity {
         menu.add(0, 1, 0, "モデル選択").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
         menu.add(0, 2, 1, "生成").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
         menu.add(0, 3, 2, "画像を保存").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
-        menu.add(0, 4, 3, "LLM設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
+        menu.add(0, 4, 3, "LLM設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+        menu.add(0, 5, 4, "演算バックエンド").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         return true;
     }
 
@@ -272,6 +315,7 @@ public class MainActivity extends Activity {
             case 2: generate(); return true;
             case 3: saveImage(); return true;
             case 4: showLlmSettingsDialog(); return true;
+            case 5: showBackendDialog(); return true;
             default: return super.onOptionsItemSelected(item);
         }
     }
@@ -298,12 +342,18 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_PICK_MODEL || resultCode != RESULT_OK || data == null) return;
+        if (resultCode != RESULT_OK || data == null) return;
         final Uri uri = data.getData();
         if (uri == null) return;
-        setBusyUi(true);
-        setStatus("モデルを準備中…");
-        worker.submit(() -> loadModel(uri));
+        if (requestCode == REQ_PICK_MODEL) {
+            setBusyUi(true);
+            setStatus("モデルを準備中…");
+            worker.submit(() -> loadModel(uri));
+        } else if (requestCode == REQ_PICK_INIT_IMAGE) {
+            setBusyUi(true);
+            setStatus("入力画像を読込中…");
+            loadInitImage(uri);
+        }
     }
 
     private void loadModel(Uri uri) {
@@ -318,11 +368,11 @@ public class MainActivity extends Activity {
                 appendLogUi("コピー完了");
             }
             setStatusUi("モデル読込中…");
-            String err = manager.load(dest.getAbsolutePath(), 0);
+            String err = loadModelFile(dest.getAbsolutePath());
             if (err.isEmpty()) {
-                appendLogUi("モデル読込成功");
+                appendLogUi("モデル読込成功" + backendSuffix());
                 runOnUiThread(() -> {
-                    setStatus("モデル読込済み — 「生成」できます");
+                    setStatus("モデル読込済み — 「生成」できます" + backendSuffix());
                     setBusyUi(false);
                 });
             } else {
@@ -424,6 +474,176 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     setStatus("生成エラー: " + t.getClass().getSimpleName());
                     progressBar.setVisibility(View.GONE);
+                    setBusyUi(false);
+                });
+            }
+        });
+    }
+
+    // --- img2img: generate from a selected input image ---
+
+    private void pickInitImage() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, REQ_PICK_INIT_IMAGE);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "画像ピッカーを開けませんでした", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void loadInitImage(Uri uri) {
+        worker.submit(() -> {
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                final Bitmap bmp = BitmapFactory.decodeStream(in);
+                if (bmp == null) {
+                    appendLogUi("入力画像の読込に失敗しました");
+                    runOnUiThread(() -> Toast.makeText(this, "画像を読み込めませんでした", Toast.LENGTH_SHORT).show());
+                    return;
+                }
+                appendLogUi("入力画像を選択 (" + bmp.getWidth() + "x" + bmp.getHeight() + ")");
+                runOnUiThread(() -> {
+                    initBitmap = bmp;
+                    initThumb.setImageBitmap(bmp);
+                    setStatus("入力画像を選択しました — 「画像から生成」できます");
+                    setBusyUi(false);
+                });
+            } catch (Throwable t) {
+                appendLogUi("入力画像エラー: " + t);
+                runOnUiThread(() -> {
+                    Toast.makeText(this, "画像読込エラー", Toast.LENGTH_SHORT).show();
+                    setBusyUi(false);
+                });
+            }
+        });
+    }
+
+    private void generateImg2img() {
+        if (manager == null || !manager.isModelLoaded()) {
+            Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (initBitmap == null) {
+            Toast.makeText(this, "先に入力画像を選択してください", Toast.LENGTH_SHORT).show();
+            pickInitImage();
+            return;
+        }
+        final String prompt = promptEdit.getText().toString();
+        final String negative = negativeEdit.getText().toString();
+        final int steps = parseInt(stepsEdit.getText().toString(), 20);
+        final int size = snapTo64(parseInt(sizeEdit.getText().toString(), 512));
+        final float strength = clamp(parseFloat(strengthEdit.getText().toString(), 0.6f), 0.05f, 1.0f);
+        final Bitmap src = initBitmap;
+
+        setBusyUi(true);
+        genStart = System.currentTimeMillis();
+        progressBar.setVisibility(View.VISIBLE);
+        progressBar.setMax(steps);
+        progressBar.setProgress(0);
+        setStatus("img2img 生成開始… (" + size + "px/" + steps + "step, strength=" + strength + ")");
+        appendLog("img2img生成: \"" + prompt + "\" " + size + "px " + steps + "step strength=" + strength);
+
+        worker.submit(() -> {
+            try {
+                Bitmap scaled = Bitmap.createScaledBitmap(src, size, size, true);
+                byte[] init = bitmapToRgb(scaled);
+                byte[] rgb = manager.img2img(init, size, size, prompt, negative,
+                        size, size, steps, 7.0f, strength, -1);
+                long ms = System.currentTimeMillis() - genStart;
+                if (rgb == null) {
+                    appendLogUi("img2img 失敗");
+                    runOnUiThread(() -> {
+                        setStatus("img2img 失敗");
+                        progressBar.setVisibility(View.GONE);
+                        setBusyUi(false);
+                    });
+                    return;
+                }
+                final Bitmap bmp = rgbToBitmap(rgb, size, size);
+                final long seed = manager.getLastSeed();
+                appendLogUi("img2img 完了 seed=" + seed + " " + (ms / 1000) + "s");
+                runOnUiThread(() -> {
+                    lastBitmap = bmp;
+                    imageView.setImageBitmap(bmp);
+                    progressBar.setProgress(progressBar.getMax());
+                    setStatus("img2img 完了 seed=" + seed + " (" + (ms / 1000) + "s)");
+                    setBusyUi(false);
+                });
+            } catch (Throwable t) {
+                appendLogUi("img2img エラー: " + t);
+                runOnUiThread(() -> {
+                    setStatus("img2img エラー: " + t.getClass().getSimpleName());
+                    progressBar.setVisibility(View.GONE);
+                    setBusyUi(false);
+                });
+            }
+        });
+    }
+
+    // --- compute backend (CPU / GPU Vulkan) ---
+
+    /** Apply the selected backend, then (re)load the model from {@code path}. Blocking. */
+    private String loadModelFile(String path) {
+        manager.setUseGpu(useGpu);
+        return manager.load(path, 0);
+    }
+
+    /** " [GPU]" / " [CPU]" tag reflecting the backend the loaded model actually uses. */
+    private String backendSuffix() {
+        if (manager == null || !manager.isModelLoaded()) return "";
+        return manager.isGpuActive() ? " [GPU]" : " [CPU]";
+    }
+
+    private void showBackendDialog() {
+        final String[] opts = {"CPU", "GPU (Vulkan)"};
+        final boolean[] sel = {useGpu};
+        new AlertDialog.Builder(this)
+                .setTitle("演算バックエンド")
+                .setSingleChoiceItems(opts, useGpu ? 1 : 0, (d, which) -> sel[0] = (which == 1))
+                .setPositiveButton("適用して再読込", (d, w) -> {
+                    boolean changed = (sel[0] != useGpu);
+                    useGpu = sel[0];
+                    saveBackendPref();
+                    if (changed) {
+                        reloadModelForBackend();
+                    }
+                })
+                .setNegativeButton("閉じる", null)
+                .show();
+    }
+
+    private void reloadModelForBackend() {
+        File cached = new File(getFilesDir(), MODEL_FILENAME);
+        if (!cached.exists() || cached.length() == 0) {
+            Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        setBusyUi(true);
+        setStatus("バックエンド切替のため再読込中… (" + (useGpu ? "GPU" : "CPU") + ")");
+        worker.submit(() -> {
+            try {
+                String err = loadModelFile(cached.getAbsolutePath());
+                runOnUiThread(() -> {
+                    if (err.isEmpty()) {
+                        boolean gpu = manager.isGpuActive();
+                        if (useGpu && !gpu) {
+                            setStatus("GPU要求 → CPUで動作中（このビルド/端末はVulkan不可）");
+                            appendLog("GPU要求しましたがCPUにフォールバックしました");
+                        } else {
+                            setStatus("再読込完了 — バックエンド: " + (gpu ? "GPU(Vulkan)" : "CPU"));
+                            appendLog("バックエンド: " + (gpu ? "GPU(Vulkan)" : "CPU"));
+                        }
+                    } else {
+                        setStatus("再読込失敗: " + err);
+                    }
+                    setBusyUi(false);
+                });
+            } catch (Throwable t) {
+                appendLogUi("再読込エラー: " + t);
+                runOnUiThread(() -> {
+                    setStatus("再読込エラー: " + t.getClass().getSimpleName());
                     setBusyUi(false);
                 });
             }
@@ -724,16 +944,23 @@ public class MainActivity extends Activity {
 
     // --- SharedPreferences for LLM config ---
 
-    private void loadLlmSettings() {
+    private void loadSettings() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         llmBaseUrl = prefs.getString(PREFS_LLM_URL, DEFAULT_LLM_BASE_URL);
         llmModel = prefs.getString(PREFS_LLM_MODEL, "");
+        useGpu = prefs.getBoolean(PREFS_USE_GPU, false);
     }
 
     private void saveLlmSettings() {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString(PREFS_LLM_URL, llmBaseUrl)
                 .putString(PREFS_LLM_MODEL, llmModel)
+                .apply();
+    }
+
+    private void saveBackendPref() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREFS_USE_GPU, useGpu)
                 .apply();
     }
 
@@ -777,8 +1004,11 @@ public class MainActivity extends Activity {
     // --- helpers ---
 
     private void setBusyUi(boolean busy) {
-        generateButton.setEnabled(!busy && manager != null && manager.isModelLoaded());
+        boolean modelReady = manager != null && manager.isModelLoaded();
+        generateButton.setEnabled(!busy && modelReady);
+        img2imgButton.setEnabled(!busy && modelReady);
         translateButton.setEnabled(!busy);
+        pickInitButton.setEnabled(!busy);
     }
 
     private void setStatus(String s) {
@@ -807,6 +1037,39 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             return def;
         }
+    }
+
+    private static float parseFloat(String s, float def) {
+        try {
+            return Float.parseFloat(s.trim());
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private static float clamp(float v, float lo, float hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    /** SD1.5 needs dimensions that are multiples of 64; snap (min 64). */
+    private static int snapTo64(int v) {
+        int snapped = (v / 64) * 64;
+        return snapped < 64 ? 64 : snapped;
+    }
+
+    /** Pack a Bitmap into tightly-packed RGB (w*h*3) bytes for the native img2img call. */
+    private static byte[] bitmapToRgb(Bitmap bmp) {
+        int w = bmp.getWidth(), h = bmp.getHeight();
+        int[] px = new int[w * h];
+        bmp.getPixels(px, 0, w, 0, 0, w, h);
+        byte[] rgb = new byte[w * h * 3];
+        for (int i = 0; i < w * h; i++) {
+            int c = px[i];
+            rgb[i * 3]     = (byte) ((c >> 16) & 0xff);
+            rgb[i * 3 + 1] = (byte) ((c >> 8) & 0xff);
+            rgb[i * 3 + 2] = (byte) (c & 0xff);
+        }
+        return rgb;
     }
 
     private String normalizeBaseUrl(String url) {

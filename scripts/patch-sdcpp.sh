@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Applies out-of-tree modifications to the fetched stable-diffusion.cpp sources.
-# These add a g_sd_step_latent hook so that the JNI progress callback can read
-# the current denoised latent tensor and produce a lightweight preview image.
+# Applies out-of-tree modifications to the freshly-fetched stable-diffusion.cpp +
+# ggml sources. Designed to run on a PRISTINE checkout (as CI does after fetch);
+# each section is guarded by a sentinel so re-runs are idempotent.
 #
-# The script is idempotent: files that are already patched are silently skipped.
-# Called by fetch-sdcpp.sh after each fetch, and safe to run standalone.
+# Patches:
+#   1. util.{h,cpp}            — globals g_sd_step_latent / g_sd_use_gpu / g_sd_active_gpu
+#   2. stable-diffusion.cpp    — expose denoised latent for preview; gate the Vulkan
+#                                backend on g_sd_use_gpu and report if it initialised
+#   3. ggml-vulkan/CMakeLists  — use a host-built vulkan-shaders-gen (cross-compile) and
+#                                don't require glslc as a find_package COMPONENT
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,73 +16,107 @@ DEST="${1:-$(cd "$SCRIPT_DIR/.." && pwd)/app/src/main/cpp/sd}"
 
 echo "[patch-sdcpp] applying patches to $DEST"
 
-# ---------------------------------------------------------------------------
-# util.h — declare g_sd_step_latent
-# ---------------------------------------------------------------------------
-if grep -q "g_sd_step_latent" "$DEST/util.h" 2>/dev/null; then
-    echo "[patch-sdcpp] util.h already patched — skipping"
-else
-    python3 - "$DEST/util.h" <<'PYEOF'
+py_replace() {
+    # py_replace <file> <sentinel> <old> <new>  — replace once; skip if sentinel present.
+    python3 - "$@" <<'PYEOF'
 import sys
-path = sys.argv[1]
+path, sentinel, old, new = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 text = open(path).read()
-OLD = 'void pretty_progress(int step, int steps, float time);'
-NEW = (
-    OLD
-    + '\n\n'
-    + '// Set by the denoising loop to the current denoised latent tensor just before\n'
-    + '// each pretty_progress() call (step > 0 only). Valid only during the callback.\n'
-    + '// The JNI layer reads this to produce a lightweight latent preview image.\n'
-    + 'struct ggml_tensor;\n'
-    + 'extern struct ggml_tensor* g_sd_step_latent;'
-)
-if OLD not in text:
-    raise RuntimeError(f'Expected pattern not found in {path}')
-open(path, 'w').write(text.replace(OLD, NEW, 1))
+if sentinel in text:
+    print(f"[patch-sdcpp] {path} already patched ({sentinel}) — skipping")
+    sys.exit(0)
+if old not in text:
+    raise RuntimeError(f"Expected pattern not found in {path} for sentinel {sentinel}")
+open(path, "w").write(text.replace(old, new, 1))
+print(f"[patch-sdcpp] patched {path} ({sentinel})")
 PYEOF
-    echo "[patch-sdcpp] patched util.h"
-fi
+}
 
 # ---------------------------------------------------------------------------
-# util.cpp — define g_sd_step_latent
+# 1. util.h / util.cpp — shared globals
 # ---------------------------------------------------------------------------
-if grep -q "g_sd_step_latent" "$DEST/util.cpp" 2>/dev/null; then
-    echo "[patch-sdcpp] util.cpp already patched — skipping"
-else
-    python3 - "$DEST/util.cpp" <<'PYEOF'
-import sys
-path = sys.argv[1]
-text = open(path).read()
-OLD = 'void* sd_progress_cb_data              = NULL;'
-NEW = OLD + '\n\nstruct ggml_tensor* g_sd_step_latent = nullptr;'
-if OLD not in text:
-    raise RuntimeError(f'Expected pattern not found in {path}')
-open(path, 'w').write(text.replace(OLD, NEW, 1))
-PYEOF
-    echo "[patch-sdcpp] patched util.cpp"
-fi
+py_replace "$DEST/util.h" "g_sd_active_gpu" \
+'void pretty_progress(int step, int steps, float time);' \
+'void pretty_progress(int step, int steps, float time);
+
+// --- llamaimage hooks (out-of-tree, see scripts/patch-sdcpp.sh) -----------
+struct ggml_tensor;
+// Current denoised latent, set just before each step progress callback (valid only
+// during the callback). The JNI layer reads it to build a lightweight preview.
+extern struct ggml_tensor* g_sd_step_latent;
+// Requested at context creation: try a GPU (Vulkan) backend when true.
+extern bool g_sd_use_gpu;
+// Set to 1 by the backend selector when a GPU backend actually initialised.
+extern int g_sd_active_gpu;'
+
+py_replace "$DEST/util.cpp" "g_sd_active_gpu" \
+'void* sd_progress_cb_data              = NULL;' \
+'void* sd_progress_cb_data              = NULL;
+
+struct ggml_tensor* g_sd_step_latent = nullptr;
+bool g_sd_use_gpu    = false;
+int  g_sd_active_gpu = 0;'
 
 # ---------------------------------------------------------------------------
-# stable-diffusion.cpp — expose denoised latent around the progress callback
+# 2a. stable-diffusion.cpp — expose denoised latent around the progress callback
 # ---------------------------------------------------------------------------
-if grep -q "g_sd_step_latent" "$DEST/stable-diffusion.cpp" 2>/dev/null; then
-    echo "[patch-sdcpp] stable-diffusion.cpp already patched — skipping"
+py_replace "$DEST/stable-diffusion.cpp" "g_sd_step_latent" \
+'                pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f);' \
+'                g_sd_step_latent = denoised;  // expose for JNI preview
+                pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f);
+                g_sd_step_latent = nullptr;'
+
+# ---------------------------------------------------------------------------
+# 2b. stable-diffusion.cpp — gate Vulkan on g_sd_use_gpu; record success
+# ---------------------------------------------------------------------------
+py_replace "$DEST/stable-diffusion.cpp" "g_sd_active_gpu = 1" \
+'#ifdef SD_USE_VULKAN
+        LOG_DEBUG("Using Vulkan backend");
+        for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
+            backend = ggml_backend_vk_init(device);
+        }
+        if (!backend) {
+            LOG_WARN("Failed to initialize Vulkan backend");
+        }
+#endif' \
+'#ifdef SD_USE_VULKAN
+        if (g_sd_use_gpu) {
+            LOG_DEBUG("Using Vulkan backend");
+            for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
+                backend = ggml_backend_vk_init(device);
+            }
+            if (!backend) {
+                LOG_WARN("Failed to initialize Vulkan backend");
+            } else {
+                g_sd_active_gpu = 1;
+            }
+        }
+#endif'
+
+# ---------------------------------------------------------------------------
+# 3. ggml-vulkan/CMakeLists.txt — host shader generator + relaxed glslc find
+#    (only consulted when GGML_VULKAN is ON, i.e. a GPU build)
+# ---------------------------------------------------------------------------
+VK_CMAKE="$DEST/ggml/src/ggml-vulkan/CMakeLists.txt"
+if [ -f "$VK_CMAKE" ]; then
+    py_replace "$VK_CMAKE" "find_package(Vulkan REQUIRED)" \
+'find_package(Vulkan COMPONENTS glslc REQUIRED)' \
+'find_package(Vulkan REQUIRED)'
+
+    py_replace "$VK_CMAKE" "GGML_VK_HOST_SHADERS_GEN" \
+'    add_subdirectory(vulkan-shaders)
+
+    set (_ggml_vk_genshaders_cmd vulkan-shaders-gen)' \
+'    # llamaimage: cross-compiling to Android cannot run a target-built shader gen,
+    # so accept a host-built one via -DGGML_VK_HOST_SHADERS_GEN=<path>.
+    if (DEFINED GGML_VK_HOST_SHADERS_GEN)
+        set (_ggml_vk_genshaders_cmd ${GGML_VK_HOST_SHADERS_GEN})
+    else()
+        add_subdirectory(vulkan-shaders)
+        set (_ggml_vk_genshaders_cmd vulkan-shaders-gen)
+    endif()'
 else
-    python3 - "$DEST/stable-diffusion.cpp" <<'PYEOF'
-import sys
-path = sys.argv[1]
-text = open(path).read()
-OLD = '                pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f);'
-NEW = (
-    '                g_sd_step_latent = denoised;  // expose for JNI preview\n'
-    + OLD + '\n'
-    + '                g_sd_step_latent = nullptr;'
-)
-if OLD not in text:
-    raise RuntimeError(f'Expected pattern not found in {path}')
-open(path, 'w').write(text.replace(OLD, NEW, 1))
-PYEOF
-    echo "[patch-sdcpp] patched stable-diffusion.cpp"
+    echo "[patch-sdcpp] $VK_CMAKE not present — skipping Vulkan CMake patch"
 fi
 
 echo "[patch-sdcpp] done."

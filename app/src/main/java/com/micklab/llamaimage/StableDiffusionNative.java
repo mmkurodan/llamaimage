@@ -43,6 +43,13 @@ public class StableDiffusionNative {
     private native byte[] nativeTxt2img(String prompt, String negativePrompt,
                                         int width, int height, int steps,
                                         float cfgScale, long seed, int sampleMethod, int clipSkip);
+    private native byte[] nativeImg2img(byte[] initRgb, int initW, int initH,
+                                        String prompt, String negativePrompt,
+                                        int width, int height, int steps,
+                                        float cfgScale, float strength, long seed,
+                                        int sampleMethod, int clipSkip);
+    private native void nativeSetUseGpu(boolean useGpu);
+    private native boolean nativeIsGpuActive();
     private native long nativeGetLastSeed();
     private native void nativeFree();
 
@@ -77,6 +84,29 @@ public class StableDiffusionNative {
                           int steps, float cfgScale, long seed, int sampleMethod, int clipSkip) {
         return nativeTxt2img(prompt, negativePrompt, width, height, steps,
                 cfgScale, seed, sampleMethod, clipSkip);
+    }
+
+    /**
+     * Generate from an existing image. {@code initRgb} is initW*initH*3 RGB bytes;
+     * {@code strength} in [0,1] controls how far the result moves from the input.
+     * Returns width*height*3 RGB bytes, or {@code null} on failure.
+     */
+    public byte[] img2img(byte[] initRgb, int initW, int initH,
+                          String prompt, String negativePrompt, int width, int height,
+                          int steps, float cfgScale, float strength, long seed,
+                          int sampleMethod, int clipSkip) {
+        return nativeImg2img(initRgb, initW, initH, prompt, negativePrompt, width, height,
+                steps, cfgScale, strength, seed, sampleMethod, clipSkip);
+    }
+
+    /** Choose GPU (Vulkan) vs CPU for the NEXT {@link #init}. CPU-only builds ignore this. */
+    public void setUseGpu(boolean useGpu) {
+        nativeSetUseGpu(useGpu);
+    }
+
+    /** Whether the currently-loaded context actually initialised on a GPU backend. */
+    public boolean isGpuActive() {
+        return nativeIsGpuActive();
     }
 
     /** Seed actually used by the most recent {@link #txt2img}. */
