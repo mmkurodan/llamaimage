@@ -63,6 +63,10 @@ public class MainActivity extends Activity {
     private static final String PREFS_SAMPLER = "sampler";
     private static final String PREFS_THREADS = "threads";
     private static final String PREFS_NSFW = "nsfw_restriction";
+    private static final String PREFS_SIZE = "image_size";
+
+    private static final int[] SIZE_VALUES = {512, 384, 256};
+    private static final String[] SIZE_LABELS = {"標準 (512px)", "小 (384px)", "最小 (256px)"};
     private static final String DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434";
     private static final String LLM_PACKAGE = "com.micklab.llama";
     private static final String LLM_SERVICE_CLASS = "com.micklab.llama.OllamaForegroundService";
@@ -97,7 +101,8 @@ public class MainActivity extends Activity {
     private TextView translatedPromptView;
     private EditText negativeEdit;
     private EditText stepsEdit;
-    private EditText sizeEdit;
+    private Button sizeButton;
+    private int selectedSize = 512;
     private EditText strengthEdit;
     private Button generateButton;
     private Button pickInitButton;
@@ -248,10 +253,10 @@ public class MainActivity extends Activity {
         stepsEdit.setText("15");
         stepsEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        sizeEdit = new EditText(this);
-        sizeEdit.setHint("size");
-        sizeEdit.setText("512");
-        sizeEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        sizeButton = new Button(this);
+        sizeButton.setText(sizeLabelFor(selectedSize));
+        sizeButton.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        sizeButton.setOnClickListener(v -> showSizePicker());
 
         strengthEdit = new EditText(this);
         strengthEdit.setHint("strength");
@@ -259,7 +264,7 @@ public class MainActivity extends Activity {
         strengthEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         paramRow.addView(stepsEdit);
-        paramRow.addView(sizeEdit);
+        paramRow.addView(sizeButton);
         paramRow.addView(strengthEdit);
         body.addView(paramRow);
 
@@ -450,7 +455,7 @@ public class MainActivity extends Activity {
         final String rawPrompt = promptEdit.getText().toString().trim();
         final String negative = negativeEdit.getText().toString();
         final int steps = parseInt(stepsEdit.getText().toString(), 20);
-        final int size = parseInt(sizeEdit.getText().toString(), 512);
+        final int size = selectedSize;
 
         setBusyUi(true);
         translatedPromptView.setVisibility(View.GONE);
@@ -566,7 +571,7 @@ public class MainActivity extends Activity {
         final String rawPrompt = promptEdit.getText().toString().trim();
         final String negative = negativeEdit.getText().toString();
         final int steps = parseInt(stepsEdit.getText().toString(), 20);
-        final int size = snapTo64(parseInt(sizeEdit.getText().toString(), 512));
+        final int size = snapTo64(selectedSize);
         final float strength = clamp(parseFloat(strengthEdit.getText().toString(), 0.6f), 0.05f, 1.0f);
         final Bitmap src = initBitmap;
 
@@ -664,7 +669,9 @@ public class MainActivity extends Activity {
             "Translate the following text to English for use as a Stable Diffusion image generation prompt. "
             + "Output ONLY the English translation — no preamble, no explanation, no extra text.");
         if (nsfwRestriction) {
-            sb.append(" If the input contains sexual or adult content, output only the single word: NSFW");
+            sb.append(" Only if the input explicitly and unambiguously describes pornographic or sexually explicit content,"
+                    + " output only the single word: NSFW."
+                    + " Animals, people, food, nature, landscapes, and everyday subjects are NOT NSFW.");
         }
         sb.append('\n').append(input);
         return sb.toString();
@@ -770,6 +777,31 @@ public class MainActivity extends Activity {
                 })
                 .setNegativeButton("キャンセル", null)
                 .show();
+    }
+
+    private void showSizePicker() {
+        int current = 0;
+        for (int i = 0; i < SIZE_VALUES.length; i++) {
+            if (SIZE_VALUES[i] == selectedSize) { current = i; break; }
+        }
+        final int[] picked = {current};
+        new AlertDialog.Builder(this)
+                .setTitle("サイズ選択")
+                .setSingleChoiceItems(SIZE_LABELS, current, (d, which) -> picked[0] = which)
+                .setPositiveButton("選択", (d, w) -> {
+                    selectedSize = SIZE_VALUES[picked[0]];
+                    sizeButton.setText(SIZE_LABELS[picked[0]]);
+                    saveGenSettings();
+                })
+                .setNegativeButton("キャンセル", null)
+                .show();
+    }
+
+    private static String sizeLabelFor(int size) {
+        for (int i = 0; i < SIZE_VALUES.length; i++) {
+            if (SIZE_VALUES[i] == size) return SIZE_LABELS[i];
+        }
+        return SIZE_LABELS[0];
     }
 
     /** Reload the cached model with the current weight precision / thread count. */
@@ -1075,6 +1107,7 @@ public class MainActivity extends Activity {
         sampler = prefs.getInt(PREFS_SAMPLER, StableDiffusionNative.SAMPLE_DPMPP2M);
         nThreads = prefs.getInt(PREFS_THREADS, 0);
         nsfwRestriction = prefs.getBoolean(PREFS_NSFW, false);
+        selectedSize = prefs.getInt(PREFS_SIZE, 512);
     }
 
     private void saveLlmSettings() {
@@ -1090,6 +1123,7 @@ public class MainActivity extends Activity {
                 .putInt(PREFS_SAMPLER, sampler)
                 .putInt(PREFS_THREADS, nThreads)
                 .putBoolean(PREFS_NSFW, nsfwRestriction)
+                .putInt(PREFS_SIZE, selectedSize)
                 .apply();
     }
 
