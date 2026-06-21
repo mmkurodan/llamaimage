@@ -657,6 +657,12 @@ public class MainActivity extends Activity {
                 translatedPromptView.setText("英訳: " + translated);
                 translatedPromptView.setVisibility(View.VISIBLE);
             });
+
+            if (nsfwRestriction && checkNsfwWithLlm(baseUrl, model, translated)) {
+                appendLogUi("NSFW判定: 性的コンテンツを検出");
+                return "NSFW";
+            }
+
             return translated;
         } catch (Throwable t) {
             appendLogUi("翻訳エラー（スキップ）: " + t.getMessage());
@@ -665,16 +671,27 @@ public class MainActivity extends Activity {
     }
 
     private String buildTranslationPrompt(String input) {
-        StringBuilder sb = new StringBuilder(
-            "Translate the following text to English for use as a Stable Diffusion image generation prompt. "
-            + "Output ONLY the English translation — no preamble, no explanation, no extra text.");
-        if (nsfwRestriction) {
-            sb.append(" Only if the input explicitly and unambiguously describes pornographic or sexually explicit content,"
-                    + " output only the single word: NSFW."
-                    + " Animals, people, food, nature, landscapes, and everyday subjects are NOT NSFW.");
+        return "Translate the following text to English for use as a Stable Diffusion image generation prompt. "
+                + "Output ONLY the English translation — no preamble, no explanation, no extra text.\n"
+                + input;
+    }
+
+    private String buildNsfwCheckPrompt(String text) {
+        return "You are a content moderator. Determine if the following text describes pornographic or sexually explicit content. "
+                + "Output only the single word NSFW if it does, or OK if it does not. "
+                + "Animals, people, food, nature, landscapes, and everyday subjects are NOT NSFW.\n"
+                + text;
+    }
+
+    private boolean checkNsfwWithLlm(String baseUrl, String model, String text) {
+        try {
+            appendLogUi("NSFWチェック中…");
+            String result = requestLlmText(baseUrl, model, buildNsfwCheckPrompt(text), 10000);
+            return result != null && result.trim().equalsIgnoreCase("NSFW");
+        } catch (Throwable t) {
+            appendLogUi("NSFWチェックエラー（スキップ）: " + t.getMessage());
+            return false;
         }
-        sb.append('\n').append(input);
-        return sb.toString();
     }
 
     private boolean isNsfwContent(String prompt) {
