@@ -14,6 +14,7 @@ public class StableDiffusionNative {
     public static final int SAMPLE_EULER_A = 0;
     public static final int SAMPLE_EULER   = 1;
     public static final int SAMPLE_DPMPP2M = 5;
+    public static final int SAMPLE_LCM     = 9;   // few-step distilled models (LCM/Turbo/Hyper-SD)
 
     /** Weight types — must match enum sd_type_t in stable-diffusion.h. */
     public static final int WTYPE_DEFAULT = -1;   // keep the model's original types
@@ -45,7 +46,7 @@ public class StableDiffusionNative {
     private native void nativeSetLogPath(String path);
     private native void nativeSetProgressListener(ProgressListener listener);
     private native void nativeSetPreviewListener(PreviewListener listener);
-    private native String nativeInit(String modelPath, int nThreads, int wtype);
+    private native String nativeInit(String modelPath, int nThreads, int wtype, String taesdPath);
     private native byte[] nativeTxt2img(String prompt, String negativePrompt,
                                         int width, int height, int steps,
                                         float cfgScale, long seed, int sampleMethod, int clipSkip);
@@ -80,9 +81,11 @@ public class StableDiffusionNative {
      * Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message.
      * {@code wtype} re-quantizes weights at load (e.g. {@link #WTYPE_Q4_0}) for faster CPU
      * matmul; {@link #WTYPE_DEFAULT} keeps the model's original types.
+     * {@code taesdPath} points at optional TAESD weights for a fast, low-memory final VAE
+     * decode; pass {@code ""} to keep the model's full VAE.
      */
-    public String init(String modelPath, int nThreads, int wtype) {
-        return nativeInit(modelPath, nThreads, wtype);
+    public String init(String modelPath, int nThreads, int wtype, String taesdPath) {
+        return nativeInit(modelPath, nThreads, wtype, taesdPath == null ? "" : taesdPath);
     }
 
     /**

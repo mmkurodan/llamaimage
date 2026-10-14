@@ -55,15 +55,19 @@ public class MainActivity extends Activity {
 
     private static final int REQ_PICK_MODEL = 1001;
     private static final int REQ_PICK_INIT_IMAGE = 1002;
+    private static final int REQ_PICK_TAESD = 1003;
     private static final String MODEL_FILENAME = "model.gguf";
+    private static final String TAESD_FILENAME = "taesd.bin";
     private static final String PREFS_NAME = "llamaimage_prefs";
     private static final String PREFS_LLM_URL = "llm_base_url";
     private static final String PREFS_LLM_MODEL = "llm_model";
     private static final String PREFS_WTYPE = "wtype";
     private static final String PREFS_SAMPLER = "sampler";
+    private static final String PREFS_CFG = "cfg_scale";
     private static final String PREFS_THREADS = "threads";
     private static final String PREFS_NSFW = "nsfw_restriction";
     private static final String PREFS_SIZE = "image_size";
+    private static final String PREFS_TAESD = "taesd_path";
 
     private static final int[] SIZE_VALUES = {512, 384, 256};
     private static final String[] SIZE_LABELS = {"標準 (512px)", "小 (384px)", "最小 (256px)"};
@@ -90,11 +94,13 @@ public class MainActivity extends Activity {
 
     private String llmBaseUrl = DEFAULT_LLM_BASE_URL;
     private String llmModel = "";
-    // Generation settings (load-time: wtype/threads need a model reload; sampler is per-run).
+    // Generation settings (load-time: wtype/threads/taesd need a model reload; sampler/cfg are per-run).
     private int wtype = StableDiffusionNative.WTYPE_DEFAULT;
-    private int sampler = StableDiffusionNative.SAMPLE_DPMPP2M;
+    private int sampler = StableDiffusionNative.SAMPLE_LCM;   // few-step distilled default (LCM/Turbo/Hyper-SD)
+    private float cfgScale = 1.0f;            // 1.0 for LCM/Turbo (guidance-free); ~7 for vanilla SD1.5
     private int nThreads = 0;                 // 0 = auto (physical cores)
     private boolean nsfwRestriction = false;
+    private String taesdPath = "";            // "" = full VAE
 
     private LinearLayout rootBody;
     private EditText promptEdit;
@@ -164,7 +170,7 @@ public class MainActivity extends Activity {
                 setBusyUi(true);
             });
             try {
-                String err = manager.load(cached.getAbsolutePath(), nThreads, wtype);
+                String err = manager.load(cached.getAbsolutePath(), nThreads, wtype, taesdPath);
                 if (err.isEmpty()) {
                     appendLogUi("モデル読込成功（キャッシュ）" + wtypeSuffix());
                     runOnUiThread(() -> {
@@ -225,7 +231,9 @@ public class MainActivity extends Activity {
         rootBody = body;
 
         TextView guide = new TextView(this);
-        guide.setText("プロンプトを入力（日本語可）→「生成」で自動翻訳＆画像生成（LLM設定時）。モデル・LLM・生成設定は上部メニューから。");
+        guide.setText("プロンプトを入力（日本語可）→「生成」で自動翻訳＆画像生成（LLM設定時）。"
+                + "既定はLCM・6step・CFG=1（蒸留モデル向け）。通常のSD1.5は「生成設定」でDPM++2M・CFG≈7に。"
+                + "モデル／TAESD／各種設定は上部メニューから。");
         guide.setPadding(0, 0, 0, dp(8));
         body.addView(guide);
 
@@ -250,7 +258,7 @@ public class MainActivity extends Activity {
 
         stepsEdit = new EditText(this);
         stepsEdit.setHint("steps");
-        stepsEdit.setText("15");
+        stepsEdit.setText("6");
         stepsEdit.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         sizeButton = new Button(this);
@@ -324,6 +332,7 @@ public class MainActivity extends Activity {
         menu.add(0, 3, 2, "画像を保存").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
         menu.add(0, 4, 3, "LLM設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         menu.add(0, 5, 4, "生成設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+        menu.add(0, 6, 5, "TAESD").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         return true;
     }
 
@@ -335,6 +344,7 @@ public class MainActivity extends Activity {
             case 3: saveImage(); return true;
             case 4: showLlmSettingsDialog(); return true;
             case 5: showGenSettingsDialog(); return true;
+            case 6: showTaesdDialog(); return true;
             default: return super.onOptionsItemSelected(item);
         }
     }
@@ -372,6 +382,10 @@ public class MainActivity extends Activity {
             setBusyUi(true);
             setStatus("入力画像を読込中…");
             loadInitImage(uri);
+        } else if (requestCode == REQ_PICK_TAESD) {
+            setBusyUi(true);
+            setStatus("TAESDを準備中…");
+            worker.submit(() -> loadTaesd(uri));
         }
     }
 
@@ -387,7 +401,7 @@ public class MainActivity extends Activity {
                 appendLogUi("コピー完了");
             }
             setStatusUi("モデル読込中…");
-            String err = manager.load(dest.getAbsolutePath(), nThreads, wtype);
+            String err = manager.load(dest.getAbsolutePath(), nThreads, wtype, taesdPath);
             if (err.isEmpty()) {
                 appendLogUi("モデル読込成功" + wtypeSuffix());
                 runOnUiThread(() -> {
@@ -454,7 +468,7 @@ public class MainActivity extends Activity {
         }
         final String rawPrompt = promptEdit.getText().toString().trim();
         final String negative = negativeEdit.getText().toString();
-        final int steps = parseInt(stepsEdit.getText().toString(), 20);
+        final int steps = parseInt(stepsEdit.getText().toString(), 6);
         final int size = selectedSize;
 
         setBusyUi(true);
@@ -485,7 +499,7 @@ public class MainActivity extends Activity {
             appendLogUi("生成開始: \"" + prompt + "\" " + size + "px " + steps + "step");
 
             try {
-                byte[] rgb = manager.generate(prompt, negative, size, size, steps, 7.0f, -1, sampler);
+                byte[] rgb = manager.generate(prompt, negative, size, size, steps, cfgScale, -1, sampler);
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -570,7 +584,7 @@ public class MainActivity extends Activity {
         }
         final String rawPrompt = promptEdit.getText().toString().trim();
         final String negative = negativeEdit.getText().toString();
-        final int steps = parseInt(stepsEdit.getText().toString(), 20);
+        final int steps = parseInt(stepsEdit.getText().toString(), 6);
         final int size = snapTo64(selectedSize);
         final float strength = clamp(parseFloat(strengthEdit.getText().toString(), 0.6f), 0.05f, 1.0f);
         final Bitmap src = initBitmap;
@@ -606,7 +620,7 @@ public class MainActivity extends Activity {
                 Bitmap scaled = Bitmap.createScaledBitmap(src, size, size, true);
                 byte[] init = bitmapToRgb(scaled);
                 byte[] rgb = manager.img2img(init, size, size, prompt, negative,
-                        size, size, steps, 7.0f, strength, -1, sampler);
+                        size, size, steps, cfgScale, strength, -1, sampler);
                 long ms = System.currentTimeMillis() - genStart;
                 if (rgb == null) {
                     final String nativeErr = manager.getLastError();
@@ -736,15 +750,27 @@ public class MainActivity extends Activity {
         Button samBtn = new Button(this);
         samBtn.setText("サンプラー: " + samplerLabel(selSampler[0]));
         samBtn.setOnClickListener(v -> {
-            selSampler[0] = (selSampler[0] == StableDiffusionNative.SAMPLE_DPMPP2M)
-                    ? StableDiffusionNative.SAMPLE_EULER_A : StableDiffusionNative.SAMPLE_DPMPP2M;
+            selSampler[0] = nextSampler(selSampler[0]);
             samBtn.setText("サンプラー: " + samplerLabel(selSampler[0]));
         });
         container.addView(samBtn);
         TextView samHint = new TextView(this);
-        samHint.setText("DPM++ 2M は少ないステップ（〜15）で収束しやすい");
+        samHint.setText("LCM=蒸留モデル用（4〜8step/CFG=1）／ DPM++ 2M・Euler a=通常のSD1.5（〜20step/CFG≈7）");
         samHint.setTextSize(11);
         container.addView(samHint);
+
+        TextView cfgLabel = new TextView(this);
+        cfgLabel.setText("CFG スケール");
+        cfgLabel.setPadding(0, dp(12), 0, 0);
+        container.addView(cfgLabel);
+        final EditText cfgInput = new EditText(this);
+        cfgInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        cfgInput.setText(String.valueOf(cfgScale));
+        container.addView(cfgInput);
+        TextView cfgHint = new TextView(this);
+        cfgHint.setText("LCM/Turbo系=1.0（高速・ネガティブ無効）／ 通常のSD1.5=7.0");
+        cfgHint.setTextSize(11);
+        container.addView(cfgHint);
 
         TextView thLabel = new TextView(this);
         thLabel.setText("スレッド数（0=自動）");
@@ -783,6 +809,7 @@ public class MainActivity extends Activity {
                     boolean reloadNeeded = (selWtype[0] != wtype) || (newThreads != nThreads);
                     wtype = selWtype[0];
                     sampler = selSampler[0];
+                    cfgScale = clamp(parseFloat(cfgInput.getText().toString(), cfgScale), 0.1f, 20.0f);
                     nThreads = newThreads;
                     nsfwRestriction = selNsfw[0];
                     saveGenSettings();
@@ -832,7 +859,7 @@ public class MainActivity extends Activity {
         setStatus("設定変更のため再読込中…" + wtypeSuffix());
         worker.submit(() -> {
             try {
-                String err = manager.load(cached.getAbsolutePath(), nThreads, wtype);
+                String err = manager.load(cached.getAbsolutePath(), nThreads, wtype, taesdPath);
                 runOnUiThread(() -> {
                     if (err.isEmpty()) {
                         setStatus("再読込完了" + wtypeSuffix());
@@ -852,6 +879,83 @@ public class MainActivity extends Activity {
         });
     }
 
+    // --- TAESD (tiny autoencoder): fast, low-memory final VAE decode ---
+
+    private void showTaesdDialog() {
+        boolean set = taesdPath != null && !taesdPath.isEmpty() && new File(taesdPath).exists();
+        new AlertDialog.Builder(this)
+                .setTitle("TAESD（高速VAE / プレビュー）")
+                .setMessage(set
+                        ? "現在: 設定済み。「解除」で通常のVAEに戻します。"
+                        : "未設定。TAESDの重み（例: madebyollin/taesd の diffusion_pytorch_model.safetensors）を"
+                                + "選ぶと、最終 VAE デコードが高速化＋省メモリになります（生成中プレビューは従来の軽量近似のまま）。")
+                .setPositiveButton("ファイルを選択", (d, w) -> pickTaesd())
+                .setNeutralButton(set ? "解除" : "キャンセル", (d, w) -> { if (set) clearTaesd(); })
+                .setNegativeButton("閉じる", null)
+                .show();
+    }
+
+    private void pickTaesd() {
+        if (!nativeReady) {
+            Toast.makeText(this, "ネイティブ初期化が完了していません", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            intent.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,
+                    Uri.parse("content://com.android.externalstorage.documents/document/primary:Download"));
+        } catch (Throwable ignore) {
+        }
+        try {
+            startActivityForResult(intent, REQ_PICK_TAESD);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "ファイルピッカーを開けませんでした", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** Copy the picked TAESD file into app storage, then reload the model with it applied. */
+    private void loadTaesd(Uri uri) {
+        try {
+            long srcSize = querySize(uri);
+            File dest = new File(getFilesDir(), TAESD_FILENAME);
+            appendLogUi("TAESDコピー開始 (" + srcSize + " bytes)…");
+            copyUriToFile(uri, dest, srcSize);
+            taesdPath = dest.getAbsolutePath();
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(PREFS_TAESD, taesdPath).apply();
+            File cachedModel = new File(getFilesDir(), MODEL_FILENAME);
+            if (cachedModel.exists() && cachedModel.length() > 0) {
+                appendLogUi("TAESD設定完了 — モデルを再読込します");
+                runOnUiThread(this::reloadModel);
+            } else {
+                appendLogUi("TAESDを保存しました（次回モデル読込時に適用されます）");
+                runOnUiThread(() -> {
+                    setStatus("TAESD設定済み — モデルを読み込んでください");
+                    setBusyUi(false);
+                });
+            }
+        } catch (Throwable t) {
+            appendLogUi("TAESD準備エラー: " + t);
+            runOnUiThread(() -> {
+                setStatus("TAESD準備エラー: " + t.getClass().getSimpleName());
+                setBusyUi(false);
+            });
+        }
+    }
+
+    private void clearTaesd() {
+        taesdPath = "";
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(PREFS_TAESD, "").apply();
+        File f = new File(getFilesDir(), TAESD_FILENAME);
+        if (f.exists()) {
+            f.delete();
+        }
+        appendLogUi("TAESDを解除しました — モデルを再読込します");
+        reloadModel();
+    }
+
     private String wtypeSuffix() {
         return wtype == StableDiffusionNative.WTYPE_DEFAULT ? "" : " [" + wtypeLabel(wtype) + "]";
     }
@@ -869,7 +973,16 @@ public class MainActivity extends Activity {
     }
 
     private static String samplerLabel(int s) {
-        return s == StableDiffusionNative.SAMPLE_DPMPP2M ? "DPM++ 2M" : "Euler a";
+        if (s == StableDiffusionNative.SAMPLE_LCM) return "LCM";
+        if (s == StableDiffusionNative.SAMPLE_DPMPP2M) return "DPM++ 2M";
+        return "Euler a";
+    }
+
+    /** Cycle LCM → DPM++ 2M → Euler a → LCM for the settings toggle. */
+    private static int nextSampler(int s) {
+        if (s == StableDiffusionNative.SAMPLE_LCM) return StableDiffusionNative.SAMPLE_DPMPP2M;
+        if (s == StableDiffusionNative.SAMPLE_DPMPP2M) return StableDiffusionNative.SAMPLE_EULER_A;
+        return StableDiffusionNative.SAMPLE_LCM;
     }
 
     // --- LLM API ---
@@ -1121,10 +1234,13 @@ public class MainActivity extends Activity {
         llmBaseUrl = prefs.getString(PREFS_LLM_URL, DEFAULT_LLM_BASE_URL);
         llmModel = prefs.getString(PREFS_LLM_MODEL, "");
         wtype = prefs.getInt(PREFS_WTYPE, StableDiffusionNative.WTYPE_DEFAULT);
-        sampler = prefs.getInt(PREFS_SAMPLER, StableDiffusionNative.SAMPLE_DPMPP2M);
+        sampler = prefs.getInt(PREFS_SAMPLER, StableDiffusionNative.SAMPLE_LCM);
+        cfgScale = prefs.getFloat(PREFS_CFG, 1.0f);
         nThreads = prefs.getInt(PREFS_THREADS, 0);
         nsfwRestriction = prefs.getBoolean(PREFS_NSFW, false);
         selectedSize = prefs.getInt(PREFS_SIZE, 512);
+        String tp = prefs.getString(PREFS_TAESD, "");
+        taesdPath = (!tp.isEmpty() && new File(tp).exists()) ? tp : "";
     }
 
     private void saveLlmSettings() {
@@ -1138,6 +1254,7 @@ public class MainActivity extends Activity {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putInt(PREFS_WTYPE, wtype)
                 .putInt(PREFS_SAMPLER, sampler)
+                .putFloat(PREFS_CFG, cfgScale)
                 .putInt(PREFS_THREADS, nThreads)
                 .putBoolean(PREFS_NSFW, nsfwRestriction)
                 .putInt(PREFS_SIZE, selectedSize)

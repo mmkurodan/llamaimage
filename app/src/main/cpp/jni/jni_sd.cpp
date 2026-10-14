@@ -239,13 +239,16 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetPreviewListener(JNIEn
 // Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message.
 // wtype: an sd_type_t value to re-quantize the weights to at load (e.g. Q4_0/Q8_0 for
 // faster CPU matmul); pass <0 (or out of range) to keep the model's original types.
+// taesdPath: optional tiny-autoencoder (TAESD) weights for a fast, low-memory final VAE
+// decode; pass "" to keep the model's full VAE (unchanged behaviour).
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath, jint nThreads, jint wtype) {
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath, jint nThreads, jint wtype, jstring taesdPath) {
     std::lock_guard<std::mutex> lk(g_mutex);
     std::string model = jstr(env, modelPath);
     if (model.empty()) {
         return env->NewStringUTF("model path is empty");
     }
+    std::string taesd = jstr(env, taesdPath);   // "" -> full VAE
 
     // Free + recreate inside try/catch so a failure (e.g. std::bad_alloc on a large
     // model) surfaces as an error string instead of crashing the process.
@@ -272,13 +275,13 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
             "",            // t5xxl_path
             "",            // diffusion_model_path
             "",            // vae_path
-            "",            // taesd_path
+            taesd.c_str(), // taesd_path: tiny AE -> fast, low-memory final VAE decode ("" = full VAE)
             "",            // control_net_path
             "",            // lora_model_dir
             "",            // embed_dir
             "",            // stacked_id_embed_dir
             false,         // vae_decode_only=false: load the VAE encoder too, so img2img works
-            false,         // vae_tiling
+            true,          // vae_tiling: tile the VAE decode to cap peak memory on-device
             false,         // free_params_immediately
             threads,       // n_threads
             wt,            // wtype: original types, or Q4_0/Q8_0 to speed up CPU matmul
@@ -287,7 +290,7 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
             false,         // keep_clip_on_cpu
             false,         // keep_control_net_cpu
             false,         // keep_vae_on_cpu
-            false);        // diffusion_flash_attn
+            true);         // diffusion_flash_attn: engages for SDXL/Turbo-class heads; no-op on SD1.5
     } catch (const std::exception& e) {
         g_ctx = nullptr;
         g_last_error = std::string("init 例外: ") + e.what();

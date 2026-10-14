@@ -11,6 +11,13 @@
 対象モデル: **`Sashkanik13/sd1.5-text2img-gguf`** の単一ファイル `model_q4_0.gguf`
 （約 1.57GB, UNet+CLIP+VAE 一体型, Q4_0）。
 
+> **高速化（既定）**: 本アプリの既定は**少ステップ蒸留モデル向け**（サンプラ **LCM** / **CFG=1** / **6 step**）です。
+> `stduhpf/dreamshaper-8LCM-im-GGUF-sdcpp` などの **LCM / Turbo / Hyper-SD 系 GGUF** を読み込むと、素の SD1.5 の
+> 20 step / CFG≈7 に対し **UNet 評価が約 1/6** になり大幅に高速化します（画質は DreamShaper 系の方がむしろ上）。
+> 素の `model_q4_0.gguf` を使う場合は **「生成設定」で サンプラ=DPM++ 2M / CFG≈7**、step も 15〜20 に戻してください。
+> さらに上部メニュー **「TAESD」** で tiny-autoencoder を設定すると、**最終 VAE デコードが高速化＋省メモリ**に
+> なります（`madebyollin/taesd` の重みを使用）。※生成中プレビューは従来どおり軽量な線形近似のままです。
+
 ---
 
 ## 1. モデルの準備（端末側）
@@ -44,12 +51,13 @@ bash scripts/fetch-sdcpp.sh          # 依存取得（冪等。CMake configure �
 1. アプリ起動 → ネイティブ初期化成功後（arm64-v8a 実機が必要）、**ファイルピッカーが自動で開く**
    → Download の `model_q4_0.gguf` を選択。やり直しは上部 **ActionBar の「モデル選択」**から。
    モデルは初回のみ app 内へコピー（以降はサイズ一致で再利用）。
-2. プロンプト（既定 `a photo of a cat`）、steps（既定 20）、size（既定 512）を入力。
+2. プロンプト（既定 `a photo of a cat`）、steps（既定 6）、size（既定 512）を入力。サンプラ／CFG は「生成設定」から。
 3. **「② 生成」**（本文ボタン or ActionBar「生成」）→ 進捗が**プログレスバー**と
    **ActionBar サブタイトル**（`生成中 5/20 (123s 残り~Xs)`）に表示 → 完了後に画像表示。
 4. **ActionBar「画像を保存」**でギャラリー（Pictures/llamaimage）へ PNG 保存。
 
-> CPU 生成のため SD1.5 は **512px/20step で数分〜十数分/枚** かかります（速くしたい場合は size/steps を下げる）。
+> CPU 生成の負荷は概ね **step 数 × CFG パス数** に比例します。素の SD1.5（20step/CFG≈7）は 512px で
+> **数分〜十数分/枚**ですが、LCM/Turbo 系（6step/CFG=1）なら UNet 評価が約 1/6 で済みます。さらに size/steps を下げると短縮できます。
 > ステータスは ActionBar サブタイトルに、詳細ログは画面下部に出ます。
 
 ---

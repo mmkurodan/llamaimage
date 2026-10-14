@@ -64,12 +64,12 @@ public final class SdModelManager {
      * {@code wtype} re-quantizes weights at load (e.g. {@code WTYPE_Q4_0}); use
      * {@code WTYPE_DEFAULT} to keep the original types.
      */
-    public synchronized String load(String modelPath, int nThreads, int wtype) {
+    public synchronized String load(String modelPath, int nThreads, int wtype, String taesdPath) {
         busy = true;
         try {
             modelLoaded = false;
             loadedModelPath = null;
-            String err = sd.init(modelPath, nThreads, wtype);
+            String err = sd.init(modelPath, nThreads, wtype, taesdPath);
             if (err != null && err.isEmpty()) {
                 modelLoaded = true;
                 loadedModelPath = modelPath;
