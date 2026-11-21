@@ -40,7 +40,7 @@ jobs:
           gradle wrapper --gradle-version 8.7
           chmod +x ./gradlew
 
-      # ネイティブ層 (libsd_jni.so) のビルドに必要な NDK と CMake を導入する。
+      # ネイティブ層 (libsd_jni.so / libsd_jni_fp16.so) のビルドに必要な NDK と CMake を導入する。
       # build.gradle の ndkVersion と一致させ、AGP が確実に検出できるようにする。
       - name: Install Android NDK & CMake
         run: |
@@ -71,6 +71,17 @@ jobs:
       - name: Build Signed Release AAB
         # injected signing は使わず、app/build.gradle の署名設定を使う
         run: ./gradlew --no-daemon --console=plain bundleRelease
+
+      # libsd_jni.so (armv8-a) と libsd_jni_fp16.so (armv8.2-a+fp16+dotprod, :sdjni-fp16) の
+      # 両方が APK に入っていることを確認する (実行時に CPU 機能で選択される)。
+      - name: Verify native libraries in APKs
+        run: |
+          for apk in app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/release/app-release.apk; do
+            for lib in libsd_jni.so libsd_jni_fp16.so; do
+              unzip -l "$apk" "lib/arm64-v8a/$lib" > /dev/null || { echo "::error::$lib missing in $apk"; exit 1; }
+            done
+            echo "$apk:"; unzip -l "$apk" 'lib/*' | awk '$4 ~ /\.so$/ {print "  " $1 " " $4}'
+          done
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4.6.2

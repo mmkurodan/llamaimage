@@ -6,9 +6,16 @@
 /build/
 /app/build/
 /app/.cxx/
+/sdjni-fp16/build/
+/sdjni-fp16/.cxx/
 local.properties
 *.iml
 .idea/
+
+# .so files staged by build-local.sh (packaged only with -PsdPrebuiltNative=true) + its work dirs
+/app/src/main/jniLibs/
+/.build-local-wrap/
+/.build-local-native/
 
 # Signing material restored in CI
 /app/keystore.jks

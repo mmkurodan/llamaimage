@@ -1,53 +1,89 @@
-// JNI bridge for stable-diffusion.cpp (SD1.5 text2img PoC).
+// JNI bridge for stable-diffusion.cpp (SD1.x / SD2.x txt2img + img2img).
 //
-// Mirrors the design of the LLM AI Server's jni_llama.cpp: a single global engine
-// context loaded once, dynamic JNI naming (Java_<pkg>_<class>_<method>), String-return
-// init that yields "" on success / an error message on failure, and a progress callback
-// bridged back to a Java listener. CPU backend only (see CMakeLists.txt).
+// Mirrors the design of the LLM AI Server's jni_llama.cpp: a single global engine context,
+// dynamic JNI naming (Java_<pkg>_<class>_<method>), a String-returning init that yields "" on
+// success / an error message on failure, and progress/preview callbacks bridged back to Java.
+// CPU backend only (see CMakeLists.txt). The same source is built once per CPU variant
+// (SD_JNI_VARIANT, e.g. baseline armv8-a vs. armv8.2-a+fp16+dotprod); Java picks the library.
 //
-// Builds for Android (arm64-v8a) and also compiles on a host toolchain so the bridge can
-// be sanity-checked off-device (android/log.h usage is guarded by __ANDROID__).
+// Relies on the out-of-tree sd.cpp hooks applied by scripts/patch-sdcpp.sh:
+//   g_sd_step_latent  current denoised latent during a sampling-step callback (preview)
+//   g_sd_phase        1 = sampling steps, 2 = VAE decode tiles (both share the progress callback)
+//   sd_unwind_cleanup frees work buffers when the cancel exception unwinds through sd.cpp
+//
+// Also compiles on a host toolchain so the bridge can be sanity-checked off-device
+// (android/log.h usage is guarded by __ANDROID__).
 
 #include <jni.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <exception>
 #include <mutex>
+#include <random>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "stable-diffusion.h"
-#include "util.h"                     // g_sd_step_latent
+#include "util.h"                     // g_sd_step_latent, g_sd_phase (scripts/patch-sdcpp.sh)
 #include "ggml/include/ggml.h"        // ggml_tensor for latent preview
 
 #ifdef __ANDROID__
 #include <android/log.h>
 #define LOG_TAG "sd_jni"
+#define ALOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #else
+#define ALOGD(...) ((void)0)
 #define ALOGI(...) ((void)0)
 #define ALOGE(...) ((void)0)
 #endif
 
+#ifndef SD_JNI_VARIANT
+#define SD_JNI_VARIANT "armv8-a"
+#endif
+
+// Progress phases reported to Java (must match StableDiffusionNative.PHASE_*).
+static const int kPhaseSampling = 1;
+[[maybe_unused]] static const int kPhaseDecode = 2;   // VAE-decode tiles (only forwarded)
+
 // ---------------------------------------------------------------------------
 // Global engine state (single context, like ModelManager's single model).
 // ---------------------------------------------------------------------------
-static std::mutex   g_mutex;          // serializes init / generate / free
-static sd_ctx_t*    g_ctx     = nullptr;
-static int64_t      g_last_seed = -1;
-static std::string  g_last_error;     // last native error (e.g. out-of-memory)
+static std::mutex          g_mutex;               // serializes init / generate / free
+static sd_ctx_t*           g_ctx = nullptr;
+static std::atomic<int64_t> g_last_seed{-1};
+static std::atomic<bool>   g_cancel{false};       // set by nativeCancel, cleared by nativeClearCancel
+static std::atomic<bool>   g_cancelled{false};    // last generate ended because of a cancel
+static std::mutex          g_err_mutex;
+static std::string         g_last_error;          // last native error (e.g. out-of-memory)
 
-static JavaVM*      g_vm      = nullptr;
-static jobject      g_progress_listener = nullptr;  // global ref, may be null
-static jobject      g_preview_listener  = nullptr;  // global ref, may be null
-static std::string  g_log_path;                     // optional log file
+static JavaVM*             g_vm = nullptr;
+static std::mutex          g_listener_mutex;      // guards the listener ref + method ids
+static jobject             g_listener = nullptr;  // global ref, may be null
+static jmethodID           g_on_progress = nullptr;  // void onProgress(int phase, int step, int steps)
+static jmethodID           g_on_preview  = nullptr;  // void onPreview(byte[] rgb, int w, int h)
+static std::mutex          g_log_mutex;
+static std::string         g_log_path;            // optional log file (INFO and above)
+
+// Thrown from the progress callback to abort sampling; caught in nativeTxt2img/nativeImg2img.
+// Deliberately not derived from std::exception so nothing in between can mistake it for an error.
+struct sd_jni_cancelled {};
+
+static void set_error(const std::string& e) {
+    std::lock_guard<std::mutex> lk(g_err_mutex);
+    g_last_error = e;
+}
 
 // ---------------------------------------------------------------------------
-// Latent → RGB approximation coefficients (A1111 "cheap approximation").
-// Maps the 4 SD1.5 latent channels to RGB at latent resolution (W/8 x H/8).
+// Latent → RGB approximation (the widely used SD1.x/2.x "cheap approximation";
+// keturn, also used by A1111/ComfyUI previews): rgb = latent · coeff, image = rgb * 0.5 + 0.5.
+// Maps the 4 latent channels to RGB at latent resolution (W/8 x H/8).
 // ---------------------------------------------------------------------------
 static const float kLatentRgbCoeff[4][3] = {
     //    R        G        B
@@ -58,11 +94,15 @@ static const float kLatentRgbCoeff[4][3] = {
 };
 
 // ---------------------------------------------------------------------------
-// Logging: forward sd.cpp log lines to logcat and (optionally) a file, matching
-// the parent app's "everything also goes to a log file" behaviour.
+// Logging: forward sd.cpp log lines to logcat and (INFO and above) to a log file,
+// matching the parent app's "everything also goes to a log file" behaviour.
 // ---------------------------------------------------------------------------
 static void sd_log_to_file(const char* text) {
-    if (g_log_path.empty() || text == nullptr) {
+    if (text == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_log_mutex);
+    if (g_log_path.empty()) {
         return;
     }
     FILE* f = fopen(g_log_path.c_str(), "a");
@@ -76,21 +116,116 @@ static void sd_log_cb(enum sd_log_level_t level, const char* text, void* /*data*
     if (text == nullptr) {
         return;
     }
-    if (level == SD_LOG_ERROR) {
-        ALOGE("%s", text);
-    } else {
-        ALOGI("%s", text);
+    switch (level) {
+        case SD_LOG_DEBUG:
+            ALOGD("%s", text);
+            return;  // per-tensor/buffer chatter: logcat only
+        case SD_LOG_ERROR:
+            ALOGE("%s", text);
+            break;
+        default:
+            ALOGI("%s", text);
+            break;
     }
     sd_log_to_file(text);
 }
 
 // ---------------------------------------------------------------------------
-// Progress: sd.cpp invokes this synchronously on the generating thread (the Java
-// worker thread that called txt2img). g_sd_step_latent is set by stable-diffusion.cpp
-// to the current denoised latent tensor just before this callback fires (step > 0).
-// We use it to produce a lightweight RGB preview via linear approximation.
+// UTF-16 (Java) -> standard UTF-8. GetStringUTFChars returns *modified* UTF-8 (surrogate pairs
+// as 6 bytes), which sd.cpp's tokenizer rejects (utf8_to_utf32 throws), so convert by hand.
 // ---------------------------------------------------------------------------
+static std::string jstr(JNIEnv* env, jstring s) {
+    std::string out;
+    if (s == nullptr) {
+        return out;
+    }
+    const jsize len = env->GetStringLength(s);
+    std::vector<jchar> buf((size_t)len);
+    if (len > 0) {
+        env->GetStringRegion(s, 0, len, buf.data());
+    }
+    out.reserve((size_t)len * 3);
+    for (jsize i = 0; i < len; ++i) {
+        uint32_t cp = buf[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < len && buf[i + 1] >= 0xDC00 && buf[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (uint32_t)(buf[i + 1] - 0xDC00);
+            ++i;
+        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+            cp = 0xFFFD;  // lone surrogate
+        }
+        if (cp < 0x80) {
+            out += (char)cp;
+        } else if (cp < 0x800) {
+            out += (char)(0xC0 | (cp >> 6));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += (char)(0xE0 | (cp >> 12));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else {
+            out += (char)(0xF0 | (cp >> 18));
+            out += (char)(0x80 | ((cp >> 12) & 0x3F));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Progress: sd.cpp invokes this synchronously on the generating thread (the Java worker thread
+// that called txt2img). g_sd_phase tells sampling steps (1) from VAE-decode tiles (2) — both use
+// this callback. During a sampling step g_sd_step_latent holds the current denoised latent,
+// which we turn into a lightweight RGB preview.
+// ---------------------------------------------------------------------------
+static void emit_preview(JNIEnv* env, const struct ggml_tensor* lat) {
+    if (g_on_preview == nullptr || lat == nullptr || lat->type != GGML_TYPE_F32) {
+        return;
+    }
+    const int W = (int)lat->ne[0];  // latent width  (image_w / 8)
+    const int H = (int)lat->ne[1];  // latent height (image_h / 8)
+    const int C = (int)lat->ne[2];  // 4 for SD1.x / SD2.x
+    if (W <= 0 || H <= 0 || C < 4) {
+        return;
+    }
+    std::vector<jbyte> rgb((size_t)W * H * 3);
+    for (int h = 0; h < H; ++h) {
+        for (int w = 0; w < W; ++w) {
+            float L[4];
+            for (int c = 0; c < 4; ++c) {
+                L[c] = *(const float*)((const char*)lat->data + c * lat->nb[2] + h * lat->nb[1] + w * lat->nb[0]);
+            }
+            for (int ch = 0; ch < 3; ++ch) {
+                float v = 0.0f;
+                for (int c = 0; c < 4; ++c) {
+                    v += kLatentRgbCoeff[c][ch] * L[c];
+                }
+                int iv = (int)((v * 0.5f + 0.5f) * 255.0f + 0.5f);
+                iv = iv < 0 ? 0 : (iv > 255 ? 255 : iv);
+                rgb[((size_t)h * W + w) * 3 + ch] = (jbyte)iv;
+            }
+        }
+    }
+    jbyteArray arr = env->NewByteArray((jsize)rgb.size());
+    if (arr == nullptr) {
+        env->ExceptionClear();
+        return;
+    }
+    env->SetByteArrayRegion(arr, 0, (jsize)rgb.size(), rgb.data());
+    env->CallVoidMethod(g_listener, g_on_preview, arr, W, H);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(arr);
+}
+
 static void sd_progress_cb(int step, int steps, float /*time*/, void* /*data*/) {
+    const int phase = g_sd_phase;
+    // Cancel only between sampling steps: nothing is mid-flight there, and the unwind is cleaned
+    // up by sd_unwind_cleanup (patch-sdcpp.sh). The VAE decode is short and runs to completion.
+    if (phase == kPhaseSampling && g_cancel.load()) {
+        throw sd_jni_cancelled();
+    }
     if (g_vm == nullptr) {
         return;
     }
@@ -107,73 +242,20 @@ static void sd_progress_cb(int step, int steps, float /*time*/, void* /*data*/) 
         }
         attached = true;
     }
-
-    // --- 1. Fire step progress to ProgressListener ---
-    if (g_progress_listener != nullptr) {
-        jclass cls = env->GetObjectClass(g_progress_listener);
-        jmethodID mid = env->GetMethodID(cls, "onProgress", "(II)V");
-        if (mid != nullptr) {
-            env->CallVoidMethod(g_progress_listener, mid, step, steps);
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-            }
-        }
-        env->DeleteLocalRef(cls);
-    }
-
-    // --- 2. Build latent preview and fire PreviewListener ---
-    struct ggml_tensor* lat = g_sd_step_latent;
-    if (g_preview_listener != nullptr && lat != nullptr && lat->type == GGML_TYPE_F32) {
-        const int W = (int)lat->ne[0];  // latent width  (image_w / 8)
-        const int H = (int)lat->ne[1];  // latent height (image_h / 8)
-        const int C = (int)lat->ne[2];  // should be 4 for SD1.5
-
-        if (W > 0 && H > 0 && C >= 4) {
-            const int n_px = W * H;
-            jbyteArray rgb_arr = env->NewByteArray(n_px * 3);
-            if (rgb_arr != nullptr) {
-                jbyte* rgb = env->GetByteArrayElements(rgb_arr, nullptr);
-                if (rgb != nullptr) {
-                    for (int h = 0; h < H; ++h) {
-                        for (int w = 0; w < W; ++w) {
-                            // Read the 4 latent channels for this pixel
-                            float L[4];
-                            for (int c = 0; c < 4; ++c) {
-                                L[c] = *(const float*)((const char*)lat->data
-                                        + c * lat->nb[2]
-                                        + h * lat->nb[1]
-                                        + w * lat->nb[0]);
-                            }
-                            // Apply approximation coefficients + bias
-                            for (int ch = 0; ch < 3; ++ch) {
-                                float val = 0.5f;
-                                for (int c = 0; c < 4; ++c) {
-                                    val += kLatentRgbCoeff[c][ch] * L[c];
-                                }
-                                int iv = (int)(val * 255.0f + 0.5f);
-                                if (iv < 0) iv = 0;
-                                if (iv > 255) iv = 255;
-                                rgb[(h * W + w) * 3 + ch] = (jbyte)iv;
-                            }
-                        }
-                    }
-                    env->ReleaseByteArrayElements(rgb_arr, rgb, 0);
-
-                    jclass pcls = env->GetObjectClass(g_preview_listener);
-                    jmethodID pmid = env->GetMethodID(pcls, "onPreview", "([BII)V");
-                    if (pmid != nullptr) {
-                        env->CallVoidMethod(g_preview_listener, pmid, rgb_arr, W, H);
-                        if (env->ExceptionCheck()) {
-                            env->ExceptionClear();
-                        }
-                    }
-                    env->DeleteLocalRef(pcls);
+    {
+        std::lock_guard<std::mutex> lk(g_listener_mutex);
+        if (g_listener != nullptr) {
+            if (g_on_progress != nullptr) {
+                env->CallVoidMethod(g_listener, g_on_progress, phase, step, steps);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
                 }
-                env->DeleteLocalRef(rgb_arr);
+            }
+            if (phase == kPhaseSampling && step > 0) {
+                emit_preview(env, g_sd_step_latent);
             }
         }
     }
-
     if (attached) {
         g_vm->DetachCurrentThread();
     }
@@ -189,66 +271,63 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
     return JNI_VERSION_1_6;
 }
 
-static std::string jstr(JNIEnv* env, jstring s) {
-    if (s == nullptr) {
-        return std::string();
-    }
-    const char* c = env->GetStringUTFChars(s, nullptr);
-    std::string out = c ? c : "";
-    if (c) {
-        env->ReleaseStringUTFChars(s, c);
-    }
-    return out;
-}
-
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeSystemInfo(JNIEnv* env, jobject) {
-    return env->NewStringUTF(sd_get_system_info());
+    std::string info = std::string("libsd_jni variant: ") + SD_JNI_VARIANT + "\n" + sd_get_system_info();
+    return env->NewStringUTF(info.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetLogPath(JNIEnv* env, jobject, jstring path) {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_log_path = jstr(env, path);
+    std::string p = jstr(env, path);
+    std::lock_guard<std::mutex> lk(g_log_mutex);
+    g_log_path = p;
 }
 
+// Registers the single callback object (StableDiffusionNative.Callbacks). Does not take the
+// engine mutex, so it never blocks behind a running generation.
 extern "C" JNIEXPORT void JNICALL
-Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetProgressListener(JNIEnv* env, jobject, jobject listener) {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    if (g_progress_listener != nullptr) {
-        env->DeleteGlobalRef(g_progress_listener);
-        g_progress_listener = nullptr;
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetListener(JNIEnv* env, jobject, jobject listener) {
+    std::lock_guard<std::mutex> lk(g_listener_mutex);
+    if (g_listener != nullptr) {
+        env->DeleteGlobalRef(g_listener);
+        g_listener = nullptr;
     }
-    if (listener != nullptr) {
-        g_progress_listener = env->NewGlobalRef(listener);
+    g_on_progress = nullptr;
+    g_on_preview = nullptr;
+    if (listener == nullptr) {
+        return;
     }
+    jclass cls = env->GetObjectClass(listener);
+    g_on_progress = env->GetMethodID(cls, "onProgress", "(III)V");
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        g_on_progress = nullptr;
+    }
+    g_on_preview = env->GetMethodID(cls, "onPreview", "([BII)V");
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        g_on_preview = nullptr;
+    }
+    env->DeleteLocalRef(cls);
+    g_listener = env->NewGlobalRef(listener);
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetPreviewListener(JNIEnv* env, jobject, jobject listener) {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    if (g_preview_listener != nullptr) {
-        env->DeleteGlobalRef(g_preview_listener);
-        g_preview_listener = nullptr;
-    }
-    if (listener != nullptr) {
-        g_preview_listener = env->NewGlobalRef(listener);
-    }
-}
-
-// Load an all-in-one SD1.5 GGUF. Returns "" on success or an error message.
-// wtype: an sd_type_t value to re-quantize the weights to at load (e.g. Q4_0/Q8_0 for
-// faster CPU matmul); pass <0 (or out of range) to keep the model's original types.
-// taesdPath: optional tiny-autoencoder (TAESD) weights for a fast, low-memory final VAE
-// decode; pass "" to keep the model's full VAE (unchanged behaviour).
+// Load a single-file SD checkpoint (GGUF/safetensors/ckpt). Returns "" on success or an error.
+// wtype: an sd_type_t to re-quantize weights to at load (<0 keeps the file's types).
+// taesdPath: optional TAESD weights for a fast, low-memory final VAE decode ("" = full VAE).
+// vaeTiling: decode the VAE in tiles (caps peak memory; costs ~2x decode time at 512px).
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath, jint nThreads, jint wtype, jstring taesdPath) {
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath,
+                                                             jint nThreads, jint wtype, jstring taesdPath,
+                                                             jboolean vaeTiling) {
     std::lock_guard<std::mutex> lk(g_mutex);
     std::string model = jstr(env, modelPath);
     if (model.empty()) {
         return env->NewStringUTF("model path is empty");
     }
-    std::string taesd = jstr(env, taesdPath);   // "" -> full VAE
+    std::string taesd = jstr(env, taesdPath);
+    set_error("");
 
     // Free + recreate inside try/catch so a failure (e.g. std::bad_alloc on a large
     // model) surfaces as an error string instead of crashing the process.
@@ -260,14 +339,20 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
 
         int threads = nThreads;
         if (threads <= 0) {
-            threads = get_num_physical_cores();
+            // Java normally passes an explicit count (performance cores). Note: sd.cpp's own
+            // get_num_physical_cores() mis-builds its sysfs path at this pin and returns n/2.
+            unsigned hc = std::thread::hardware_concurrency();
+            threads = hc > 0 ? (int)hc : 4;
         }
 
         // <0 or out-of-range -> keep original weight types (SD_TYPE_COUNT).
         sd_type_t wt = (wtype >= 0 && wtype < SD_TYPE_COUNT) ? (sd_type_t)wtype : SD_TYPE_COUNT;
 
-        // Single-file SD1.5 GGUF: only model_path is set, everything else is empty.
-        // vae_decode_only=false so the VAE encoder is available for img2img.
+        ALOGI("init: model=%s threads=%d wtype=%d taesd=%s vae_tiling=%d variant=%s",
+              model.c_str(), threads, (int)wtype, taesd.empty() ? "-" : taesd.c_str(),
+              vaeTiling ? 1 : 0, SD_JNI_VARIANT);
+
+        // Single-file checkpoint: only model_path is set, everything else is empty.
         g_ctx = new_sd_ctx(
             model.c_str(),
             "",            // clip_l_path
@@ -275,41 +360,86 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
             "",            // t5xxl_path
             "",            // diffusion_model_path
             "",            // vae_path
-            taesd.c_str(), // taesd_path: tiny AE -> fast, low-memory final VAE decode ("" = full VAE)
+            taesd.c_str(), // taesd_path ("" = full VAE)
             "",            // control_net_path
             "",            // lora_model_dir
             "",            // embed_dir
             "",            // stacked_id_embed_dir
             false,         // vae_decode_only=false: load the VAE encoder too, so img2img works
-            true,          // vae_tiling: tile the VAE decode to cap peak memory on-device
-            false,         // free_params_immediately
+            vaeTiling == JNI_TRUE,  // vae_tiling: only on low-RAM devices (Java decides)
+            false,         // free_params_immediately: keep weights for repeated generations
             threads,       // n_threads
-            wt,            // wtype: original types, or Q4_0/Q8_0 to speed up CPU matmul
+            wt,            // wtype
             STD_DEFAULT_RNG,
             DEFAULT,       // schedule
             false,         // keep_clip_on_cpu
             false,         // keep_control_net_cpu
             false,         // keep_vae_on_cpu
-            true);         // diffusion_flash_attn: engages for SDXL/Turbo-class heads; no-op on SD1.5
+            false);        // diffusion_flash_attn: no gain on CPU at this pin (SD1.x never engages it)
     } catch (const std::exception& e) {
         g_ctx = nullptr;
-        g_last_error = std::string("init 例外: ") + e.what();
-        ALOGE("%s", g_last_error.c_str());
-        return env->NewStringUTF(g_last_error.c_str());
+        set_error(std::string("init 例外: ") + e.what());
     } catch (...) {
         g_ctx = nullptr;
-        g_last_error = "init 不明な例外";
-        ALOGE("%s", g_last_error.c_str());
-        return env->NewStringUTF(g_last_error.c_str());
+        set_error("init 不明な例外");
     }
 
     if (g_ctx == nullptr) {
-        return env->NewStringUTF("new_sd_ctx failed (see log)");
+        std::string err;
+        {
+            std::lock_guard<std::mutex> elk(g_err_mutex);
+            err = g_last_error.empty() ? "new_sd_ctx failed (see log)" : g_last_error;
+        }
+        ALOGE("%s", err.c_str());
+        return env->NewStringUTF(err.c_str());
     }
     return env->NewStringUTF("");
 }
 
-// txt2img -> returns width*height*3 RGB bytes, or null on failure.
+static int64_t resolve_seed(jlong seed) {
+    if (seed >= 0) {
+        return (int64_t)seed;
+    }
+    static std::mt19937_64 rng{std::random_device{}()};  // guarded by g_mutex (callers hold it)
+    return (int64_t)(rng() & 0x7FFFFFFFULL);
+}
+
+static sample_method_t resolve_method(jint m) {
+    return (m >= 0 && m < N_SAMPLE_METHODS) ? (sample_method_t)m : EULER_A;
+}
+
+// Copies the first result image into a Java byte[] and frees the sd.cpp result.
+static jbyteArray take_result(JNIEnv* env, sd_image_t* results, const char* what) {
+    if (results == nullptr || results[0].data == nullptr) {
+        set_error(std::string(what) + ": 画像が生成されませんでした（ログ参照）");
+        ALOGE("%s returned no image", what);
+        if (results) {
+            free(results);
+        }
+        return nullptr;
+    }
+    const jsize n_bytes = (jsize)(results[0].width * results[0].height * results[0].channel);
+    jbyteArray arr = env->NewByteArray(n_bytes);
+    if (arr != nullptr) {
+        env->SetByteArrayRegion(arr, 0, n_bytes, reinterpret_cast<const jbyte*>(results[0].data));
+    } else {
+        env->ExceptionClear();
+        set_error(std::string(what) + ": 結果バッファを確保できませんでした");
+    }
+    free(results[0].data);
+    free(results);
+    return arr;
+}
+
+// Records an exception escaping sd.cpp. Returns nullptr for convenient `return fail(...)`.
+static jbyteArray fail(const std::string& msg) {
+    set_error(msg);
+    ALOGE("%s", msg.c_str());
+    sd_log_to_file((msg + "\n").c_str());
+    return nullptr;
+}
+
+// txt2img -> returns width*height*3 RGB bytes, or null on failure / cancel.
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
         JNIEnv* env, jobject,
@@ -317,41 +447,32 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
         jint width, jint height, jint steps,
         jfloat cfgScale, jlong seed, jint sampleMethod, jint clipSkip) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    g_last_error.clear();
+    set_error("");
+    g_cancelled = false;
     if (g_ctx == nullptr) {
-        ALOGE("nativeTxt2img called before init");
-        return nullptr;
+        return fail("txt2img: モデルが読み込まれていません");
     }
-
     std::string p = jstr(env, prompt);
     std::string n = jstr(env, negativePrompt);
-
-    int64_t used_seed = seed;
-    if (used_seed < 0) {
-        srand((unsigned)time(nullptr));
-        used_seed = rand();
-    }
+    const int64_t used_seed = resolve_seed(seed);
     g_last_seed = used_seed;
 
-    sample_method_t method = EULER_A;
-    if (sampleMethod >= 0 && sampleMethod < N_SAMPLE_METHODS) {
-        method = (sample_method_t)sampleMethod;
-    }
-
-    // Generation can throw (e.g. std::bad_alloc on a large request); catch it here so it
-    // becomes a clean error+null instead of crashing by escaping the JNI boundary.
     sd_image_t* results = nullptr;
+    g_sd_phase = 0;
     try {
+        if (g_cancel.load()) {
+            throw sd_jni_cancelled();
+        }
         results = txt2img(
             g_ctx,
             p.c_str(),
             n.c_str(),
-            clipSkip,          // clip_skip (<=0 == unspecified)
-            cfgScale,          // cfg_scale
-            3.5f,              // guidance (flux-only; ignored by SD1.5)
+            clipSkip,          // clip_skip (<=0 == model default)
+            cfgScale,          // cfg_scale (1.0 skips the unconditional pass)
+            3.5f,              // guidance (flux-only; ignored)
             width,
             height,
-            method,
+            resolve_method(sampleMethod),
             steps,
             used_seed,
             1,                 // batch_count
@@ -365,45 +486,25 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
             0.0f,              // slg_scale
             0.01f,             // skip_layer_start
             0.2f);             // skip_layer_end
+    } catch (const sd_jni_cancelled&) {
+        g_sd_phase = 0;
+        g_cancelled = true;
+        set_error("cancelled");
+        return nullptr;
     } catch (const std::exception& e) {
-        g_last_error = std::string("txt2img 例外: ") + e.what();
-        ALOGE("%s", g_last_error.c_str());
-        sd_log_to_file((g_last_error + "\n").c_str());
-        return nullptr;
+        g_sd_phase = 0;
+        return fail(std::string("txt2img 例外: ") + e.what());
     } catch (...) {
-        g_last_error = "txt2img 不明な例外";
-        ALOGE("%s", g_last_error.c_str());
-        sd_log_to_file((g_last_error + "\n").c_str());
-        return nullptr;
+        g_sd_phase = 0;
+        return fail("txt2img 不明な例外");
     }
-
-    if (results == nullptr || results[0].data == nullptr) {
-        ALOGE("txt2img returned no image");
-        if (results) {
-            free(results);
-        }
-        return nullptr;
-    }
-
-    const uint32_t w = results[0].width;
-    const uint32_t h = results[0].height;
-    const uint32_t c = results[0].channel;
-    const jsize n_bytes = (jsize)(w * h * c);
-
-    jbyteArray arr = env->NewByteArray(n_bytes);
-    if (arr != nullptr) {
-        env->SetByteArrayRegion(arr, 0, n_bytes, reinterpret_cast<const jbyte*>(results[0].data));
-    }
-
-    free(results[0].data);
-    free(results);
-    return arr;
+    g_sd_phase = 0;
+    return take_result(env, results, "txt2img");
 }
 
-// img2img -> returns width*height*3 RGB bytes, or null on failure.
-// initRgb is an initW*initH*3 RGB image; strength in [0,1] controls how far the
-// result departs from it (higher = more change). Requires a context loaded with
-// vae_decode_only=false (so the VAE encoder is available).
+// img2img -> returns width*height*3 RGB bytes, or null on failure / cancel.
+// initRgb is an initW*initH*3 RGB image (must equal width x height); strength in (0,1] controls
+// how far the result departs from it (sd.cpp runs about steps*strength sampling steps).
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
         JNIEnv* env, jobject,
@@ -412,45 +513,37 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
         jint width, jint height, jint steps,
         jfloat cfgScale, jfloat strength, jlong seed, jint sampleMethod, jint clipSkip) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    g_last_error.clear();
+    set_error("");
+    g_cancelled = false;
     if (g_ctx == nullptr) {
-        ALOGE("nativeImg2img called before init");
-        return nullptr;
+        return fail("img2img: モデルが読み込まれていません");
     }
-    if (initRgb == nullptr) {
-        ALOGE("nativeImg2img: init image is null");
-        return nullptr;
+    if (initRgb == nullptr || env->GetArrayLength(initRgb) < (jsize)(initW * initH * 3)) {
+        return fail("img2img: 入力画像が不正です");
     }
-
+    if (initW != width || initH != height) {
+        return fail("img2img: 入力画像のサイズが出力サイズと一致しません");
+    }
     std::string p = jstr(env, prompt);
     std::string n = jstr(env, negativePrompt);
-
-    int64_t used_seed = seed;
-    if (used_seed < 0) {
-        srand((unsigned)time(nullptr));
-        used_seed = rand();
-    }
+    const int64_t used_seed = resolve_seed(seed);
     g_last_seed = used_seed;
 
-    sample_method_t method = EULER_A;
-    if (sampleMethod >= 0 && sampleMethod < N_SAMPLE_METHODS) {
-        method = (sample_method_t)sampleMethod;
-    }
-
-    jbyte* init_data = env->GetByteArrayElements(initRgb, nullptr);
-    if (init_data == nullptr) {
-        ALOGE("nativeImg2img: failed to access init image bytes");
-        return nullptr;
-    }
+    std::vector<uint8_t> init_data((size_t)initW * initH * 3);
+    env->GetByteArrayRegion(initRgb, 0, (jsize)init_data.size(), reinterpret_cast<jbyte*>(init_data.data()));
 
     sd_image_t init_image;
     init_image.width   = (uint32_t)initW;
     init_image.height  = (uint32_t)initH;
     init_image.channel = 3;
-    init_image.data    = reinterpret_cast<uint8_t*>(init_data);
+    init_image.data    = init_data.data();
 
     sd_image_t* results = nullptr;
+    g_sd_phase = 0;
     try {
+        if (g_cancel.load()) {
+            throw sd_jni_cancelled();
+        }
         results = img2img(
             g_ctx,
             init_image,
@@ -458,10 +551,10 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
             n.c_str(),
             clipSkip,
             cfgScale,
-            3.5f,              // guidance (flux-only; ignored by SD1.5)
+            3.5f,              // guidance (flux-only; ignored)
             width,
             height,
-            method,
+            resolve_method(sampleMethod),
             steps,
             strength,
             used_seed,
@@ -476,53 +569,47 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
             0.0f,              // slg_scale
             0.01f,             // skip_layer_start
             0.2f);             // skip_layer_end
+    } catch (const sd_jni_cancelled&) {
+        g_sd_phase = 0;
+        g_cancelled = true;
+        set_error("cancelled");
+        return nullptr;
     } catch (const std::exception& e) {
-        g_last_error = std::string("img2img 例外: ") + e.what();
-        ALOGE("%s", g_last_error.c_str());
-        sd_log_to_file((g_last_error + "\n").c_str());
-        env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);
-        return nullptr;
+        g_sd_phase = 0;
+        return fail(std::string("img2img 例外: ") + e.what());
     } catch (...) {
-        g_last_error = "img2img 不明な例外";
-        ALOGE("%s", g_last_error.c_str());
-        sd_log_to_file((g_last_error + "\n").c_str());
-        env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);
-        return nullptr;
+        g_sd_phase = 0;
+        return fail("img2img 不明な例外");
     }
+    g_sd_phase = 0;
+    return take_result(env, results, "img2img");
+}
 
-    env->ReleaseByteArrayElements(initRgb, init_data, JNI_ABORT);  // read-only, discard changes
+// Request cancellation of the running (or next) generation. Lock-free: callable from any thread.
+extern "C" JNIEXPORT void JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeCancel(JNIEnv*, jobject) {
+    g_cancel = true;
+}
 
-    if (results == nullptr || results[0].data == nullptr) {
-        ALOGE("img2img returned no image");
-        if (results) {
-            free(results);
-        }
-        return nullptr;
-    }
+extern "C" JNIEXPORT void JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeClearCancel(JNIEnv*, jobject) {
+    g_cancel = false;
+}
 
-    const uint32_t w = results[0].width;
-    const uint32_t h = results[0].height;
-    const uint32_t c = results[0].channel;
-    const jsize n_bytes = (jsize)(w * h * c);
-
-    jbyteArray arr = env->NewByteArray(n_bytes);
-    if (arr != nullptr) {
-        env->SetByteArrayRegion(arr, 0, n_bytes, reinterpret_cast<const jbyte*>(results[0].data));
-    }
-
-    free(results[0].data);
-    free(results);
-    return arr;
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeWasCancelled(JNIEnv*, jobject) {
+    return g_cancelled.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeGetLastSeed(JNIEnv*, jobject) {
-    return (jlong)g_last_seed;
+    return (jlong)g_last_seed.load();
 }
 
-// Last native error message (empty if none). Set when a generate call throws.
+// Last native error message (empty if none).
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeLastError(JNIEnv* env, jobject) {
+    std::lock_guard<std::mutex> lk(g_err_mutex);
     return env->NewStringUTF(g_last_error.c_str());
 }
 
@@ -532,9 +619,8 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeFree(JNIEnv*, jobject) {
     try {
         if (g_ctx != nullptr) {
             free_sd_ctx(g_ctx);
-            g_ctx = nullptr;
         }
     } catch (...) {
-        g_ctx = nullptr;
     }
+    g_ctx = nullptr;
 }
