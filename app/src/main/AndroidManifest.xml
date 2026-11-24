@@ -10,6 +10,8 @@
 
     <application
         android:label="llamaimage"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:largeHeap="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">
