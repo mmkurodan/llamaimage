@@ -8,11 +8,14 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
@@ -25,18 +28,22 @@ import android.provider.MediaStore;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.Menu;
-import android.view.MenuItem;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.PopupMenu;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -57,40 +64,44 @@ public class MainActivity extends Activity {
 
     private static final int REQ_PICK_INIT_IMAGE = 1002;
 
-    private static final String PREFS_NAME = "llamaimage_prefs";
-    private static final String PREFS_LLM_URL = "llm_base_url";
-    private static final String PREFS_LLM_MODEL = "llm_model";
-    private static final String PREFS_WTYPE = "wtype";
-    private static final String PREFS_SAMPLER = "sampler";
-    private static final String PREFS_CFG = "cfg_scale";
-    private static final String PREFS_THREADS = "threads";
-    private static final String PREFS_NSFW = "nsfw_restriction";
-    private static final String PREFS_SIZE = "image_size";
-    private static final String PREFS_TAESD_LEGACY = "taesd_path";   // old versions: picked file path
-    private static final String PREFS_USE_TAESD = "use_taesd";
-    private static final String PREFS_VAE_TILING = "vae_tiling";
-    private static final String PREFS_MODEL_ID = "model_id";
-    private static final String PREFS_PENDING_MODEL = "pending_model_id";  // select after download
-    private static final String PREFS_STEPS = "steps";
-    private static final String PREFS_STRENGTH = "strength";
-    private static final String PREFS_SEED = "seed";
-    private static final String PREFS_PROMPT = "prompt";
-    private static final String PREFS_NEGATIVE = "negative";
+    static final String PREFS_NAME = "llamaimage_prefs";
+    static final String PREFS_LLM_URL = "llm_base_url";
+    static final String PREFS_LLM_MODEL = "llm_model";
+    static final String PREFS_WTYPE = "wtype";
+    static final String PREFS_SAMPLER = "sampler";
+    static final String PREFS_CFG = "cfg_scale";
+    static final String PREFS_THREADS = "threads";
+    static final String PREFS_NSFW = "nsfw_restriction";
+    static final String PREFS_SIZE = "image_size";
+    static final String PREFS_TAESD_LEGACY = "taesd_path";   // old versions: picked file path
+    static final String PREFS_USE_TAESD = "use_taesd";
+    static final String PREFS_VAE_TILING = "vae_tiling";
+    static final String PREFS_MODEL_ID = "model_id";
+    static final String PREFS_PENDING_MODEL = "pending_model_id";  // select after download
+    static final String PREFS_STEPS = "steps";
+    static final String PREFS_STRENGTH = "strength";
+    static final String PREFS_SEED = "seed";
+    static final String PREFS_PROMPT = "prompt";
+    static final String PREFS_NEGATIVE = "negative";
+    static final String PREFS_TAB = "main_tab";
+
+    private static final int TAB_TXT2IMG = 0, TAB_IMG2IMG = 1, TAB_API = 2;
+    private static final int STRENGTH_MIN_PCT = 5, STRENGTH_MAX_PCT = 100;
 
     private static final int[] SIZE_VALUES = {512, 448, 384, 256};
     private static final String[] SIZE_LABELS = {"512px（標準）", "448px", "384px（高速）", "256px（最速）"};
-    private static final int MAX_STEPS = 50;
+    static final int MAX_STEPS = 50;
     private static final int MAX_LOG_CHARS = 20000;
-    private static final long LOW_RAM_BYTES = 6L * 1024 * 1024 * 1024;
+    static final long LOW_RAM_BYTES = 6L * 1024 * 1024 * 1024;
 
-    private static final String DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434";
+    static final String DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434";
     private static final String LLM_PACKAGE = "com.micklab.llama";
     private static final String LLM_SERVICE_CLASS = "com.micklab.llama.OllamaForegroundService";
     private static final String LLM_SERVICE_ACTION = "com.micklab.llama.START_SERVICE";
     private static final String LLM_PLAY_STORE_URL =
             "https://play.google.com/store/apps/details?id=com.micklab.llama";
 
-    private static final int MENU_MODEL = 1, MENU_GENERATE = 2, MENU_SAVE = 3, MENU_SETTINGS = 4, MENU_LLM = 5;
+    private static final int MENU_LLM = 1, MENU_MANUAL = 2, MENU_RIGHTS = 3, MENU_PRIVACY = 4;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -130,6 +141,8 @@ public class MainActivity extends Activity {
     // --- views ---
     private LinearLayout rootBody;
     private TextView modelText;
+    private TextView modelStateText;
+    private View modelDot;
     private LinearLayout downloadRow;
     private ProgressBar downloadBar;
     private TextView downloadText;
@@ -140,16 +153,33 @@ public class MainActivity extends Activity {
     private EditText stepsEdit;
     private Button sizeButton;
     private EditText seedEdit;
-    private EditText strengthEdit;
+    private SeekBar strengthBar;
+    private TextView strengthValueText;
     private Button generateButton;
     private Button cancelButton;
-    private Button pickInitButton;
-    private Button img2imgButton;
+    private View pickInitButton;
     private ImageView initThumb;
+    private TextView initThumbHint;
+    private TextView[] tabViews;
+    private LinearLayout tabBar;
+    private ScrollView mainScroll;
+    private LinearLayout genArea;
+    private LinearLayout apiArea;
+    private LinearLayout img2imgPanel;
+    private int currentTab = TAB_TXT2IMG;
+    private View apiDot;
+    private TextView apiStateText;
+    private TextView apiAddressText;
+    private Switch apiSwitch;
+    private long apiToggleAt = 0;
     private ProgressBar progressBar;
     private TextView statusText;
     private ImageView imageView;
+    private LinearLayout placeholderView;
+    private LinearLayout imageActions;
+    private Button saveButton;
     private TextView logText;
+    private ScrollView logScroll;
     private Bitmap lastBitmap;
     private long lastSeed = -1;
     private Bitmap initBitmap;                // selected img2img input (square, cropped)
@@ -163,7 +193,7 @@ public class MainActivity extends Activity {
         @Override public void onPreview(byte[] rgb, int w, int h) {
             final Bitmap bmp = rgbToBitmap(rgb, w, h);
             runOnUiThread(() -> {
-                if (generating) imageView.setImageBitmap(bmp);
+                if (generating) showImage(bmp);
             });
         }
     };
@@ -185,23 +215,19 @@ public class MainActivity extends Activity {
         setContentView(buildUi());
         rootBody.requestFocus();
 
-        generateButton.setOnClickListener(v -> startGeneration(false));
-        img2imgButton.setOnClickListener(v -> startGeneration(true));
-        pickInitButton.setOnClickListener(v -> pickInitImage());
+        generateButton.setOnClickListener(v -> startGeneration(currentTab == TAB_IMG2IMG));
         cancelButton.setOnClickListener(v -> cancelGeneration());
         downloadCancelButton.setOnClickListener(v -> confirmCancelDownload());
         imageView.setOnLongClickListener(v -> {
-            if (lastSeed >= 0) {
-                seedEdit.setText(String.valueOf(lastSeed));
-                Toast.makeText(this, "シード " + lastSeed + " を固定しました（-1 でランダムに戻ります）",
-                        Toast.LENGTH_SHORT).show();
-            }
+            lockSeed();
             return true;
         });
 
         refreshControls();
         setStatus("ネイティブ初期化中…");
         worker.submit(this::initNative);
+        // Bring the image API back if it was left enabled (e.g. after the process was killed).
+        com.micklab.llamaimage.api.ImageApiService.startIfEnabled(this);
     }
 
     @Override
@@ -209,6 +235,7 @@ public class MainActivity extends Activity {
         super.onStart();
         started = true;
         if (nativeReady) checkDownloads();
+        if (currentTab == TAB_API) apiPollTask.run();
     }
 
     @Override
@@ -216,6 +243,7 @@ public class MainActivity extends Activity {
         super.onStop();
         started = false;
         ui.removeCallbacks(pollTask);
+        ui.removeCallbacks(apiPollTask);
         persistInputs();
     }
 
@@ -295,8 +323,12 @@ public class MainActivity extends Activity {
         } else if (downloading) {
             setStatus("ダウンロード中… 完了後に自動で読み込みます");
         } else {
-            setStatus("モデルを選択してください（初回のみダウンロード）");
-            showModelChooser();
+            // Nothing on the device yet: keep (or pre-select) a downloadable model so the main
+            // button offers its download — no dialog in the way of the prompt → generate flow.
+            ModelCatalog.ModelSpec want = currentSpec();
+            if (want == null || !want.downloadable()) selectModel(ModelCatalog.DEFAULT_MODEL, false);
+            setStatus("「" + currentSpec().title + "」を使います — 初回のみダウンロードが必要です");
+            refreshControls();
         }
     }
 
@@ -304,134 +336,321 @@ public class MainActivity extends Activity {
     // UI
     // =====================================================================================
 
+    // --- palette: black base, violet→pink accent ---
+    private static final int C_BG = 0xFF000000;
+    private static final int C_SURFACE = 0xFF111114;
+    private static final int C_SURFACE2 = 0xFF1A1A20;
+    private static final int C_STROKE = 0xFF26262E;
+    private static final int C_TEXT = 0xFFF4F4F6;
+    private static final int C_TEXT2 = 0xFFA1A1AA;
+    private static final int C_TEXT3 = 0xFF63636E;
+    private static final int C_ACCENT = 0xFFA78BFA;
+    private static final int C_GRAD_A = 0xFF7C3AED;
+    private static final int C_GRAD_B = 0xFFDB2777;
+    private static final int C_OK = 0xFF34D399;
+    private static final int C_WARN = 0xFFFBBF24;
+
+    private static final int BTN_PRIMARY = 0, BTN_SECONDARY = 1, BTN_GHOST = 2;
+
+    /**
+     * Main screen, top to bottom: header, model card, tabs (テキスト→画像 / 画像→画像 / API).
+     * The two generation tabs share everything from the prompt down (generate, image, save,
+     * 詳細設定); 画像→画像 only adds the input image + strength slider above the prompt.
+     * The API tab swaps that area for the API switch. The log box is always at the bottom.
+     */
     private View buildUi() {
-        int pad = dp(12);
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(pad, pad, pad, pad);
+        body.setPadding(dp(20), dp(14), dp(20), dp(28));
         body.setFocusable(true);
         body.setFocusableInTouchMode(true);
         rootBody = body;
 
-        // Model row: current model + change button.
-        LinearLayout modelRow = new LinearLayout(this);
-        modelRow.setOrientation(LinearLayout.HORIZONTAL);
-        modelRow.setGravity(Gravity.CENTER_VERTICAL);
-        modelText = new TextView(this);
-        modelText.setTextSize(13);
-        modelText.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        Button changeModel = new Button(this);
-        changeModel.setText("モデル");
-        changeModel.setOnClickListener(v -> showModelChooser());
-        modelRow.addView(modelText);
-        modelRow.addView(changeModel);
-        body.addView(modelRow);
+        // --- header: wordmark + overflow menu ---
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout brand = new LinearLayout(this);
+        brand.setOrientation(LinearLayout.VERTICAL);
+        TextView title = text("llamaimage", 24, C_TEXT);
+        title.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        title.setLetterSpacing(-0.02f);
+        TextView tagline = text("ON-DEVICE  IMAGE  GENERATION", 9, C_TEXT3);
+        tagline.setLetterSpacing(0.22f);
+        brand.addView(title);
+        brand.addView(tagline);
+        header.addView(brand, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView menuButton = text("⋮", 24, C_TEXT2);
+        menuButton.setGravity(Gravity.CENTER);
+        menuButton.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), null, null));
+        menuButton.setOnClickListener(this::showMainMenu);
+        header.addView(menuButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        body.addView(header, marginLp(0, 0, 0, 18));
 
-        // Download row (visible only while a model downloads).
+        // --- model card (tap to change) ---
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(16), dp(12), dp(14), dp(12));
+        card.setBackground(ripple(rounded(C_SURFACE, 16, C_STROKE)));
+        card.setOnClickListener(v -> showModelChooser());
+        modelDot = new View(this);
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(8), dp(8));
+        dotLp.rightMargin = dp(12);
+        card.addView(modelDot, dotLp);
+        LinearLayout modelCol = new LinearLayout(this);
+        modelCol.setOrientation(LinearLayout.VERTICAL);
+        TextView modelLabel = text("MODEL", 9, C_TEXT3);
+        modelLabel.setLetterSpacing(0.2f);
+        modelText = text("", 15, C_TEXT);
+        modelText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        modelStateText = text("", 12, C_TEXT2);
+        modelCol.addView(modelLabel);
+        modelCol.addView(modelText);
+        modelCol.addView(modelStateText);
+        card.addView(modelCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        card.addView(text("変更 ›", 13, C_ACCENT));
+        body.addView(card, marginLp(0, 0, 0, 10));
+
+        // --- download progress (only while a model downloads) ---
         downloadRow = new LinearLayout(this);
         downloadRow.setOrientation(LinearLayout.VERTICAL);
+        downloadRow.setPadding(dp(16), dp(12), dp(16), dp(8));
+        downloadRow.setBackground(rounded(C_SURFACE, 16, C_STROKE));
         downloadRow.setVisibility(View.GONE);
         downloadBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         downloadBar.setMax(1000);
-        downloadText = new TextView(this);
-        downloadText.setTextSize(12);
-        downloadCancelButton = new Button(this);
-        downloadCancelButton.setText("ダウンロード中止");
-        downloadRow.addView(downloadBar);
-        downloadRow.addView(downloadText);
-        downloadRow.addView(downloadCancelButton);
-        body.addView(downloadRow);
+        tintProgress(downloadBar);
+        downloadText = text("", 12, C_TEXT2);
+        downloadCancelButton = button("ダウンロード中止", BTN_GHOST);
+        downloadRow.addView(downloadBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(4)));
+        downloadRow.addView(downloadText, marginLp(0, 8, 0, 4));
+        LinearLayout.LayoutParams dcLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(36));
+        dcLp.gravity = Gravity.END;
+        downloadRow.addView(downloadCancelButton, dcLp);
+        body.addView(downloadRow, marginLp(0, 0, 0, 10));
 
-        promptEdit = new EditText(this);
-        promptEdit.setHint("プロンプト（日本語・英語）");
-        promptEdit.setMinLines(2);
-        body.addView(promptEdit);
+        // --- tabs (segmented control) ---
+        LinearLayout tabBar = new LinearLayout(this);
+        tabBar.setOrientation(LinearLayout.HORIZONTAL);
+        tabBar.setPadding(dp(4), dp(4), dp(4), dp(4));
+        tabBar.setBackground(rounded(C_SURFACE, 14, C_STROKE));
+        String[] tabLabels = {"テキスト→画像", "画像→画像", "API"};
+        tabViews = new TextView[tabLabels.length];
+        for (int i = 0; i < tabLabels.length; i++) {
+            final int index = i;
+            TextView t = text(tabLabels[i], 13, C_TEXT2);
+            t.setGravity(Gravity.CENTER);
+            t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            t.setOnClickListener(v -> selectTab(index));
+            tabViews[i] = t;
+            tabBar.addView(t, new LinearLayout.LayoutParams(0, dp(40), 1f));
+        }
+        body.addView(tabBar, marginLp(0, 6, 0, 14));
+        this.tabBar = tabBar;
 
-        translatedPromptView = new TextView(this);
-        translatedPromptView.setTextSize(11);
-        translatedPromptView.setTextColor(0xFF888888);
-        translatedPromptView.setPadding(0, dp(2), 0, dp(4));
+        // ===== generation area (tabs 0 and 1) =====
+        genArea = new LinearLayout(this);
+        genArea.setOrientation(LinearLayout.VERTICAL);
+
+        // --- img2img only: input image + strength slider ---
+        img2imgPanel = new LinearLayout(this);
+        img2imgPanel.setOrientation(LinearLayout.HORIZONTAL);
+        img2imgPanel.setGravity(Gravity.CENTER_VERTICAL);
+        img2imgPanel.setPadding(dp(12), dp(12), dp(16), dp(12));
+        img2imgPanel.setBackground(rounded(C_SURFACE, 16, C_STROKE));
+        FrameLayout thumbFrame = new FrameLayout(this);
+        thumbFrame.setBackground(ripple(rounded(C_SURFACE2, 12, C_STROKE)));
+        thumbFrame.setClipToOutline(true);
+        initThumbHint = text("＋\n入力画像", 11, C_TEXT3);
+        initThumbHint.setGravity(Gravity.CENTER);
+        thumbFrame.addView(initThumbHint, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        initThumb = new ImageView(this);
+        initThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        thumbFrame.addView(initThumb, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        thumbFrame.setOnClickListener(v -> pickInitImage());
+        pickInitButton = thumbFrame;
+        LinearLayout.LayoutParams thumbLp = new LinearLayout.LayoutParams(dp(84), dp(84));
+        thumbLp.rightMargin = dp(14);
+        img2imgPanel.addView(thumbFrame, thumbLp);
+        LinearLayout strengthCol = new LinearLayout(this);
+        strengthCol.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout strengthHead = new LinearLayout(this);
+        strengthHead.setOrientation(LinearLayout.HORIZONTAL);
+        strengthHead.addView(text("変化量", 13, C_TEXT),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        strengthValueText = text("", 13, C_ACCENT);
+        strengthValueText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        strengthHead.addView(strengthValueText);
+        strengthCol.addView(strengthHead);
+        strengthBar = new SeekBar(this);
+        strengthBar.setMax(STRENGTH_MAX_PCT - STRENGTH_MIN_PCT);
+        strengthBar.setProgressTintList(ColorStateList.valueOf(C_ACCENT));
+        strengthBar.setProgressBackgroundTintList(ColorStateList.valueOf(0x33FFFFFF));
+        strengthBar.setThumbTintList(ColorStateList.valueOf(0xFFFFFFFF));
+        strengthBar.setPadding(dp(4), dp(10), dp(4), dp(10));
+        strengthBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int progress, boolean fromUser) {
+                updateStrengthLabel();
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) {}
+            @Override public void onStopTrackingTouch(SeekBar s) {}
+        });
+        strengthCol.addView(strengthBar, marginLp(-4, 2, -4, 0));
+        LinearLayout strengthEnds = new LinearLayout(this);
+        strengthEnds.setOrientation(LinearLayout.HORIZONTAL);
+        strengthEnds.addView(text("元画像に近い", 10, C_TEXT3),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        strengthEnds.addView(text("大きく変える", 10, C_TEXT3));
+        strengthCol.addView(strengthEnds);
+        img2imgPanel.addView(strengthCol,
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        genArea.addView(img2imgPanel, marginLp(0, 0, 0, 10));
+
+        // --- prompt ---
+        promptEdit = field("どんな画像を作りますか？（日本語・英語）");
+        promptEdit.setTextSize(16);
+        promptEdit.setMinLines(3);
+        promptEdit.setGravity(Gravity.TOP | Gravity.START);
+        promptEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        promptEdit.setBackground(rounded(C_SURFACE, 16, C_STROKE));
+        promptEdit.setPadding(dp(16), dp(14), dp(16), dp(14));
+        genArea.addView(promptEdit, marginLp(0, 0, 0, 0));
+
+        translatedPromptView = text("", 12, C_TEXT3);
+        translatedPromptView.setPadding(dp(4), dp(6), dp(4), 0);
         translatedPromptView.setVisibility(View.GONE);
-        body.addView(translatedPromptView);
+        genArea.addView(translatedPromptView);
 
-        negativeEdit = new EditText(this);
-        negativeEdit.setHint("ネガティブプロンプト（CFG>1 のとき有効）");
-        body.addView(negativeEdit);
+        // --- generate / cancel (same slot) ---
+        generateButton = button("生成する", BTN_PRIMARY);
+        genArea.addView(generateButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 0, 12, 0, 0));
+        cancelButton = button("中止", BTN_SECONDARY);
+        cancelButton.setVisibility(View.GONE);
+        genArea.addView(cancelButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 0, 12, 0, 0));
+
+        statusText = text("", 12, C_TEXT2);
+        statusText.setGravity(Gravity.CENTER);
+        statusText.setPadding(0, dp(10), 0, dp(10));
+        genArea.addView(statusText);
+
+        // --- canvas: square image, placeholder, progress along the bottom edge ---
+        FrameLayout canvas = new FrameLayout(this);
+        canvas.setBackground(rounded(C_SURFACE, 20, C_STROKE));
+        canvas.setClipToOutline(true);
+        imageView = new ImageView(this) {
+            @Override
+            protected void onMeasure(int widthSpec, int heightSpec) {
+                super.onMeasure(widthSpec, widthSpec);   // square, like every generated image
+            }
+        };
+        imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        canvas.addView(imageView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        placeholderView = new LinearLayout(this);
+        placeholderView.setOrientation(LinearLayout.VERTICAL);
+        placeholderView.setGravity(Gravity.CENTER);
+        TextView spark = text("✦", 34, C_ACCENT);
+        spark.setGravity(Gravity.CENTER);
+        TextView hint = text("プロンプトを入力して「生成する」", 13, C_TEXT3);
+        hint.setGravity(Gravity.CENTER);
+        placeholderView.addView(spark);
+        placeholderView.addView(hint, marginLp(0, 6, 0, 0));
+        canvas.addView(placeholderView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.setVisibility(View.GONE);
+        tintProgress(progressBar);
+        canvas.addView(progressBar, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(4), Gravity.BOTTOM));
+        genArea.addView(canvas, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // --- actions under the image ---
+        imageActions = new LinearLayout(this);
+        imageActions.setOrientation(LinearLayout.HORIZONTAL);
+        imageActions.setVisibility(View.GONE);
+        saveButton = button("↓  保存", BTN_SECONDARY);
+        saveButton.setOnClickListener(v -> saveImage());
+        Button reworkButton = button("↻  再加工", BTN_SECONDARY);
+        reworkButton.setOnClickListener(v -> useResultAsInput());
+        Button seedButton = button("シード固定", BTN_GHOST);
+        seedButton.setOnClickListener(v -> lockSeed());
+        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        LinearLayout.LayoutParams reworkLp = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        reworkLp.leftMargin = dp(8);
+        LinearLayout.LayoutParams seedLp = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        seedLp.leftMargin = dp(8);
+        imageActions.addView(saveButton, saveLp);
+        imageActions.addView(reworkButton, reworkLp);
+        imageActions.addView(seedButton, seedLp);
+        genArea.addView(imageActions, marginLp(0, 12, 0, 0));
+
+        // --- folded: negative prompt and the other parameters ---
+        LinearLayout adv = new LinearLayout(this);
+        adv.setOrientation(LinearLayout.VERTICAL);
+
+        negativeEdit = field("例: blurry, low quality");
+        adv.addView(labeled("ネガティブプロンプト（CFG>1 のとき有効）", negativeEdit, false));
 
         LinearLayout paramRow = new LinearLayout(this);
         paramRow.setOrientation(LinearLayout.HORIZONTAL);
-        stepsEdit = new EditText(this);
+        stepsEdit = field("");
         stepsEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
-        sizeButton = new Button(this);
+        sizeButton = button("", BTN_GHOST);
+        sizeButton.setBackground(ripple(rounded(C_SURFACE2, 12, C_STROKE)));
+        sizeButton.setTextSize(14);
         sizeButton.setOnClickListener(v -> showSizePicker());
-        seedEdit = new EditText(this);
+        seedEdit = field("-1");
         seedEdit.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED);
-        paramRow.addView(labeled("ステップ数", stepsEdit));
-        paramRow.addView(labeled("サイズ", sizeButton));
-        paramRow.addView(labeled("シード（-1=ランダム）", seedEdit));
-        body.addView(paramRow);
+        paramRow.addView(labeled("ステップ数", stepsEdit, true));
+        paramRow.addView(labeled("サイズ", sizeButton, true));
+        paramRow.addView(labeled("シード（-1=ランダム）", seedEdit, true));
+        ((LinearLayout.LayoutParams) paramRow.getChildAt(1).getLayoutParams()).leftMargin = dp(8);
+        ((LinearLayout.LayoutParams) paramRow.getChildAt(2).getLayoutParams()).leftMargin = dp(8);
+        adv.addView(paramRow, marginLp(0, 14, 0, 0));
 
-        generateButton = new Button(this);
-        generateButton.setText("生成");
-        generateButton.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        body.addView(generateButton);
+        Button more = button("サンプラー・CFG・TAESD などの生成設定  ›", BTN_GHOST);
+        more.setOnClickListener(v -> showGenSettingsDialog());
+        adv.addView(more, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(44), 0, 18, 0, 0));
 
-        cancelButton = new Button(this);
-        cancelButton.setText("中止");
-        cancelButton.setVisibility(View.GONE);
-        cancelButton.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        body.addView(cancelButton);
+        TextView guide = text("日本語のプロンプトは LLM（⋮ → LLM設定）で英訳してから生成します。"
+                + "モデルを選ぶと推奨のサンプラー／ステップ数／CFG が適用されます。", 11, C_TEXT3);
+        guide.setLineSpacing(0, 1.2f);
+        adv.addView(guide, marginLp(0, 12, 0, 0));
 
-        // img2img row: input-image thumbnail + pick + strength + generate-from-image.
-        LinearLayout img2imgRow = new LinearLayout(this);
-        img2imgRow.setOrientation(LinearLayout.HORIZONTAL);
-        img2imgRow.setGravity(Gravity.CENTER_VERTICAL);
-        initThumb = new ImageView(this);
-        initThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(dp(48), dp(48));
-        thumbParams.rightMargin = dp(8);
-        initThumb.setLayoutParams(thumbParams);
-        pickInitButton = new Button(this);
-        pickInitButton.setText("入力画像");
-        strengthEdit = new EditText(this);
-        strengthEdit.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        img2imgButton = new Button(this);
-        img2imgButton.setText("画像から生成");
-        img2imgRow.addView(initThumb);
-        img2imgRow.addView(labeled("img2img", pickInitButton));
-        img2imgRow.addView(labeled("変化量 0.05〜1", strengthEdit));
-        img2imgRow.addView(labeled(" ", img2imgButton));
-        body.addView(img2imgRow);
+        genArea.addView(section("詳細設定", "ネガティブプロンプト・ステップ数・サイズ・シード",
+                adv, false), marginLp(0, 24, 0, 0));
+        body.addView(genArea);
 
-        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progressBar.setVisibility(View.GONE);
-        body.addView(progressBar);
+        // ===== API area (tab 2) =====
+        apiArea = buildApiPanel();
+        body.addView(apiArea);
 
-        statusText = new TextView(this);
-        statusText.setTextSize(13);
-        statusText.setPadding(0, dp(2), 0, dp(6));
-        body.addView(statusText);
-
-        imageView = new ImageView(this);
-        imageView.setAdjustViewBounds(true);
-        imageView.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        body.addView(imageView);
-
-        TextView guide = new TextView(this);
-        guide.setText("日本語のプロンプトは LLM（LLM設定）で英訳してから生成します。"
-                + "モデルを選ぶと推奨のサンプラー／ステップ数／CFG が適用されます（「生成設定」で変更可）。"
-                + "画像を長押しするとそのシードを固定できます。");
-        guide.setTextSize(11);
-        guide.setTextColor(0xFF777777);
-        guide.setPadding(0, dp(8), 0, dp(4));
-        body.addView(guide);
-
-        logText = new TextView(this);
-        logText.setTextSize(11);
-        body.addView(logText);
+        // --- log: fixed-height scrollable box ---
+        logText = text("", 11, C_TEXT2);
+        logText.setTypeface(Typeface.MONOSPACE);
+        logText.setTextIsSelectable(true);
+        logText.setLineSpacing(0, 1.15f);
+        logScroll = new ScrollView(this);
+        logScroll.setBackground(rounded(0xFF08080A, 12, C_STROKE));
+        logScroll.setPadding(dp(12), dp(10), dp(12), dp(10));
+        logScroll.setClipToPadding(false);
+        logScroll.setScrollbarFadingEnabled(false);
+        logScroll.addView(logText);
+        // Let the box scroll by itself instead of the page grabbing the gesture.
+        logScroll.setOnTouchListener((v, e) -> {
+            int a = e.getActionMasked();
+            v.getParent().requestDisallowInterceptTouchEvent(
+                    a != MotionEvent.ACTION_UP && a != MotionEvent.ACTION_CANCEL);
+            return false;
+        });
+        body.addView(section("ログ", null, logScroll, true, dp(180)), marginLp(0, 12, 0, 0));
 
         // Restore persisted inputs.
         SharedPreferences p = prefs();
@@ -439,27 +658,353 @@ public class MainActivity extends Activity {
         negativeEdit.setText(p.getString(PREFS_NEGATIVE, ""));
         stepsEdit.setText(String.valueOf(p.getInt(PREFS_STEPS, 6)));
         seedEdit.setText(String.valueOf(p.getLong(PREFS_SEED, -1)));
-        strengthEdit.setText(String.valueOf(p.getFloat(PREFS_STRENGTH, 0.6f)));
+        setStrength(p.getFloat(PREFS_STRENGTH, 0.6f));
         sizeButton.setText(sizeLabelFor(selectedSize));
         updateModelText();
+        selectTab(Math.max(0, Math.min(TAB_API, p.getInt(PREFS_TAB, TAB_TXT2IMG))));
 
         ScrollView scroll = new ScrollView(this);
+        mainScroll = scroll;
+        scroll.setBackgroundColor(C_BG);
+        scroll.setFillViewport(true);
         scroll.addView(body);
         return scroll;
     }
 
-    private LinearLayout labeled(String label, View field) {
+    /** API tab: on/off switch, live state, and how other apps call it. */
+    private LinearLayout buildApiPanel() {
+        LinearLayout area = new LinearLayout(this);
+        area.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(14), dp(16), dp(16));
+        card.setBackground(rounded(C_SURFACE, 16, C_STROKE));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
-        TextView t = new TextView(this);
-        t.setText(label);
-        t.setTextSize(11);
-        t.setTextColor(0xFF666666);
+        TextView t = text("画像生成 API", 16, C_TEXT);
+        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         col.addView(t);
-        col.addView(field, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        col.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout stateRow = new LinearLayout(this);
+        stateRow.setOrientation(LinearLayout.HORIZONTAL);
+        stateRow.setGravity(Gravity.CENTER_VERTICAL);
+        apiDot = new View(this);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(8), dp(8));
+        dlp.rightMargin = dp(8);
+        stateRow.addView(apiDot, dlp);
+        apiStateText = text("", 12, C_TEXT2);
+        stateRow.addView(apiStateText);
+        col.addView(stateRow, marginLp(0, 4, 0, 0));
+        row.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        apiSwitch = new Switch(this);
+        int[][] states = {{android.R.attr.state_checked}, {}};
+        apiSwitch.setThumbTintList(new ColorStateList(states, new int[]{0xFFFFFFFF, 0xFF8A8A94}));
+        apiSwitch.setTrackTintList(new ColorStateList(states, new int[]{C_GRAD_A, 0xFF3A3A44}));
+        apiSwitch.setOnClickListener(v -> setApiEnabled(apiSwitch.isChecked()));
+        row.addView(apiSwitch);
+        card.addView(row);
+
+        apiAddressText = text("", 13, C_TEXT);
+        apiAddressText.setTypeface(Typeface.MONOSPACE);
+        apiAddressText.setTextIsSelectable(true);
+        apiAddressText.setBackground(rounded(C_SURFACE2, 10, 0));
+        apiAddressText.setPadding(dp(12), dp(10), dp(12), dp(10));
+        card.addView(apiAddressText, marginLp(0, 14, 0, 0));
+        TextView scope = text("この端末内のアプリからのみ接続できます（127.0.0.1）。"
+                + "Assistant など他のアプリから呼ばれたときは自動で起動します。", 11, C_TEXT3);
+        scope.setLineSpacing(0, 1.2f);
+        card.addView(scope, marginLp(0, 8, 0, 0));
+        area.addView(card);
+
+        LinearLayout ref = new LinearLayout(this);
+        ref.setOrientation(LinearLayout.VERTICAL);
+        ref.setPadding(dp(16), dp(14), dp(16), dp(16));
+        ref.setBackground(rounded(C_SURFACE, 16, C_STROKE));
+        TextView rt = text("エンドポイント", 14, C_TEXT);
+        rt.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        ref.addView(rt);
+        TextView eps = text("POST /generate\n  {\"prompt\": \"…\"} → {\"image\": PNG(Base64), \"seed\", …}\n"
+                + "POST /v1/images/generations   OpenAI 互換\n"
+                + "GET  /health ・ GET /models ・ POST /cancel", 11, C_TEXT2);
+        eps.setTypeface(Typeface.MONOSPACE);
+        eps.setTextIsSelectable(true);
+        eps.setLineSpacing(0, 1.25f);
+        ref.addView(eps, marginLp(0, 8, 0, 0));
+        TextView note = text("モデル・サイズ・ステップ数などは、指定がなければこのアプリの設定を使います。"
+                + "日本語のプロンプトは LLM設定の LLM で英訳されます。詳しくは ⋮ → マニュアル。", 11, C_TEXT3);
+        note.setLineSpacing(0, 1.2f);
+        ref.addView(note, marginLp(0, 10, 0, 0));
+        area.addView(ref, marginLp(0, 10, 0, 0));
+        return area;
+    }
+
+    private void selectTab(int tab) {
+        currentTab = tab;
+        prefs().edit().putInt(PREFS_TAB, tab).apply();
+        for (int i = 0; i < tabViews.length; i++) {
+            boolean on = i == tab;
+            tabViews[i].setTextColor(on ? C_TEXT : C_TEXT3);
+            if (on) {
+                GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                        new int[]{0xFF2A1E4A, 0xFF3A1A33});
+                g.setCornerRadius(dp(10));
+                g.setStroke(dp(1), 0x557C3AED);
+                tabViews[i].setBackground(g);
+            } else {
+                tabViews[i].setBackground(ripple(rounded(0x00000000, 10, 0)));
+            }
+        }
+        genArea.setVisibility(tab == TAB_API ? View.GONE : View.VISIBLE);
+        img2imgPanel.setVisibility(tab == TAB_IMG2IMG ? View.VISIBLE : View.GONE);
+        apiArea.setVisibility(tab == TAB_API ? View.VISIBLE : View.GONE);
+        ui.removeCallbacks(apiPollTask);
+        if (tab == TAB_API) apiPollTask.run();
+        if (generateButton != null && store != null) refreshControls();
+    }
+
+    /** Refreshes the API tab once a second while it is visible (the service starts async). */
+    private final Runnable apiPollTask = new Runnable() {
+        @Override public void run() {
+            refreshApiState();
+            if (currentTab == TAB_API && started) ui.postDelayed(this, 1000);
+        }
+    };
+
+    private void refreshApiState() {
+        boolean enabled = com.micklab.llamaimage.api.ImageApiService.isEnabled(this);
+        boolean listening = com.micklab.llamaimage.api.ImageApiService.isListening();
+        int port = com.micklab.llamaimage.api.ImageApiService.port(this);
+        String err = com.micklab.llamaimage.api.ImageApiService.lastError();
+        boolean pending = SystemClock.elapsedRealtime() - apiToggleAt < 3000;
+        boolean want = pending ? apiSwitch.isChecked() : enabled;
+        if (!pending) apiSwitch.setChecked(enabled);
+        String state = listening && want ? "稼働中" : want ? "起動中…" : listening ? "停止中…" : "停止";
+        if (!err.isEmpty() && want && !listening && !pending) state = "エラー: " + err;
+        enabled = want;
+        apiStateText.setText(state);
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.OVAL);
+        d.setColor(listening && enabled ? C_OK : enabled ? C_WARN : C_TEXT3);
+        apiDot.setBackground(d);
+        apiAddressText.setText("http://127.0.0.1:" + port);
+    }
+
+    private void setApiEnabled(boolean on) {
+        apiToggleAt = SystemClock.elapsedRealtime();
+        int port = com.micklab.llamaimage.api.ImageApiService.port(this);
+        if (on) {
+            com.micklab.llamaimage.api.ImageApiService.start(this, -1);
+            appendLog("画像生成 API を開始（ポート " + port + "）");
+        } else {
+            try {
+                startService(com.micklab.llamaimage.api.ImageApiService.stopIntent(this));
+                appendLog("画像生成 API を停止");
+            } catch (Exception e) {
+                Toast.makeText(this, "停止できませんでした: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
+        }
+        // The service updates "enabled" itself; show the result on the next polls.
+        ui.postDelayed(this::refreshApiState, 300);
+    }
+
+    private float strengthValue() {
+        return (strengthBar.getProgress() + STRENGTH_MIN_PCT) / 100f;
+    }
+
+    private void setStrength(float v) {
+        int pct = Math.round(clamp(v, 0.05f, 1.0f) * 100);
+        strengthBar.setProgress(pct - STRENGTH_MIN_PCT);
+        updateStrengthLabel();
+    }
+
+    private void updateStrengthLabel() {
+        strengthValueText.setText(String.format(Locale.US, "%.2f", strengthValue()));
+    }
+
+    // --- view helpers (code-built UI, no XML) ---
+
+    private TextView text(String s, float sp, int color) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        return t;
+    }
+
+    private EditText field(String hint) {
+        EditText e = new EditText(this);
+        e.setHint(hint);
+        e.setTextSize(14);
+        e.setTextColor(C_TEXT);
+        e.setHintTextColor(C_TEXT3);
+        e.setBackground(rounded(C_SURFACE2, 12, C_STROKE));
+        e.setPadding(dp(12), dp(10), dp(12), dp(10));
+        return e;
+    }
+
+    private Button button(String label, int style) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setStateListAnimator(null);
+        b.setElevation(0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setPadding(dp(16), 0, dp(16), 0);
+        b.setTextSize(style == BTN_PRIMARY ? 16 : 14);
+        b.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        b.setSingleLine(true);
+        if (style == BTN_PRIMARY) {
+            GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                    new int[]{C_GRAD_A, C_GRAD_B});
+            g.setCornerRadius(dp(28));
+            b.setBackground(ripple(g));
+            b.setTextColor(0xFFFFFFFF);
+            b.setLetterSpacing(0.04f);
+        } else if (style == BTN_SECONDARY) {
+            b.setBackground(ripple(rounded(C_SURFACE2, 28, 0xFF3A3A44)));
+            b.setTextColor(C_TEXT);
+        } else {
+            b.setBackground(ripple(rounded(0x00000000, 12, C_STROKE)));
+            b.setTextColor(C_TEXT2);
+        }
+        return b;
+    }
+
+    private GradientDrawable rounded(int color, int radiusDp, int strokeColor) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(radiusDp));
+        if (strokeColor != 0) g.setStroke(dp(1), strokeColor);
+        return g;
+    }
+
+    private static RippleDrawable ripple(Drawable content) {
+        return new RippleDrawable(ColorStateList.valueOf(0x22FFFFFF), content, null);
+    }
+
+    private void tintProgress(ProgressBar bar) {
+        bar.setProgressTintList(ColorStateList.valueOf(C_ACCENT));
+        bar.setProgressBackgroundTintList(ColorStateList.valueOf(0x33FFFFFF));
+        bar.setIndeterminateTintList(ColorStateList.valueOf(C_ACCENT));
+    }
+
+    private LinearLayout.LayoutParams marginLp(int l, int t, int r, int b) {
+        return sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, l, t, r, b);
+    }
+
+    private LinearLayout.LayoutParams sizedLp(int w, int h, int l, int t, int r, int b) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, h);
+        lp.setMargins(dp(l), dp(t), dp(r), dp(b));
+        return lp;
+    }
+
+    private LinearLayout labeled(String label, View field, boolean weighted) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView t = text(label, 11, C_TEXT3);
+        t.setSingleLine(true);
+        col.addView(t, marginLp(2, 0, 0, 6));
+        col.addView(field, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
+        col.setLayoutParams(weighted
+                ? new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
         return col;
+    }
+
+    private View section(String title, String subtitle, View content, boolean expanded) {
+        return section(title, subtitle, content, expanded, ViewGroup.LayoutParams.WRAP_CONTENT);
+    }
+
+    /** A card with a tappable header that folds {@code content} away. */
+    private View section(String title, String subtitle, View content, boolean expanded, int contentHeight) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(rounded(C_SURFACE, 16, C_STROKE));
+
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        head.setPadding(dp(16), dp(14), dp(14), dp(14));
+        head.setBackground(new RippleDrawable(ColorStateList.valueOf(0x22FFFFFF), null,
+                rounded(0xFFFFFFFF, 16, 0)));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView t = text(title, 14, C_TEXT);
+        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        col.addView(t);
+        if (subtitle != null) col.addView(text(subtitle, 11, C_TEXT3), marginLp(0, 2, 0, 0));
+        head.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView chevron = text("›", 22, C_TEXT2);
+        chevron.setRotation(expanded ? 90 : 0);
+        head.addView(chevron);
+        card.addView(head);
+
+        FrameLayout holder = new FrameLayout(this);
+        holder.setPadding(dp(16), 0, dp(16), dp(16));
+        holder.addView(content, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, contentHeight));
+        holder.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        card.addView(holder);
+
+        head.setOnClickListener(v -> {
+            boolean open = holder.getVisibility() != View.VISIBLE;
+            holder.setVisibility(open ? View.VISIBLE : View.GONE);
+            chevron.animate().rotation(open ? 90 : 0).setDuration(150).start();
+        });
+        return card;
+    }
+
+    /** Read-only scrollable text (manual / rights / privacy policy). */
+    private void showDocument(String title, String body) {
+        TextView t = text(body, 13, C_TEXT2);
+        t.setTextIsSelectable(true);
+        t.setLineSpacing(0, 1.3f);
+        t.setPadding(dp(22), dp(8), dp(22), dp(8));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(t);
+        new AlertDialog.Builder(this).setTitle(title).setView(sv).setPositiveButton("閉じる", null).show();
+    }
+
+    private static void setEnabledStyled(View v, boolean enabled) {
+        v.setEnabled(enabled);
+        v.setAlpha(enabled ? 1f : 0.35f);
+    }
+
+    /** Shows {@code bmp} in the canvas (null = empty canvas with the placeholder). */
+    private void showImage(Bitmap bmp) {
+        imageView.setImageBitmap(bmp);
+        placeholderView.setVisibility(bmp == null ? View.VISIBLE : View.GONE);
+    }
+
+    /**
+     * 「再加工」: the generated image becomes the img2img input. Switches to the 画像→画像 tab and
+     * scrolls up to the input / strength slider so the user can tweak the prompt and regenerate.
+     */
+    private void useResultAsInput() {
+        if (lastBitmap == null || generating) return;
+        initBitmap = lastBitmap;   // already square; scaled to the target size at generation time
+        initThumb.setImageBitmap(initBitmap);
+        initThumbHint.setVisibility(View.GONE);
+        selectTab(TAB_IMG2IMG);
+        appendLog("生成画像を入力画像に設定 (" + initBitmap.getWidth() + "x" + initBitmap.getHeight()
+                + (lastSeed >= 0 ? ", seed=" + lastSeed : "") + ")");
+        setStatus("生成画像を入力にしました — プロンプトと変化量を調整して「生成する」");
+        mainScroll.post(() -> mainScroll.smoothScrollTo(0, Math.max(0, tabBar.getTop() - dp(8))));
+    }
+
+    private void lockSeed() {
+        if (lastSeed < 0) return;
+        seedEdit.setText(String.valueOf(lastSeed));
+        Toast.makeText(this, "シード " + lastSeed + " を固定しました（詳細設定で -1 にするとランダム）",
+                Toast.LENGTH_SHORT).show();
     }
 
     private boolean isBusy() {
@@ -470,48 +1015,42 @@ public class MainActivity extends Activity {
     private void refreshControls() {
         boolean modelReady = manager != null && manager.isModelLoaded();
         boolean idle = nativeReady && !isBusy();
-        generateButton.setEnabled(idle && modelReady);
-        img2imgButton.setEnabled(idle && modelReady);
-        pickInitButton.setEnabled(!generating);
+        ModelCatalog.ModelSpec spec = currentSpec();
+        boolean installed = spec != null && store.installedFile(spec) != null;
+        boolean canDownload = spec != null && !installed && spec.downloadable() && monitoredDownload == null;
+
+        String label;
+        if (loading) label = "モデル読み込み中…";
+        else if (modelReady || installed) label = "生成する";
+        else if (monitoredDownload != null || finalizing) label = "ダウンロード中…";
+        else if (canDownload) label = "モデルをダウンロード（" + spec.sizeLabel() + "）";
+        else label = "生成する";
+        generateButton.setText(label);
+        setEnabledStyled(generateButton, idle && (modelReady || canDownload));
+        generateButton.setVisibility(generating ? View.GONE : View.VISIBLE);
         cancelButton.setVisibility(generating ? View.VISIBLE : View.GONE);
-        invalidateOptionsMenu();
+        setEnabledStyled(pickInitButton, !generating);
+        imageActions.setVisibility(lastBitmap != null && !generating ? View.VISIBLE : View.GONE);
+        updateModelText();
     }
 
-    @Override
-    public boolean onCreateOptionsMenu(Menu menu) {
-        menu.add(0, MENU_MODEL, 0, "モデル").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
-        menu.add(0, MENU_GENERATE, 1, "生成").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
-        menu.add(0, MENU_SAVE, 2, "画像を保存").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
-        menu.add(0, MENU_SETTINGS, 3, "生成設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
-        menu.add(0, MENU_LLM, 4, "LLM設定").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
-        return true;
-    }
-
-    @Override
-    public boolean onPrepareOptionsMenu(Menu menu) {
-        boolean modelReady = manager != null && manager.isModelLoaded();
-        boolean idle = nativeReady && !isBusy();
-        setMenuEnabled(menu, MENU_GENERATE, idle && modelReady);
-        setMenuEnabled(menu, MENU_SETTINGS, idle);
-        setMenuEnabled(menu, MENU_SAVE, lastBitmap != null);
-        return super.onPrepareOptionsMenu(menu);
-    }
-
-    private static void setMenuEnabled(Menu menu, int id, boolean enabled) {
-        MenuItem item = menu.findItem(id);
-        if (item != null) item.setEnabled(enabled);
-    }
-
-    @Override
-    public boolean onOptionsItemSelected(MenuItem item) {
-        switch (item.getItemId()) {
-            case MENU_MODEL: showModelChooser(); return true;
-            case MENU_GENERATE: startGeneration(false); return true;
-            case MENU_SAVE: saveImage(); return true;
-            case MENU_SETTINGS: showGenSettingsDialog(); return true;
-            case MENU_LLM: showLlmSettingsDialog(); return true;
-            default: return super.onOptionsItemSelected(item);
-        }
+    private void showMainMenu(View anchor) {
+        PopupMenu pm = new PopupMenu(this, anchor);
+        Menu m = pm.getMenu();
+        m.add(0, MENU_LLM, 0, "LLM設定（翻訳）");
+        m.add(0, MENU_MANUAL, 1, "マニュアル");
+        m.add(0, MENU_RIGHTS, 2, "権利・ライセンス");
+        m.add(0, MENU_PRIVACY, 3, "Privacy Policy");
+        pm.setOnMenuItemClickListener(item -> {
+            switch (item.getItemId()) {
+                case MENU_LLM: showLlmSettingsDialog(); return true;
+                case MENU_MANUAL: showDocument("マニュアル", AppDocs.manual(this)); return true;
+                case MENU_RIGHTS: showDocument("権利・ライセンス", AppDocs.rights(this)); return true;
+                case MENU_PRIVACY: showDocument("Privacy Policy", AppDocs.privacy()); return true;
+                default: return false;
+            }
+        });
+        pm.show();
     }
 
     // =====================================================================================
@@ -532,7 +1071,33 @@ public class MainActivity extends Activity {
 
     private void updateModelText() {
         ModelCatalog.ModelSpec s = currentSpec();
-        modelText.setText(s == null ? "モデル: 未選択" : "モデル: " + s.title);
+        modelText.setText(s == null ? "未選択" : s.title);
+        String state;
+        int dot;
+        if (s == null) {
+            state = "タップしてモデルを選択";
+            dot = C_TEXT3;
+        } else if (loading) {
+            state = "読み込み中…";
+            dot = C_WARN;
+        } else if (manager != null && manager.isModelLoaded()) {
+            state = "準備完了 ・ " + s.recommendedLabel();
+            dot = C_OK;
+        } else if (store.installedFile(s) != null) {
+            state = "端末に保存済み";
+            dot = C_WARN;
+        } else if (monitoredDownload == s || finalizing) {
+            state = "ダウンロード中…";
+            dot = C_WARN;
+        } else {
+            state = "未ダウンロード ・ " + s.sizeLabel();
+            dot = C_TEXT3;
+        }
+        modelStateText.setText(state);
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.OVAL);
+        d.setColor(dot);
+        modelDot.setBackground(d);
     }
 
     /** Model chooser: one card per model with download / use / delete actions. */
@@ -558,11 +1123,8 @@ public class MainActivity extends Activity {
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL);
             card.setPadding(dp(12), dp(10), dp(12), dp(10));
-            GradientDrawable bg = new GradientDrawable();
-            bg.setCornerRadius(dp(6));
-            bg.setStroke(dp(1), isActive ? 0xFF3F51B5 : 0xFFCCCCCC);
-            bg.setColor(isActive ? 0xFFE8EAF6 : 0xFFFFFFFF);
-            card.setBackground(bg);
+            card.setBackground(rounded(isActive ? 0x267C3AED : C_SURFACE2, 14,
+                    isActive ? C_ACCENT : C_STROKE));
             LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             cardLp.bottomMargin = dp(10);
@@ -571,6 +1133,7 @@ public class MainActivity extends Activity {
             title.setText(s.title + (isActive && loadedNow ? "（使用中）" : ""));
             title.setTypeface(Typeface.DEFAULT_BOLD);
             title.setTextSize(15);
+            title.setTextColor(C_TEXT);
             card.addView(title);
 
             TextView info = new TextView(this);
@@ -579,12 +1142,13 @@ public class MainActivity extends Activity {
                     : "未ダウンロード（初回のみ " + s.sizeLabel() + "）";
             info.setText(state + "\n" + s.sizeLabel() + " ・ 推奨: " + s.recommendedLabel());
             info.setTextSize(12);
+            info.setTextColor(installed ? C_OK : C_TEXT2);
             card.addView(info);
 
             TextView desc = new TextView(this);
             desc.setText(s.description);
             desc.setTextSize(12);
-            desc.setTextColor(0xFF666666);
+            desc.setTextColor(C_TEXT2);
             card.addView(desc);
 
             LinearLayout buttons = new LinearLayout(this);
@@ -634,11 +1198,11 @@ public class MainActivity extends Activity {
 
         TextView where = new TextView(this);
         File ext = store.externalDir();
-        where.setText("ダウンロード元は Hugging Face（URL はアプリに内蔵）。保存先: "
+        where.setText("ダウンロード元は Hugging Face / Civitai（URL と SHA-256 はアプリに内蔵）。保存先: "
                 + (ext != null ? ext.getAbsolutePath() : "(利用不可)")
                 + "\n高速VAEデコード（TAESD, 既定 ON）の切替は「生成設定」から。");
         where.setTextSize(11);
-        where.setTextColor(0xFF777777);
+        where.setTextColor(C_TEXT3);
         list.addView(where);
 
         ScrollView scroll = new ScrollView(this);
@@ -717,6 +1281,7 @@ public class MainActivity extends Activity {
         downloadBar.setIndeterminate(true);
         ui.removeCallbacks(pollTask);
         if (started) ui.post(pollTask);
+        refreshControls();
     }
 
     /**
@@ -951,8 +1516,13 @@ public class MainActivity extends Activity {
         ModelCatalog.ModelSpec spec = currentSpec();
         File file = spec == null ? null : store.installedFile(spec);
         if (file == null) {
-            setStatus("モデルを選択してください");
-            if (!chooserShownThisLaunch) showModelChooser();
+            if (spec == null) {
+                setStatus("モデルを選択してください");
+                if (!chooserShownThisLaunch) showModelChooser();
+            } else {
+                setStatus("「" + spec.title + "」をダウンロードすると生成できます");
+            }
+            refreshControls();
             return;
         }
         if (useTaesd && store.installedTaesd() == null) {
@@ -964,7 +1534,7 @@ public class MainActivity extends Activity {
         }
         final SdModelManager.LoadConfig cfg = buildLoadConfig(file);
         if (manager.isLoaded(cfg)) {
-            setStatus("モデル読込済み — 「生成」できます");
+            setStatus("準備完了 — プロンプトを入力して「生成する」");
             refreshControls();
             return;
         }
@@ -990,7 +1560,7 @@ public class MainActivity extends Activity {
                     appendLog("モデル読込成功: " + spec.title + " (" + (ms / 1000) + "s, "
                             + cfg.threads + "スレッド" + wtypeSuffix()
                             + (cfg.taesdPath.isEmpty() ? "" : ", TAESD") + (cfg.vaeTiling ? ", VAEタイル" : "") + ")");
-                    setStatus("モデル読込済み — 「生成」できます");
+                    setStatus("準備完了 — プロンプトを入力して「生成する」");
                 } else {
                     appendLog("モデル読込失敗: " + e);
                     setStatus("読込失敗: " + e);
@@ -1018,8 +1588,14 @@ public class MainActivity extends Activity {
             return;
         }
         if (manager == null || !manager.isModelLoaded()) {
-            Toast.makeText(this, "先にモデルを読み込んでください", Toast.LENGTH_SHORT).show();
-            if (currentSpec() == null || store.installedFile(currentSpec()) == null) showModelChooser();
+            ModelCatalog.ModelSpec s = currentSpec();
+            if (s != null && store.installedFile(s) == null && s.downloadable() && monitoredDownload == null) {
+                confirmDownload(s);   // first run: the main button doubles as "download the model"
+            } else if (s == null) {
+                showModelChooser();
+            } else {
+                Toast.makeText(this, "モデルの準備中です", Toast.LENGTH_SHORT).show();
+            }
             return;
         }
         if (fromImage && initBitmap == null) {
@@ -1037,7 +1613,7 @@ public class MainActivity extends Activity {
         stepsEdit.setText(String.valueOf(steps));
         final int size = snapTo64(selectedSize);
         final long seed = parseLong(seedEdit.getText().toString(), -1);
-        final float strength = clamp(parseFloat(strengthEdit.getText().toString(), 0.6f), 0.05f, 1.0f);
+        final float strength = strengthValue();
         final float cfg = cfgScale;
         final int method = sampler;
         final boolean nsfw = nsfwRestriction;
@@ -1114,7 +1690,7 @@ public class MainActivity extends Activity {
             if (samplingEndMs > 0) lastDecodeMs = now - samplingEndMs;
             lastBitmap = bmp;
             lastSeed = r.seed;
-            imageView.setImageBitmap(bmp);
+            showImage(bmp);
             String timing = String.format(Locale.US, "%.1fs", totalSec);
             if (samplingStartMs > 0 && samplingEndMs > 0) {
                 timing += String.format(Locale.US, "（サンプリング %.1fs / デコード %.1fs）",
@@ -1135,7 +1711,7 @@ public class MainActivity extends Activity {
     /** Common end of a generation. Shows the last finished image (drops a leftover preview). */
     private void finishGeneration(String status) {
         generating = false;
-        imageView.setImageBitmap(lastBitmap);   // null clears the view
+        showImage(lastBitmap);   // null clears the view
         progressBar.setIndeterminate(false);
         progressBar.setVisibility(View.GONE);
         setStatus(status);
@@ -1216,7 +1792,8 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     initBitmap = bmp;
                     initThumb.setImageBitmap(bmp);
-                    setStatus("入力画像を選択しました — 「画像から生成」できます");
+                    initThumbHint.setVisibility(View.GONE);
+                    setStatus("入力画像を選択しました — 変化量を調整して「生成する」");
                 });
             } catch (Throwable t) {
                 appendLogUi("入力画像エラー: " + t);
@@ -1400,7 +1977,7 @@ public class MainActivity extends Activity {
         TextView t = new TextView(this);
         t.setText(text);
         t.setTextSize(11);
-        t.setTextColor(0xFF666666);
+        t.setTextColor(C_TEXT3);
         c.addView(t);
     }
 
@@ -1696,7 +2273,7 @@ public class MainActivity extends Activity {
                 .putString(PREFS_NEGATIVE, negativeEdit.getText().toString())
                 .putInt(PREFS_STEPS, Math.min(MAX_STEPS, parseInt(stepsEdit.getText().toString(), 6)))
                 .putLong(PREFS_SEED, parseLong(seedEdit.getText().toString(), -1))
-                .putFloat(PREFS_STRENGTH, clamp(parseFloat(strengthEdit.getText().toString(), 0.6f), 0.05f, 1.0f))
+                .putFloat(PREFS_STRENGTH, strengthValue())
                 .apply();
     }
 
@@ -1759,7 +2336,6 @@ public class MainActivity extends Activity {
     // =====================================================================================
 
     private void setStatus(String s) {
-        if (getActionBar() != null) getActionBar().setSubtitle(s);
         if (statusText != null) statusText.setText(s);
     }
 
@@ -1772,7 +2348,7 @@ public class MainActivity extends Activity {
         return (sec / 60) + "分" + (sec % 60) + "s";
     }
 
-    private static Bitmap rgbToBitmap(byte[] rgb, int w, int h) {
+    static Bitmap rgbToBitmap(byte[] rgb, int w, int h) {
         int[] pixels = new int[w * h];
         for (int i = 0; i < w * h; i++) {
             int r = rgb[i * 3] & 0xff;
@@ -1784,7 +2360,7 @@ public class MainActivity extends Activity {
     }
 
     /** Pack a Bitmap into tightly-packed RGB (w*h*3) bytes for the native img2img call. */
-    private static byte[] bitmapToRgb(Bitmap bmp) {
+    static byte[] bitmapToRgb(Bitmap bmp) {
         int w = bmp.getWidth(), h = bmp.getHeight();
         int[] px = new int[w * h];
         bmp.getPixels(px, 0, w, 0, 0, w, h);
@@ -1854,7 +2430,7 @@ public class MainActivity extends Activity {
     }
 
     /** SD needs dimensions that are multiples of 64; snap (min 64). */
-    private static int snapTo64(int v) {
+    static int snapTo64(int v) {
         int snapped = (v / 64) * 64;
         return snapped < 64 ? 64 : snapped;
     }
@@ -1866,6 +2442,7 @@ public class MainActivity extends Activity {
         if (t.length() > MAX_LOG_CHARS) {
             logText.setText(t.subSequence(t.length() - MAX_LOG_CHARS / 2, t.length()));
         }
+        logScroll.post(() -> logScroll.scrollTo(0, logText.getHeight()));
     }
 
     private void appendLogUi(String msg) {

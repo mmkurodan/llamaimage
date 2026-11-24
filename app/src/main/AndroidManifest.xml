@@ -3,6 +3,13 @@
     <!-- Model downloads (Hugging Face, via the system DownloadManager) and the loopback LLM API. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Image generation API (ImageApiService): a foreground service other apps start on demand,
+         a partial wake lock while generating, and its status notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- We talk to the com.micklab.llama Ollama-compatible server (loopback) and may launch it. -->
     <queries>
         <package android:name="com.micklab.llama" />
@@ -29,6 +36,29 @@
             </intent-filter>
 
         </activity>
+
+        <!-- Image generation API (127.0.0.1:8766). Exported so other apps can switch it on/off:
+             explicit Intent to this component with action com.micklab.llamaimage.START_SERVICE
+             (optional int extra "port") or com.micklab.llamaimage.STOP_SERVICE. -->
+        <service
+            android:name=".api.ImageApiService"
+            android:foregroundServiceType="specialUse"
+            android:exported="true">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="local_image_generation_api_server" />
+        </service>
+
+        <!-- Invisible trampoline: other apps launch it (explicit Intent, action
+             com.micklab.llamaimage.START_SERVICE, optional int extra "port") when an OEM
+             "AutoLaunch" block refuses the direct cross-app service start. -->
+        <activity
+            android:name=".api.ApiStartActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
     </application>
 

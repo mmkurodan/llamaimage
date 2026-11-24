@@ -8,9 +8,11 @@ import java.util.List;
  * Built-in list of downloadable models. The app keeps the download URL, exact size and SHA-256
  * of every file, downloads a model the first time it is selected, and verifies it before use.
  *
- * All entries are single-file checkpoints that the pinned stable-diffusion.cpp loads directly,
- * and all share the SD1.x/2.x latent space (same TAESD, same preview coefficients). Sizes and
- * hashes are the Hugging Face LFS metadata of the referenced revision.
+ * All entries are single-file checkpoints (GGUF or safetensors) that the pinned stable-diffusion.cpp
+ * loads directly. Files re-uploaded by third parties were checked against the SHA-256 the original
+ * author published on Civitai; HF URLs of re-uploads are pinned to a commit. All share the SD1.x/2.x
+ * latent space (same TAESD, same preview coefficients). Sizes and hashes are the HF LFS metadata
+ * of the referenced revision, or the Civitai file metadata for Civitai downloads.
  */
 public final class ModelCatalog {
 
@@ -96,6 +98,73 @@ public final class ModelCatalog {
             "b8944e9fe0b69b36ae1b5bb0185b3a7b8ef14347fe0fa9af6c64c4829022261f",
             StableDiffusionNative.SAMPLE_DPMPP2M, 20, 7.0f);
 
+    private static final String CIVITAI = "https://civitai.com/api/download/models/";
+
+    // --- photoreal SD1.5 models. LCM versions are fast (few steps, CFG 1) like DreamShaper LCM;
+    // the regular versions need ~20 steps and CFG>1, i.e. several minutes per image on a CPU. ---
+
+    /** Lykon's official LCM version of AbsoluteReality (Civitai only; anonymous download works). */
+    public static final ModelSpec ABSOLUTE_REALITY_LCM = new ModelSpec(
+            "absolutereality_lcm",
+            "AbsoluteReality LCM（写実・高速）",
+            "DreamShaper の作者 Lykon による写実特化モデルの公式 LCM 版。肌や髪の質感が得意。"
+                    + "4〜8 step / CFG 1〜2、LCM サンプラー専用。配布元: Civitai。",
+            CIVITAI + "256668?fileId=199166",
+            "AbsoluteReality_LCM.safetensors",
+            2133804992L,
+            "0501f9c30cf36a777f0e3722e497b8cc5e8d9fde839e2459b80621e02f8ed98d",
+            StableDiffusionNative.SAMPLE_LCM, 6, 1.0f);
+
+    /**
+     * Community LCM merge of Photon (Civitai model 306814). Civitai requires a login for this
+     * file, so this is an HF re-upload whose SHA-256 equals the one published on Civitai.
+     */
+    public static final ModelSpec PHOTON_LCM = new ModelSpec(
+            "photon_lcm",
+            "Photon LCM（写実・高速）",
+            "写真表現に強い Photon を LCM 化したモデル（コミュニティ版）。4〜6 step / CFG 1 で仕上がる。"
+                    + "配布元: Hugging Face（Civitai 版と同一ファイル）。",
+            HF + "moonshotmillion/Photon_LCM_1.5/resolve/965ff0a137f5baeb46bab41656f52ab1375da6cf/"
+                    + "photonLCM_v10.safetensors",
+            "Photon_LCM.safetensors",
+            2133817176L,
+            "f2d45bbd0f7d28b7ff5e33cf5f7dca82ccf7a14fa55a867ec4dc7f701cb2859f",
+            StableDiffusionNative.SAMPLE_LCM, 6, 1.0f);
+
+    public static final ModelSpec ABSOLUTE_REALITY = new ModelSpec(
+            "absolutereality_181",
+            "AbsoluteReality 1.8.1（写実・低速）",
+            "Lykon の写実特化モデル（公式リポジトリ）。高品質だが 20 step / CFG 7 が必要で、"
+                    + "1 枚に数分かかる。",
+            HF + "Lykon/AbsoluteReality/resolve/df7c3efce8f54d02cf73a21fcecd908a0fde2898/"
+                    + "AbsoluteReality_1.8.1_pruned.safetensors",
+            "AbsoluteReality_1.8.1_pruned.safetensors",
+            2132625432L,
+            "463d6a9fe8a4b56a4d69ef3692074c0617428dfd8e8f12f9efe3b1e9a71717ce",
+            StableDiffusionNative.SAMPLE_DPMPP2M, 20, 7.0f);
+
+    public static final ModelSpec PHOTON = new ModelSpec(
+            "photon_v1",
+            "Photon v1（写真・低速）",
+            "プロンプト追従性の高いフォトリアル SD1.5 モデル。20 step / CFG 6 が必要で、1 枚に数分かかる。",
+            HF + "sam749/Photon-v1/resolve/73bb8facb8576b69224315bfc77b14eb11b5591c/photon_v1.safetensors",
+            "photon_v1.safetensors",
+            2132625918L,
+            "ec41bd2a8271acde4ae81cac004d9f3300e7fb0870eae8cbfe0bbc4ef8e27f91",
+            StableDiffusionNative.SAMPLE_DPMPP2M, 20, 6.0f);
+
+    public static final ModelSpec JUGGERNAUT_REBORN = new ModelSpec(
+            "juggernaut_reborn",
+            "Juggernaut Reborn（写実・低速）",
+            "人物写真が安定する SD1.5 版 Juggernaut（KandooAI / RunDiffusion）。"
+                    + "20 step / CFG 7 が必要で、1 枚に数分かかる。",
+            HF + "HyperX-Sentience/Juggernaut-Reborn/resolve/7431787c76a081f7b5fb3bc24d780478bd1e6344/"
+                    + "juggernaut_reborn.safetensors",
+            "juggernaut_reborn.safetensors",
+            2132653060L,
+            "338b85bc4f7628bc42cce336242e79154a57c2a4360531436e97f7793568f18c",
+            StableDiffusionNative.SAMPLE_DPMPP2M, 20, 7.0f);
+
     /** Tiny AutoEncoder for SD1.x/2.x: much faster, lower-memory final decode (slightly softer). */
     public static final ModelSpec TAESD = new ModelSpec(
             "taesd",
@@ -109,7 +178,8 @@ public final class ModelCatalog {
 
     /** Selectable image-generation models, recommended first. */
     public static final List<ModelSpec> MODELS = Collections.unmodifiableList(Arrays.asList(
-            DREAMSHAPER8_LCM, SD_TURBO, SD15_BASE));
+            DREAMSHAPER8_LCM, ABSOLUTE_REALITY_LCM, PHOTON_LCM, SD_TURBO,
+            ABSOLUTE_REALITY, PHOTON, JUGGERNAUT_REBORN, SD15_BASE));
 
     public static final ModelSpec DEFAULT_MODEL = DREAMSHAPER8_LCM;
 
