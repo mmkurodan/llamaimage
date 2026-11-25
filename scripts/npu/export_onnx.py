@@ -69,6 +69,34 @@ class TaesdEncoder(torch.nn.Module):
         return self.vae.encode(image * 2.0 - 1.0, return_dict=False)[0]
 
 
+def fix_resize_params(model):
+    """Resize's roi/scales (inputs 1, 2) must be float32. The fp16 converter turns the Constant
+    nodes (and initializers) feeding them into float16 even when Resize itself is blocked; turn
+    those back into float32."""
+    import numpy as np
+    from onnx import TensorProto, numpy_helper
+
+    wanted = set()
+    for n in model.graph.node:
+        if n.op_type == "Resize":
+            wanted.update(x for x in list(n.input)[1:3] if x)
+    fixed = 0
+    for n in model.graph.node:
+        if n.op_type == "Constant" and n.output[0] in wanted:
+            for att in n.attribute:
+                if att.name == "value" and att.t.data_type == TensorProto.FLOAT16:
+                    att.t.CopyFrom(numpy_helper.from_array(
+                        numpy_helper.to_array(att.t).astype(np.float32), att.t.name))
+                    fixed += 1
+    for i, init in enumerate(model.graph.initializer):
+        if init.name in wanted and init.data_type == TensorProto.FLOAT16:
+            model.graph.initializer[i].CopyFrom(numpy_helper.from_array(
+                numpy_helper.to_array(init).astype(np.float32), init.name))
+            fixed += 1
+    if fixed:
+        print(f"[export] restored {fixed} Resize roi/scales tensors to float32")
+
+
 def export(module, args, path, input_names, output_names):
     tmp = path + ".fp32"
     os.makedirs(tmp, exist_ok=True)
@@ -85,6 +113,7 @@ def export(module, args, path, input_names, output_names):
     block = list(float16.DEFAULT_OP_BLOCK_LIST) + ["Resize"]
     model16 = float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True,
                                                op_block_list=block)
+    fix_resize_params(model16)
     onnx.save(model16, path, save_as_external_data=False)
     shutil.rmtree(tmp)
     print(f"[export] {path}: {os.path.getsize(path) / 1e6:.1f} MB")
