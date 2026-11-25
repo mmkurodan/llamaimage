@@ -87,7 +87,8 @@ jobs:
                     open("jt/tokens.json", "w"), ensure_ascii=False)
           PY
           CK=$(python -c "from huggingface_hub import hf_hub_download as d; print(d('Lykon/dreamshaper-8-lcm','DreamShaper8_LCM.safetensors',revision='4645d8bc6a8e6b106d21606d63e8460cdad4f1a6'))")
-          javac -d jt/classes -cp "jt/lib/*" $(find app/src/main/java/com/micklab/llamaimage/npu scripts/npu/java-test -name '*.java')
+          # NpuManager / NpuAssets are the Android glue (android.*); everything else is plain Java.
+          javac -d jt/classes -cp "jt/lib/*" $(find app/src/main/java/com/micklab/llamaimage/npu scripts/npu/java-test -name '*.java' ! -name NpuManager.java ! -name NpuAssets.java)
           java -Xmx6g -cp "jt/classes:jt/lib/*" com.micklab.llamaimage.npu.NpuJavaTest jt/assets "$CK" jt/tokens.json npu-ref/java
           python scripts/npu/assemble.py --templates npu-templates --checkpoint "$CK" --out jt/py
           for f in text_encoder.weights unet.weights; do
