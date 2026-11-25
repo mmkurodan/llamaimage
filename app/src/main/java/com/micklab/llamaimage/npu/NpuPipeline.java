@@ -92,8 +92,12 @@ public final class NpuPipeline implements Closeable {
             so.addConfigEntry("ep.context_file_path", ctx.getAbsolutePath());
             so.addConfigEntry("ep.context_embed_mode", "0");   // binary beside it (no 2 GB protobuf limit)
         }
+        Runtime rt = Runtime.getRuntime();
+        log.log("NPU " + name + ": NPU 向け最適化を開始（" + (model.length() + new File(model.getParentFile(),
+                name + ".weights").length()) / 1_000_000 + " MB, Java heap 空き " + (rt.maxMemory() - rt.totalMemory()
+                + rt.freeMemory()) / 1_000_000 + " MB）");
         OrtSession s = env.createSession(model.getAbsolutePath(), so);
-        log.log("NPU " + name + ": コンパイル " + (System.currentTimeMillis() - t0) / 1000 + "s");
+        log.log("NPU " + name + ": 最適化 完了 " + (System.currentTimeMillis() - t0) / 1000 + "s");
         return s;
     }
 

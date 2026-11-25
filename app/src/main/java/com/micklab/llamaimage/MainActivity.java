@@ -218,8 +218,24 @@ public class MainActivity extends Activity {
 
         store = new ModelStore(this);
         loadSettings();
+        String prevLog = previousLogTail(40);
+        boolean npuCrashed = prefs().getBoolean(PREFS_NPU_PENDING, false);
+        if (npuCrashed) {
+            // The previous NPU preparation never finished (the process died): don't retry it
+            // automatically, or the app is stuck in "NPU を準備中…" on every launch.
+            backend = BACKEND_CPU;
+            prefs().edit().putBoolean(PREFS_NPU_PENDING, false).apply();
+            saveGenSettings();
+        }
         setContentView(buildUi());
         rootBody.requestFocus();
+        if (!prevLog.isEmpty()) {
+            logText.append("— 前回のログ（末尾） —\n" + prevLog + "\n— ここから今回 —\n");
+        }
+        persistLog("==== 起動 ====");
+        if (npuCrashed) {
+            appendLog("前回 NPU の準備中にアプリが終了したため、CPU に切り替えました（生成設定で再度 NPU を選べます）");
+        }
 
         generateButton.setOnClickListener(v -> startGeneration(currentTab == TAB_IMG2IMG));
         cancelButton.setOnClickListener(v -> cancelGeneration());
@@ -307,6 +323,12 @@ public class MainActivity extends Activity {
     }
 
     /** Decide what to do once native is ready: resume a download, load a model, or ask. */
+    /** Keeps the screen on (app stays foreground, not killed by OEM memory governors) while busy. */
+    private void updateKeepScreenOn() {
+        if (loading || generating) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+
     private void startupModelFlow() {
         boolean downloading = checkDownloads();
         if (finalizing) {
@@ -1028,6 +1050,7 @@ public class MainActivity extends Activity {
 
     /** Single place that enables/disables controls for the current state. */
     private void refreshControls() {
+        updateKeepScreenOn();
         boolean modelReady = manager != null && manager.isModelLoaded();
         boolean idle = nativeReady && !isBusy();
         ModelCatalog.ModelSpec spec = currentSpec();
@@ -1579,14 +1602,20 @@ public class MainActivity extends Activity {
             try {
                 store.ensureVerified(spec, file, pct -> setStatusUi("モデルを検証中… " + pct + "%"));
                 if (cfg.npuModelId != null) {
+                    prefs().edit().putBoolean(PREFS_NPU_PENDING, true).commit();   // crash guard
                     com.micklab.llamaimage.npu.NpuManager nm = npu();
+                    appendLogUi("NPU: 準備開始（" + spec.title + "）");
                     nm.ensureAssets(this::setStatusUi);
+                    appendLogUi("NPU: 補助ファイル OK");
                     if (!nm.isBuilt(spec.id, spec.sha256)) {
                         appendLogUi("NPU 用モデルを端末で作成します（初回のみ・約 2GB）");
                         nm.ensureBuilt(spec.id, file, spec.sha256, this::setStatusUi);
+                        appendLogUi("NPU: モデル作成 完了");
                     }
                     setStatusUi("NPU を準備中…（初回は最適化に数分かかります）");
+                    appendLogUi("NPU: セッション作成（初回は NPU 向け最適化）開始");
                     err = manager.loadNpu(cfg, nm, this::appendLogUi);
+                    prefs().edit().putBoolean(PREFS_NPU_PENDING, false).commit();
                 } else {
                     setStatusUi("モデル読込中… " + spec.title);
                     err = manager.load(cfg);
@@ -1596,6 +1625,7 @@ public class MainActivity extends Activity {
             }
             final String e = err;
             final long ms = SystemClock.elapsedRealtime() - t0;
+            prefs().edit().putBoolean(PREFS_NPU_PENDING, false).commit();   // finished (ok or error)
             runOnUiThread(() -> {
                 loading = false;
                 if (e.isEmpty()) {
@@ -2511,8 +2541,47 @@ public class MainActivity extends Activity {
         return snapped < 64 ? 64 : snapped;
     }
 
+    private static final String APP_LOG = "app_log.txt";
+    private static final String PREFS_NPU_PENDING = "npu_load_pending";   // set while an NPU load runs
+
+    /** Also appended to files/app_log.txt so the next launch can show what happened before a crash. */
+    private void persistLog(String line) {
+        try {
+            File f = new File(getFilesDir(), APP_LOG);
+            if (f.length() > 200_000) {
+                File old = new File(getFilesDir(), APP_LOG + ".1");
+                old.delete();
+                f.renameTo(old);
+            }
+            try (java.io.FileWriter w = new java.io.FileWriter(f, true)) {
+                w.write(new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + " " + line + "\n");
+            }
+        } catch (IOException ignore) {
+        }
+    }
+
+    /** Last lines of the previous run's log (shown at startup), or "". */
+    private String previousLogTail(int maxLines) {
+        File f = new File(getFilesDir(), APP_LOG);
+        if (!f.isFile()) return "";
+        try {
+            java.util.List<String> lines = new java.util.ArrayList<>();
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                String l;
+                while ((l = r.readLine()) != null) {
+                    lines.add(l);
+                    if (lines.size() > maxLines) lines.remove(0);
+                }
+            }
+            return android.text.TextUtils.join("\n", lines);
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
     private void appendLog(String msg) {
         if (msg == null || logText == null) return;
+        persistLog(msg.trim());
         logText.append(msg.endsWith("\n") ? msg : msg + "\n");
         CharSequence t = logText.getText();
         if (t.length() > MAX_LOG_CHARS) {
