@@ -99,13 +99,15 @@ def make(onnx_path, ckpt, name, out_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", required=True, help="dir with unet.onnx / text_encoder.onnx (fp16)")
+    ap.add_argument("--models", required=True, help="dir with unet_*.onnx / text_encoder.onnx (fp16)")
     ap.add_argument("--checkpoint", required=True, help="SD1.5 single-file .safetensors")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    make(os.path.join(a.models, "unet.onnx"), load_checkpoint(a.checkpoint, ["model.diffusion_model."]),
-         "unet", a.out)
+    from unet_parts import NAMES as UNET_PARTS
+    unet_ck = load_checkpoint(a.checkpoint, ["model.diffusion_model."])
+    for name in UNET_PARTS:   # the UNet is exported in parts (unet_parts.py)
+        make(os.path.join(a.models, f"{name}.onnx"), unet_ck, name, a.out)
     make(os.path.join(a.models, "text_encoder.onnx"),
          load_checkpoint(a.checkpoint, ["cond_stage_model.transformer."]), "text_encoder", a.out)
 

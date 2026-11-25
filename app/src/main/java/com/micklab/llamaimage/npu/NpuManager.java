@@ -104,8 +104,13 @@ public final class NpuManager {
         File assets = assetDir();
         NpuModelAssembler.assemble(assets, "text_encoder", checkpoint, out,
                 p -> status.onStatus("NPU 用に変換中（テキストエンコーダ） " + p + "%"));
-        NpuModelAssembler.assemble(assets, "unet", checkpoint, out,
-                p -> status.onStatus("NPU 用に変換中（UNet） " + p + "%"));
+        for (int i = 0; i < NpuPipeline.UNET_PARTS.length; i++) {
+            String label = "UNet " + (i + 1) + "/" + NpuPipeline.UNET_PARTS.length;
+            NpuModelAssembler.assemble(assets, NpuPipeline.UNET_PARTS[i], checkpoint, out,
+                    p -> status.onStatus("NPU 用に変換中（" + label + "） " + p + "%"));
+        }
+        new File(out, "unet.onnx").delete();      // v1 single-file UNet, if this dir held one
+        new File(out, "unet.weights").delete();
         for (String f : new String[]{"taesd_decoder.onnx", "taesd_encoder.onnx", "tokenizer_vocab.json",
                 "tokenizer_merges.txt"}) {
             IoUtil.copy(new File(assets, f), new File(out, f));

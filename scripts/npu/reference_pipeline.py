@@ -14,6 +14,8 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
+from unet_parts import NAMES as UNET_PARTS, run_unet
+
 
 def session(path, provider):
     opts = ort.SessionOptions()
@@ -45,7 +47,7 @@ def main():
 
     t0 = time.time()
     te = session(os.path.join(a.models, "text_encoder.onnx"), a.provider)
-    unet = session(os.path.join(a.models, "unet.onnx"), a.provider)
+    unet = {n: session(os.path.join(a.models, f"{n}.onnx"), a.provider) for n in UNET_PARTS}
     dec = session(os.path.join(a.models, "taesd_decoder.onnx"), a.provider)
     enc = session(os.path.join(a.models, "taesd_encoder.onnx"), a.provider)
     print(f"sessions: {time.time() - t0:.1f}s")
@@ -76,8 +78,7 @@ def main():
         gen = torch.Generator().manual_seed(a.seed)
         for t in sched.timesteps:
             t1 = time.time()
-            eps = unet.run(None, {"sample": latents, "timestep": np.array([float(t)], np.float32),
-                                  "encoder_hidden_states": hidden})[0]
+            eps = run_unet(unet, latents, np.array([float(t)], np.float32), hidden)
             out = sched.step(torch.from_numpy(eps), t, torch.from_numpy(latents), generator=gen)
             latents, denoised = out.prev_sample.numpy(), out.denoised.numpy()
             print(f"  t={int(t)} {time.time() - t1:.2f}s")

@@ -21,7 +21,11 @@ import ai.onnxruntime.OrtSession;
  * ORT CPU provider (used by the CI test). Independent of Android so it can be tested on a JVM.
  *
  * QNN compiles each graph for the device on the first session creation; the compiled context is
- * written to {@code cacheDir} ("ep.context_*") and loaded directly next time.
+ * written to {@code cacheDir} ("ep.context_*") and loaded directly next time. The UNet comes in
+ * parts ({@link #UNET_PARTS}, scripts/npu/unet_parts.py) chained by tensor name: compiling the
+ * whole UNet at once needed ~10 GB and the process was killed. Every missing context is compiled
+ * and its session closed again (freeing the compiler's memory and the HTP buffers) before the next
+ * one; only then are all sessions opened from the cache.
  */
 public final class NpuPipeline implements Closeable {
     public static final int SIZE = 512, LATENT = 64, CHANNELS = 4, HIDDEN = 768;
@@ -47,31 +51,49 @@ public final class NpuPipeline implements Closeable {
             {0.298f, 0.207f, 0.208f}, {0.187f, 0.286f, 0.173f}, {-0.158f, 0.189f, 0.264f}, {-0.184f, -0.271f, -0.473f}};
 
     private final OrtEnvironment env = OrtEnvironment.getEnvironment();
-    private final OrtSession textEncoder, unet, decoder, encoder;
+    /** UNet parts in execution order (= unet_parts.NAMES). */
+    public static final String[] UNET_PARTS = {"unet_0", "unet_1", "unet_2"};
+
+    private final OrtSession textEncoder, decoder, encoder;
+    private final OrtSession[] unet = new OrtSession[UNET_PARTS.length];
     private final ClipTokenizer tokenizer;
     private final LcmScheduler scheduler = new LcmScheduler();
     private long lastSeed = -1;
 
     public NpuPipeline(File dir, Map<String, String> qnnOptions, File cacheDir, Log log) throws IOException {
         tokenizer = new ClipTokenizer(new File(dir, "tokenizer_vocab.json"), new File(dir, "tokenizer_merges.txt"));
-        OrtSession te = null, un = null, de = null, en = null;
+        String[] names = new String[UNET_PARTS.length + 3];
+        names[0] = "text_encoder";
+        System.arraycopy(UNET_PARTS, 0, names, 1, UNET_PARTS.length);
+        names[names.length - 2] = "taesd_decoder";
+        names[names.length - 1] = "taesd_encoder";
+        OrtSession[] s = new OrtSession[names.length];
         try {
-            log.stage(1, 4, "text_encoder");
-            te = open(new File(dir, "text_encoder.onnx"), qnnOptions, cacheDir, log);
-            log.stage(2, 4, "unet");
-            un = open(new File(dir, "unet.onnx"), qnnOptions, cacheDir, log);
-            log.stage(3, 4, "taesd_decoder");
-            de = open(new File(dir, "taesd_decoder.onnx"), qnnOptions, cacheDir, log);
-            log.stage(4, 4, "taesd_encoder");
-            en = open(new File(dir, "taesd_encoder.onnx"), qnnOptions, cacheDir, log);
+            if (qnnOptions != null && cacheDir != null) {
+                // Pass 1: compile what is not cached yet, one graph at a time, closing each session.
+                for (int i = 0; i < names.length; i++) {
+                    File model = new File(dir, names[i] + ".onnx");
+                    if (contextFile(cacheDir, names[i]).isFile()) continue;
+                    log.stage(i + 1, names.length, names[i]);
+                    s[i] = compile(model, qnnOptions, cacheDir, log);   // null once cached
+                }
+            }
+            // Pass 2: open everything (from the cache on the NPU).
+            for (int i = 0; i < names.length; i++) {
+                if (s[i] == null) s[i] = open(new File(dir, names[i] + ".onnx"), qnnOptions, cacheDir, log);
+            }
         } catch (OrtException | RuntimeException e) {
-            for (OrtSession s : new OrtSession[]{te, un, de, en}) closeQuietly(s);
+            for (OrtSession x : s) closeQuietly(x);
             throw new IOException("NPU セッションを作成できません: " + e.getMessage(), e);
         }
-        textEncoder = te;
-        unet = un;
-        decoder = de;
-        encoder = en;
+        textEncoder = s[0];
+        System.arraycopy(s, 1, unet, 0, UNET_PARTS.length);
+        decoder = s[names.length - 2];
+        encoder = s[names.length - 1];
+    }
+
+    private static File contextFile(File cacheDir, String name) {
+        return new File(cacheDir, name + "_ctx.onnx");
     }
 
     private OrtSession open(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
@@ -82,8 +104,8 @@ public final class NpuPipeline implements Closeable {
             log.log("NPU(CPU EP) " + name + ": " + (System.currentTimeMillis() - t0) + "ms");
             return s;
         }
-        File ctx = new File(cacheDir, name + "_ctx.onnx");
-        if (ctx.isFile()) {
+        File ctx = cacheDir == null ? null : contextFile(cacheDir, name);
+        if (ctx != null && ctx.isFile()) {
             try {
                 OrtSession s = env.createSession(ctx.getAbsolutePath(), qnnOptions(qnn));
                 log.log("NPU " + name + ": キャッシュから読込 " + (System.currentTimeMillis() - t0) + "ms");
@@ -93,6 +115,14 @@ public final class NpuPipeline implements Closeable {
                 deleteContext(cacheDir, name);
             }
         }
+        return compileSession(model, qnn, cacheDir, log);   // keeps the (now cached) session
+    }
+
+    /** Compiles {@code model} for the HTP (writing the context cache when {@code cacheDir} is set). */
+    private OrtSession compileSession(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
+        String name = model.getName().replace(".onnx", "");
+        long t0 = System.currentTimeMillis();
+        File ctx = cacheDir == null ? null : contextFile(cacheDir, name);
         if (cacheDir != null && !cacheDir.isDirectory()) cacheDir.mkdirs();
         OrtSession.SessionOptions so = qnnOptions(qnn);
         if (cacheDir != null) {
@@ -107,6 +137,19 @@ public final class NpuPipeline implements Closeable {
         OrtSession s = env.createSession(model.getAbsolutePath(), so);
         log.log("NPU " + name + ": 最適化 完了 " + (System.currentTimeMillis() - t0) / 1000 + "s");
         return s;
+    }
+
+    /**
+     * Compiles and caches; the session is closed again in pass 1 (the cache is opened in pass 2),
+     * and kept only when there is no cache to reopen it from.
+     */
+    private OrtSession compile(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
+        OrtSession s = compileSession(model, qnn, cacheDir, log);
+        if (cacheDir == null) return s;
+        String name = model.getName().replace(".onnx", "");
+        if (!contextFile(cacheDir, name).isFile()) return s;   // no cache written: keep this session
+        closeQuietly(s);
+        return null;
     }
 
     private static OrtSession.SessionOptions qnnOptions(Map<String, String> qnn) throws OrtException {
@@ -170,16 +213,37 @@ public final class NpuPipeline implements Closeable {
         }
     }
 
+    /** Runs the UNet parts in order; each takes its inputs by name from the earlier tensors. */
     private float[] unet(float[] sample, int t, float[] hidden) throws OrtException {
-        Map<String, OnnxTensor> in = new HashMap<>();
-        try (OnnxTensor x = OnnxTensor.createTensor(env, FloatBuffer.wrap(sample), new long[]{1, CHANNELS, LATENT, LATENT});
-             OnnxTensor ts = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{t}), new long[]{1});
-             OnnxTensor h = OnnxTensor.createTensor(env, FloatBuffer.wrap(hidden), new long[]{1, ClipTokenizer.LENGTH, HIDDEN})) {
-            in.put("sample", x);
-            in.put("timestep", ts);
-            in.put("encoder_hidden_states", h);
-            try (OrtSession.Result r = unet.run(in)) {
-                return floats(r);
+        Map<String, OnnxTensor> vals = new HashMap<>();
+        java.util.List<OrtSession.Result> results = new java.util.ArrayList<>();
+        try {
+            vals.put("sample", OnnxTensor.createTensor(env, FloatBuffer.wrap(sample), new long[]{1, CHANNELS, LATENT, LATENT}));
+            vals.put("timestep", OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{t}), new long[]{1}));
+            vals.put("encoder_hidden_states", OnnxTensor.createTensor(env, FloatBuffer.wrap(hidden),
+                    new long[]{1, ClipTokenizer.LENGTH, HIDDEN}));
+            for (int p = 0; p < unet.length; p++) {
+                Map<String, OnnxTensor> in = new HashMap<>();
+                for (String n : unet[p].getInputNames()) {
+                    OnnxTensor v = vals.get(n);
+                    if (v == null) throw new IllegalStateException(UNET_PARTS[p] + ": 入力 " + n + " がありません");
+                    in.put(n, v);
+                }
+                OrtSession.Result r = unet[p].run(in);
+                results.add(r);
+                for (Map.Entry<String, ai.onnxruntime.OnnxValue> e : r) vals.put(e.getKey(), (OnnxTensor) e.getValue());
+            }
+            OnnxTensor out = vals.get("noise_pred");
+            if (out == null) throw new IllegalStateException("noise_pred がありません");
+            FloatBuffer fb = out.getFloatBuffer();
+            float[] eps = new float[fb.remaining()];
+            fb.get(eps);
+            return eps;
+        } finally {
+            for (OrtSession.Result r : results) r.close();
+            for (String n : new String[]{"sample", "timestep", "encoder_hidden_states"}) {
+                OnnxTensor v = vals.get(n);
+                if (v != null) v.close();
             }
         }
     }
@@ -249,6 +313,7 @@ public final class NpuPipeline implements Closeable {
 
     @Override
     public void close() {
-        for (OrtSession s : new OrtSession[]{textEncoder, unet, decoder, encoder}) closeQuietly(s);
+        for (OrtSession s : new OrtSession[]{textEncoder, decoder, encoder}) closeQuietly(s);
+        for (OrtSession s : unet) closeQuietly(s);
     }
 }

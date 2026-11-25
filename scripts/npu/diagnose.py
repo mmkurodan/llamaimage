@@ -10,6 +10,8 @@ import onnxruntime as ort
 import torch
 from PIL import Image
 
+from unet_parts import NAMES as UNET_PARTS, run_unet
+
 DS_REPO = "Lykon/dreamshaper-8-lcm"
 DS_REV = "4645d8bc6a8e6b106d21606d63e8460cdad4f1a6"
 TAESD_REPO = "madebyollin/taesd"
@@ -44,13 +46,13 @@ def main():
     hid = sess("text_encoder.onnx").run(None, {"input_ids": ids.numpy().astype(np.int32)})[0]
     stats("text_encoder", hid_ref, hid)
 
+    unet = {n: sess(f"{n}.onnx") for n in UNET_PARTS}
     rng = np.random.default_rng(0)
     x = rng.standard_normal((1, 4, 64, 64)).astype(np.float32)
     for t in (999.0, 499.0, 99.0):
         with torch.no_grad():
             eps_ref = pipe.unet(torch.from_numpy(x), torch.tensor([t]), torch.from_numpy(hid_ref)).sample.numpy()
-        eps = sess("unet.onnx").run(None, {"sample": x, "timestep": np.array([t], np.float32),
-                                          "encoder_hidden_states": hid_ref})[0]
+        eps = run_unet(unet, x, np.array([t], np.float32), hid_ref)
         stats(f"unet t={int(t)}", eps_ref, eps)
 
     tae = AutoencoderTiny.from_pretrained(TAESD_REPO, revision=TAESD_REV, torch_dtype=torch.float32)

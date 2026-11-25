@@ -12,10 +12,10 @@ on:
       - '.github/workflows/npu-models.yml'
 
 permissions:
-  contents: write   # publish the models as a GitHub Release (npu-models-v1)
+  contents: write   # publish the models as a GitHub Release (npu-models-v2)
 
 env:
-  NPU_RELEASE_TAG: npu-models-v1
+  NPU_RELEASE_TAG: npu-models-v2
 
 jobs:
   export:
@@ -91,7 +91,7 @@ jobs:
           javac -d jt/classes -cp "jt/lib/*" $(find app/src/main/java/com/micklab/llamaimage/npu scripts/npu/java-test -name '*.java' ! -name NpuManager.java ! -name NpuAssets.java)
           java -Xmx6g -cp "jt/classes:jt/lib/*" com.micklab.llamaimage.npu.NpuJavaTest jt/assets "$CK" jt/tokens.json npu-ref/java
           python scripts/npu/assemble.py --templates npu-templates --checkpoint "$CK" --out jt/py
-          for f in text_encoder.weights unet.weights; do
+          for f in text_encoder.weights unet_0.weights unet_1.weights unet_2.weights; do
             a=$(sha256sum npu-ref/java/model/$f | cut -d' ' -f1); b=$(sha256sum jt/py/$f | cut -d' ' -f1)
             echo "$f java=$a python=$b"; [ "$a" = "$b" ]
           done
@@ -137,7 +137,7 @@ jobs:
             echo "release $NPU_RELEASE_TAG exists — not republishing"; exit 0
           fi
           gh release create "$NPU_RELEASE_TAG" release/* --target "$GITHUB_SHA" --prerelease \
-            --title "NPU models v1: DreamShaper 8 LCM + TAESD (ONNX, 512px)" \
+            --title "NPU models v2: DreamShaper 8 LCM + TAESD (ONNX, 512px, UNet in 3 parts)" \
             --notes-file release/README.txt
 
       - name: Upload reference images

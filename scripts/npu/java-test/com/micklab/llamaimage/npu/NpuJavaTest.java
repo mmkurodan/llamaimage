@@ -45,7 +45,10 @@ public final class NpuJavaTest {
         // 2. assembly
         File model = new File(out, "model");
         model.mkdirs();
-        for (String name : new String[]{"text_encoder", "unet"}) {
+        String[] names = new String[1 + NpuPipeline.UNET_PARTS.length];
+        names[0] = "text_encoder";
+        System.arraycopy(NpuPipeline.UNET_PARTS, 0, names, 1, NpuPipeline.UNET_PARTS.length);
+        for (String name : names) {
             long t0 = System.currentTimeMillis();
             NpuModelAssembler.assemble(assets, name, ckpt, model, p -> { });
             System.out.println("[java] assembled " + name + " in " + (System.currentTimeMillis() - t0) + "ms");

@@ -13,6 +13,8 @@ import shutil
 
 import numpy as np
 
+from unet_parts import NAMES as UNET_PARTS, run_unet
+
 
 def assemble(templates, name, ckpt_path, out):
     from safetensors import safe_open
@@ -49,8 +51,9 @@ def run(out):
     ids = np.full((1, 77), 49407, np.int32)
     ids[0, 0] = 49406
     hid = s("text_encoder.onnx").run(None, {"input_ids": ids})[0]
-    eps = s("unet.onnx").run(None, {"sample": np.random.default_rng(0).standard_normal((1, 4, 64, 64)).astype(np.float32),
-                                     "timestep": np.array([499.0], np.float32), "encoder_hidden_states": hid})[0]
+    eps = run_unet({n: s(f"{n}.onnx") for n in UNET_PARTS},
+                   np.random.default_rng(0).standard_normal((1, 4, 64, 64)).astype(np.float32),
+                   np.array([499.0], np.float32), hid)
     print(f"[run] hidden std={hid.std():.4f} eps std={eps.std():.4f} nan={int(np.isnan(eps).sum())}")
     if not np.isfinite(eps).all() or not 0.1 < eps.std() < 5:
         raise SystemExit("assembled model produced implausible output")
@@ -64,7 +67,7 @@ def main():
     ap.add_argument("--verify", help="dir with the original exported ONNX for byte comparison")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
-    for name in ("text_encoder", "unet"):
+    for name in ["text_encoder"] + UNET_PARTS:
         p = assemble(a.templates, name, a.checkpoint, a.out)
         if a.verify:
             verify(p, os.path.join(a.verify, f"{name}.onnx"))

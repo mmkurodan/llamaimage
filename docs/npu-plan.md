@@ -18,6 +18,10 @@ init image (img2img) ─ taesd_encoder.onnx ─ add noise ──┘             
 - ORT compiles each ONNX graph for the device's HTP on first use (libQnnHtpPrepare) and caches the
   QNN context (`ep.context_enable`) in the app's files dir — no per-SoC offline conversion.
 - Static shapes: batch 1, 77 tokens, 512×512 (64×64 latents). Other sizes = other models.
+- The UNet is split into three chained ONNX parts (`scripts/npu/unet_parts.py`: down+mid / up 0 /
+  up 1–3+out, fp16 weights 697 / 324 / 698 MB), chained by tensor name in `NpuPipeline`. Compiling
+  the whole 1.7 GB UNet on the phone used ~10 GB and the process was SIGKILLed (2026-11-25, SM8850);
+  each part is now compiled, cached and closed before the next one (release `npu-models-v2`).
 - Weights fp16, float32 I/O; HTP runs fp16 (`enable_htp_fp16_precision=1`). If fp16 is too slow or
   too large for the HTP, the next step is W8A16 quantization (calibration from the reference
   pipeline's activations).

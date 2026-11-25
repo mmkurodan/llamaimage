@@ -6,8 +6,8 @@ static shapes, so everything is fixed to batch 1, 77 tokens and 512x512 (64x64 l
 
 Outputs (in --out):
   text_encoder.onnx   input_ids int32 [1,77]                     -> hidden float32 [1,77,768]
-  unet.onnx           sample f32 [1,4,64,64], timestep f32 [1],
-                      encoder_hidden_states f32 [1,77,768]        -> noise_pred f32 [1,4,64,64]
+  unet_0/1/2.onnx     the UNet in three chained parts (unet_parts.py): sample f32 [1,4,64,64],
+                      timestep f32 [1], encoder_hidden_states f32 [1,77,768] -> ... -> noise_pred
   taesd_decoder.onnx  latents f32 [1,4,64,64]                    -> image f32 [1,3,512,512] in [0,1]
   taesd_encoder.onnx  image f32 [1,3,512,512] in [0,1]           -> latents f32 [1,4,64,64]
   tokenizer/ (vocab.json, merges.txt), scheduler_config.json, LICENSE notes
@@ -39,15 +39,6 @@ class TextEncoder(torch.nn.Module):
 
     def forward(self, input_ids):
         return self.te(input_ids.long(), return_dict=False)[0]
-
-
-class UNet(torch.nn.Module):
-    def __init__(self, unet):
-        super().__init__()
-        self.unet = unet
-
-    def forward(self, sample, timestep, encoder_hidden_states):
-        return self.unet(sample, timestep, encoder_hidden_states, return_dict=False)[0]
 
 
 class TaesdDecoder(torch.nn.Module):
@@ -157,8 +148,21 @@ def main():
            ["image"], ["latents"])
     del vae
 
-    export(UNet(unet), (torch.zeros(1, 4, 64, 64), torch.tensor([999.0]), torch.zeros(1, 77, 768)),
-           os.path.join(a.out, "unet.onnx"), ["sample", "timestep", "encoder_hidden_states"], ["noise_pred"])
+    # The UNet is exported as consecutive parts (unet_parts.py) so the phone compiles each for the
+    # HTP on its own (the whole UNet at once needed ~10 GB and the app was killed).
+    import unet_parts
+    x = torch.randn(1, 4, 64, 64, generator=torch.Generator().manual_seed(0))
+    t = torch.tensor([499.0])
+    ehs = torch.randn(1, 77, 768, generator=torch.Generator().manual_seed(1))
+    args, chained = unet_parts.example_inputs(unet, x, t, ehs)
+    with torch.no_grad():
+        full = unet(x, t, ehs, return_dict=False)[0]
+    diff = (full - chained).abs().max().item()
+    print(f"[export] UNet split (PyTorch) max |full - parts| = {diff:.3g}")
+    if diff > 1e-4:
+        raise SystemExit("UNet split does not reproduce the full UNet")
+    for (name, mod, ins, outs), pargs in zip(unet_parts.parts(unet), args):
+        export(mod, pargs, os.path.join(a.out, f"{name}.onnx"), ins, outs)
     del unet
 
     tok = os.path.join(a.out, "tokenizer")

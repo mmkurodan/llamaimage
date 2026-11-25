@@ -235,6 +235,8 @@ public class MainActivity extends Activity {
         persistLog("==== 起動 ====");
         if (npuCrashed) {
             appendLog("前回 NPU の準備中にアプリが終了したため、CPU に切り替えました（生成設定で再度 NPU を選べます）");
+            String why = lastExitReason();
+            if (why != null) appendLog(why);
         }
 
         generateButton.setOnClickListener(v -> startGeneration(currentTab == TAB_IMG2IMG));
@@ -326,8 +328,10 @@ public class MainActivity extends Activity {
     // --- NPU preparation progress -----------------------------------------------------------
     // ORT compiles each graph in one blocking call without progress, so the bar shows the stage
     // (weighted by its typical share of the time: the UNet dominates) plus the elapsed time.
-    private static final int[] NPU_STAGE_WEIGHT = {0, 8, 80, 6, 6};   // index 1..4, sums to 100
-    private static final String[] NPU_STAGE_LABEL = {"", "テキストエンコーダ", "UNet", "デコーダ", "エンコーダ"};
+    // Stages = NpuPipeline order: text encoder, UNet parts 1..3 (unet_0/1/2), decoder, encoder.
+    private static final int[] NPU_STAGE_WEIGHT = {0, 8, 32, 16, 32, 6, 6};   // index 1..6, sums to 100
+    private static final String[] NPU_STAGE_LABEL = {"", "テキストエンコーダ", "UNet 1/3", "UNet 2/3", "UNet 3/3",
+            "デコーダ", "エンコーダ"};
     private int npuStage = 0, npuStages = 0;
     private long npuStageStart = 0, npuPrepStart = 0;
     private final Runnable npuTicker = new Runnable() {
@@ -359,6 +363,40 @@ public class MainActivity extends Activity {
                 + (mi.lowMemory ? "（低メモリ）" : "");
     }
 
+    /**
+     * Why the previous process ended, as recorded by Android (API 30+): tells a low-memory kill
+     * (lmkd) from a native crash in the QNN/HTP compiler. Null when unavailable.
+     */
+    private String lastExitReason() {
+        if (android.os.Build.VERSION.SDK_INT < 30) return null;
+        try {
+            java.util.List<android.app.ApplicationExitInfo> list =
+                    ((android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE))
+                            .getHistoricalProcessExitReasons(null, 0, 1);
+            if (list.isEmpty()) return null;
+            android.app.ApplicationExitInfo e = list.get(0);
+            String reason;
+            switch (e.getReason()) {
+                case android.app.ApplicationExitInfo.REASON_LOW_MEMORY: reason = "LOW_MEMORY（メモリ不足で強制終了）"; break;
+                case android.app.ApplicationExitInfo.REASON_CRASH_NATIVE: reason = "CRASH_NATIVE（ネイティブクラッシュ）"; break;
+                case android.app.ApplicationExitInfo.REASON_CRASH: reason = "CRASH（Java 例外）"; break;
+                case android.app.ApplicationExitInfo.REASON_ANR: reason = "ANR"; break;
+                case android.app.ApplicationExitInfo.REASON_SIGNALED: reason = "SIGNALED（シグナル " + e.getStatus() + "）"; break;
+                case android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE: reason = "EXCESSIVE_RESOURCE_USAGE"; break;
+                case android.app.ApplicationExitInfo.REASON_USER_REQUESTED: reason = "USER_REQUESTED"; break;
+                case android.app.ApplicationExitInfo.REASON_OTHER: reason = "OTHER"; break;
+                default: reason = "reason=" + e.getReason(); break;
+            }
+            return "前回の終了理由: " + reason + " / status " + e.getStatus() + " / importance " + e.getImportance()
+                    + " / PSS " + (e.getPss() >> 10) + " MB / RSS " + (e.getRss() >> 10) + " MB"
+                    + (e.getDescription() != null ? " / " + e.getDescription() : "")
+                    + " (" + new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                    .format(new java.util.Date(e.getTimestamp())) + ")";
+        } catch (Exception ex) {
+            return "前回の終了理由を取得できません: " + ex;
+        }
+    }
+
     private void startMemWatch() {
         if (memWatch != null) return;
         memWatch = new Thread(() -> {
@@ -384,7 +422,7 @@ public class MainActivity extends Activity {
         startMemWatch();
         appendLog(memLine());
         if (npuPrepStart == 0) npuPrepStart = SystemClock.elapsedRealtime();
-        npuStage = Math.min(index, 4);
+        npuStage = Math.max(1, Math.min(index, NPU_STAGE_LABEL.length - 1));
         npuStages = total;
         npuStageStart = SystemClock.elapsedRealtime();
         int done = 0;
