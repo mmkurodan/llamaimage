@@ -80,7 +80,11 @@ def export(module, args, path, input_names, output_names):
     from onnxconverter_common import float16
 
     model = onnx.load(fp32, load_external_data=True)
-    model16 = float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True)
+    # Resize's scales/roi inputs must stay float32 (ONNX spec); keep those nodes in fp32 (the
+    # converter inserts the casts). Upsampling in the UNet and TAESD decoder uses Resize.
+    block = list(float16.DEFAULT_OP_BLOCK_LIST) + ["Resize"]
+    model16 = float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True,
+                                               op_block_list=block)
     onnx.save(model16, path, save_as_external_data=False)
     shutil.rmtree(tmp)
     print(f"[export] {path}: {os.path.getsize(path) / 1e6:.1f} MB")
