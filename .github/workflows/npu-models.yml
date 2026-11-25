@@ -60,6 +60,42 @@ jobs:
             --prompt "portrait photo of a young woman in a cafe, natural window light"
           rm -rf asm-ar ar_lcm.safetensors
 
+      # The app's Java NPU code (app/src/main/java/.../npu) on a JVM with the ORT CPU provider.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Java NPU pipeline test (tokenizer golden, Java assembly == Python assembly, images)
+        run: |
+          set -e
+          mkdir -p jt/lib jt/assets jt/classes
+          curl -fsSL -o jt/lib/onnxruntime.jar https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime/1.32.0/onnxruntime-1.32.0.jar
+          curl -fsSL -o jt/lib/json.jar https://repo1.maven.org/maven2/org/json/json/20260814/json-20260814.jar
+          cp npu-templates/* npu-models/taesd_*.onnx jt/assets/
+          cp npu-models/tokenizer/vocab.json jt/assets/tokenizer_vocab.json
+          cp npu-models/tokenizer/merges.txt jt/assets/tokenizer_merges.txt
+          python - <<'PY'
+          import json
+          from transformers import CLIPTokenizer
+          t = CLIPTokenizer("npu-models/tokenizer/vocab.json", "npu-models/tokenizer/merges.txt")
+          prompts = ["a photo of a cat sitting on a wooden table, soft light", "", "Hello,   WORLD!!  it's 2026 :-)",
+                     "masterpiece, best quality, 1girl, (colorful),(delicate eyes and face), 8k wallpaper",
+                     "日本の桜と富士山 sunset", "emoji 🐱🎨 test", "don't we'll they're I'm you've she'd",
+                     " ".join(["very long prompt"] * 40), "a-b_c/d\\e [f] {g} <h> |i| 3.14159 1,000"]
+          json.dump({p: t(p, padding="max_length", max_length=77, truncation=True).input_ids for p in prompts},
+                    open("jt/tokens.json", "w"), ensure_ascii=False)
+          PY
+          CK=$(python -c "from huggingface_hub import hf_hub_download as d; print(d('Lykon/dreamshaper-8-lcm','DreamShaper8_LCM.safetensors',revision='4645d8bc6a8e6b106d21606d63e8460cdad4f1a6'))")
+          javac -d jt/classes -cp "jt/lib/*" $(find app/src/main/java/com/micklab/llamaimage/npu scripts/npu/java-test -name '*.java')
+          java -Xmx6g -cp "jt/classes:jt/lib/*" com.micklab.llamaimage.npu.NpuJavaTest jt/assets "$CK" jt/tokens.json npu-ref/java
+          python scripts/npu/assemble.py --templates npu-templates --checkpoint "$CK" --out jt/py
+          for f in text_encoder.weights unet.weights; do
+            a=$(sha256sum npu-ref/java/model/$f | cut -d' ' -f1); b=$(sha256sum jt/py/$f | cut -d' ' -f1)
+            echo "$f java=$a python=$b"; [ "$a" = "$b" ]
+          done
+          rm -rf npu-ref/java/model jt/py
+
       - name: Diagnose (ONNX vs PyTorch fp32, diffusers reference images)
         run: python scripts/npu/diagnose.py --models npu-models --out npu-ref
 
