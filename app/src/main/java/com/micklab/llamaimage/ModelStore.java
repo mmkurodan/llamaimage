@@ -322,27 +322,37 @@ public final class ModelStore {
                 throw new IOException("SHA-256 が一致しません（破損したダウンロード）");
             }
             File dst = new File(part.getParentFile(), spec.fileName);
-            // Some DownloadManagers name the file after the server's Content-Disposition instead of
-            // our ".part" destination; Civitai sends exactly spec.fileName, so the download may
-            // already BE dst. Never delete it then (that used to destroy the verified download).
-            if (!part.getCanonicalPath().equals(dst.getCanonicalPath())) {
-                if (dst.exists()) dst.delete();
-                if (!part.renameTo(dst)) throw new IOException("ファイルを配置できません: " + dst);
-            }
+            // DownloadManager.remove() deletes the file at the path it recorded, so the file must
+            // not be at that path any more when the entry is dropped. Normally it is ".part" and is
+            // renamed to dst. But some DownloadManagers name the file after the server's
+            // Content-Disposition, and Civitai sends exactly spec.fileName — then the download
+            // already IS dst, and removing the entry (here, or later) deleted the installed model.
+            // So: move it to a staging name, drop the entry, then move it into place.
+            File staged = new File(part.getParentFile(), spec.fileName + ".staged");
+            if (staged.exists()) staged.delete();
+            if (!part.renameTo(staged)) throw new IOException("ファイルを配置できません: " + staged);
+            part = staged;   // for the catch block
+            removeDownloadEntry(id);
+            if (dst.exists()) dst.delete();
+            if (!staged.renameTo(dst)) throw new IOException("ファイルを配置できません: " + dst);
             markVerified(dst);
             return dst;
         } catch (IOException e) {
             if (part != null) part.delete();
             throw e;
         } finally {
-            // Drop the DownloadManager entry (its file was renamed away or deleted above).
-            if (id >= 0) {
-                try {
-                    dm().remove(id);
-                } catch (RuntimeException ignore) {
-                }
-            }
+            // Drop the DownloadManager entry (no-op if already dropped; its file was moved away
+            // or deleted above, so this cannot delete the installed model).
+            removeDownloadEntry(id);
             prefs.edit().remove(KEY_DL + spec.id).apply();
+        }
+    }
+
+    private void removeDownloadEntry(long id) {
+        if (id < 0) return;
+        try {
+            dm().remove(id);
+        } catch (RuntimeException ignore) {
         }
     }
 
