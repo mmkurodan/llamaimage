@@ -639,19 +639,28 @@ public class MainActivity extends Activity {
         logText.setTypeface(Typeface.MONOSPACE);
         logText.setTextIsSelectable(true);
         logText.setLineSpacing(0, 1.15f);
-        logScroll = new ScrollView(this);
+        // The page is itself a ScrollView. Claim the gesture as soon as a finger lands on the log
+        // box (dispatchTouchEvent runs even when the selectable TextView consumes the touch, which
+        // an OnTouchListener on the box does not), and use nested scrolling so the page does not
+        // intercept the drag.
+        logScroll = new ScrollView(this) {
+            @Override
+            public boolean dispatchTouchEvent(MotionEvent e) {
+                int a = e.getActionMasked();
+                if (a == MotionEvent.ACTION_DOWN) {
+                    getParent().requestDisallowInterceptTouchEvent(canScrollVertically(1) || canScrollVertically(-1));
+                } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                    getParent().requestDisallowInterceptTouchEvent(false);
+                }
+                return super.dispatchTouchEvent(e);
+            }
+        };
+        logScroll.setNestedScrollingEnabled(true);
         logScroll.setBackground(rounded(0xFF08080A, 12, C_STROKE));
         logScroll.setPadding(dp(12), dp(10), dp(12), dp(10));
         logScroll.setClipToPadding(false);
         logScroll.setScrollbarFadingEnabled(false);
         logScroll.addView(logText);
-        // Let the box scroll by itself instead of the page grabbing the gesture.
-        logScroll.setOnTouchListener((v, e) -> {
-            int a = e.getActionMasked();
-            v.getParent().requestDisallowInterceptTouchEvent(
-                    a != MotionEvent.ACTION_UP && a != MotionEvent.ACTION_CANCEL);
-            return false;
-        });
         body.addView(section("ログ", null, logScroll, true, dp(180)), marginLp(0, 12, 0, 0));
 
         // Restore persisted inputs.
