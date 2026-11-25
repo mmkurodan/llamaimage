@@ -10,3 +10,4 @@ onnxruntime==1.20.1
 accelerate
 numpy<2
 pillow
+ftfy==6.3.1
