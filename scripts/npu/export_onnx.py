@@ -115,8 +115,12 @@ def export(module, args, path, input_names, output_names):
     # Resize's scales/roi inputs must stay float32 (ONNX spec); keep those nodes in fp32 (the
     # converter inserts the casts). Upsampling in the UNet and TAESD decoder uses Resize.
     block = list(float16.DEFAULT_OP_BLOCK_LIST) + ["Resize"]
+    # The converter clamps |x| < min_positive_val (default 1e-7) up to that value, which rewrites
+    # fp16 subnormals of the checkpoint. Weights come from an fp16 checkpoint, so plain rounding
+    # is exact; disable the clamping so the exported weights stay bit-identical to it.
     model16 = float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True,
-                                               op_block_list=block)
+                                               op_block_list=block, min_positive_val=1e-30,
+                                               max_finite_val=65504.0)
     fix_resize_params(model16)
     onnx.save(model16, path, save_as_external_data=False)
     shutil.rmtree(tmp)
