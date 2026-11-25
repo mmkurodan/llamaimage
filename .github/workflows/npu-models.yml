@@ -1,0 +1,45 @@
+name: NPU models (ONNX export)
+
+# 手動実行のみ。DreamShaper 8 LCM + TAESD を NPU (ONNX Runtime QNN EP) 用の静的形状 ONNX に
+# 書き出し、CPU の参照パイプラインで画像が正しく出ることを確かめて成果物にする。
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+
+      - name: Install
+        run: pip install -r scripts/npu/requirements.txt
+
+      - name: Export ONNX
+        run: python scripts/npu/export_onnx.py --out npu-models
+
+      - name: Reference pipeline (CPU)
+        run: python scripts/npu/reference_pipeline.py --models npu-models --out npu-ref
+
+      - name: Sizes
+        run: ls -la npu-models npu-models/tokenizer npu-ref
+
+      - name: Upload reference images
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: npu-reference
+          path: npu-ref
+
+      - name: Upload ONNX models
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: npu-onnx-dreamshaper8-lcm-512
+          path: npu-models
+          compression-level: 0
