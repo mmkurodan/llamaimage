@@ -58,6 +58,7 @@ static std::atomic<bool>      g_cancelled{false};    // last generate ended beca
 static std::mutex             g_err_mutex;
 static std::string            g_last_error;          // last native error (e.g. out-of-memory)
 static std::string            g_backend = "CPU";     // backend of the loaded model (guarded by g_mutex)
+static std::atomic<bool>      g_warming{false};      // warm-up run in nativeInit: no Java callbacks
 
 static JavaVM*     g_vm = nullptr;
 static std::mutex  g_listener_mutex;                 // guards the listener ref + method ids
@@ -198,6 +199,9 @@ static void generation_progress_cb(const sd_generation_progress_t* p, void* /*da
             sd_cancel_generation(ctx, SD_CANCEL_ALL);
         }
     }
+    if (g_warming.load()) {
+        return;
+    }
     const bool sampling = p->stage != nullptr && strcmp(p->stage, "sampling") == 0;
     const bool decoding = p->stage != nullptr && (strstr(p->stage, "decode") != nullptr);
     if (!sampling && !decoding) {
@@ -221,7 +225,7 @@ static void generation_progress_cb(const sd_generation_progress_t* p, void* /*da
 // frames[0] is a U8 [C, W, H] tensor, i.e. interleaved RGB rows.
 static void preview_cb(int /*step*/, int frame_count, const sd_tensor_t* const* frames, bool /*is_noisy*/,
                        void* /*data*/) {
-    if (frame_count < 1 || frames == nullptr || frames[0] == nullptr) {
+    if (g_warming.load() || frame_count < 1 || frames == nullptr || frames[0] == nullptr) {
         return;
     }
     const sd_tensor_t* t = frames[0];
@@ -470,6 +474,34 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
         return env->NewStringUTF(err.c_str());
     }
     sd_set_generation_progress_callback(ctx, generation_progress_cb, nullptr);
+
+    // sd_ctx_create() only records the configuration: weights are loaded (and GPU kernels compiled)
+    // by the first generation, which made the first image ~50s slower after "ready". Run a tiny
+    // silent warm-up generation (64x64, 1 step) so that cost is part of the model load instead.
+    {
+        g_warming = true;
+        sd_img_gen_opt_t* w = sd_img_gen_opt_create();
+        sd_result_t* wr = nullptr;
+        sd_status_t wst = SD_STATUS_INVALID_ARGUMENT;
+        if (w != nullptr && sd_opt_set_string(w, "prompt", "warm up") == SD_STATUS_OK
+            && sd_opt_set_int(w, "width", 64) == SD_STATUS_OK && sd_opt_set_int(w, "height", 64) == SD_STATUS_OK
+            && sd_opt_set_int(w, "sample.steps", 1) == SD_STATUS_OK && sd_opt_set_int(w, "seed", 1) == SD_STATUS_OK) {
+            wst = sd_generate_image(ctx, w, &wr);
+        }
+        std::string werr = wst == SD_STATUS_OK ? "" : last_sd_error("warm-up failed");
+        sd_result_free(wr);
+        sd_opt_free(w);
+        g_warming = false;
+        if (wst != SD_STATUS_OK) {
+            sd_set_generation_progress_callback(ctx, nullptr, nullptr);
+            sd_ctx_free(ctx);
+            std::string e = "モデルを読み込めません: " + werr;
+            set_error(e);
+            ALOGE("%s", e.c_str());
+            sd_log_to_file(e.c_str());
+            return env->NewStringUTF(e.c_str());
+        }
+    }
     g_backend = backend == "cpu" ? "CPU" : backend;
     g_ctx = ctx;
     return env->NewStringUTF("");
