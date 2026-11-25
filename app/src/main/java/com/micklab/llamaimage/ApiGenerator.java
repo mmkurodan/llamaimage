@@ -230,21 +230,38 @@ public final class ApiGenerator {
         long ram = CpuInfo.totalRamBytes(app);
         boolean vaeTiling = p.getBoolean(MainActivity.PREFS_VAE_TILING,
                 ram > 0 && ram < MainActivity.LOW_RAM_BYTES);
-        boolean gpu = p.getBoolean(MainActivity.PREFS_USE_GPU, false) && !manager.gpuDevice().isEmpty();
+        int backend = p.getInt(MainActivity.PREFS_BACKEND,
+                p.getBoolean(MainActivity.PREFS_USE_GPU, false) ? MainActivity.BACKEND_GPU : MainActivity.BACKEND_CPU);
+        // NPU only if the app already built this model's NPU files (building takes minutes); else CPU.
+        com.micklab.llamaimage.npu.NpuManager nm = new com.micklab.llamaimage.npu.NpuManager(app);
+        String npuId = backend == MainActivity.BACKEND_NPU && MainActivity.npuUsable(spec)
+                && nm.isBuilt(spec.id, spec.sha256) ? spec.id : null;
+        boolean gpu = npuId == null && backend == MainActivity.BACKEND_GPU && !manager.gpuDevice().isEmpty();
         SdModelManager.LoadConfig cfg = new SdModelManager.LoadConfig(file.getAbsolutePath(),
-                threads, wtype, taesd != null ? taesd.getAbsolutePath() : "", vaeTiling, gpu);
+                threads, wtype, taesd != null ? taesd.getAbsolutePath() : "", vaeTiling, gpu, npuId);
         if (!manager.isLoaded(cfg)) {
-            log("API: loading model " + spec.title);
+            log("API: loading model " + spec.title + (npuId != null ? " (NPU)" : gpu ? " (GPU)" : ""));
             store.ensureVerified(spec, file, pct -> { });
-            String err = manager.load(cfg);
+            String err = npuId != null ? manager.loadNpu(cfg, nm, this::log) : manager.load(cfg);
+            if (!err.isEmpty() && npuId != null) {
+                log("API: NPU load failed, using CPU: " + err);
+                cfg = new SdModelManager.LoadConfig(file.getAbsolutePath(), threads, wtype,
+                        taesd != null ? taesd.getAbsolutePath() : "", vaeTiling, false, null);
+                err = manager.load(cfg);
+            }
             if (!err.isEmpty()) return Response.error(500, "model load failed: " + err);
         }
+        boolean onNpu = cfg.npuModelId != null;
 
         // --- per-image parameters (request overrides the saved settings) ---
         int savedSize = p.getInt(MainActivity.PREFS_SIZE, 512);
         int width = MainActivity.snapTo64(clamp(req.width > 0 ? req.width : savedSize, MIN_SIDE, MAX_SIDE));
         int height = MainActivity.snapTo64(clamp(req.height > 0 ? req.height
                 : (req.width > 0 ? req.width : savedSize), MIN_SIDE, MAX_SIDE));
+        if (onNpu) {   // the NPU models have static 512x512 shapes
+            width = com.micklab.llamaimage.npu.NpuPipeline.SIZE;
+            height = com.micklab.llamaimage.npu.NpuPipeline.SIZE;
+        }
         // The app's saved steps / CFG / sampler belong to the app's model; another model gets its own
         // recommended values (e.g. SD-Turbo 1 step vs SD1.5 20 steps).
         boolean specDefaults = overridden && spec.hasRecommendedSettings();

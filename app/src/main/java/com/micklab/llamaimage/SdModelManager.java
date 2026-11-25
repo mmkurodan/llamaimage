@@ -1,5 +1,8 @@
 package com.micklab.llamaimage;
 
+import com.micklab.llamaimage.npu.NpuManager;
+import com.micklab.llamaimage.npu.NpuPipeline;
+
 import java.util.Objects;
 
 /**
@@ -27,6 +30,7 @@ public final class SdModelManager {
         public final String taesdPath;   // "" = full VAE
         public final boolean vaeTiling;
         public final boolean useGpu;     // run on the GPU (OpenCL) if this library has one
+        public final String npuModelId;  // non-null: run on the NPU (built model of this catalog id)
 
         public LoadConfig(String modelPath, int threads, int wtype, String taesdPath, boolean vaeTiling) {
             this(modelPath, threads, wtype, taesdPath, vaeTiling, false);
@@ -34,6 +38,12 @@ public final class SdModelManager {
 
         public LoadConfig(String modelPath, int threads, int wtype, String taesdPath, boolean vaeTiling,
                           boolean useGpu) {
+            this(modelPath, threads, wtype, taesdPath, vaeTiling, useGpu, null);
+        }
+
+        public LoadConfig(String modelPath, int threads, int wtype, String taesdPath, boolean vaeTiling,
+                          boolean useGpu, String npuModelId) {
+            this.npuModelId = npuModelId;
             this.modelPath = modelPath;
             this.threads = threads;
             this.wtype = wtype;
@@ -46,11 +56,11 @@ public final class SdModelManager {
             if (!(o instanceof LoadConfig)) return false;
             LoadConfig c = (LoadConfig) o;
             return threads == c.threads && wtype == c.wtype && vaeTiling == c.vaeTiling
-                    && useGpu == c.useGpu && Objects.equals(modelPath, c.modelPath) && Objects.equals(taesdPath, c.taesdPath);
+                    && useGpu == c.useGpu && Objects.equals(npuModelId, c.npuModelId) && Objects.equals(modelPath, c.modelPath) && Objects.equals(taesdPath, c.taesdPath);
         }
 
         @Override public int hashCode() {
-            return Objects.hash(modelPath, threads, wtype, taesdPath, vaeTiling, useGpu);
+            return Objects.hash(modelPath, threads, wtype, taesdPath, vaeTiling, useGpu, npuModelId);
         }
     }
 
@@ -85,6 +95,7 @@ public final class SdModelManager {
     private volatile LoadConfig loaded;      // null = no model in memory
     private volatile boolean busy = false;
     private volatile boolean cancelRequested = false;
+    private NpuPipeline npu;                 // non-null while the NPU backend is loaded (guarded by this)
 
     private SdModelManager() {
         // Registered once for the process; UI listeners are swapped on the Java side only.
@@ -177,6 +188,7 @@ public final class SdModelManager {
         busy = true;
         try {
             loaded = null;
+            closeNpu();
             String err = sd.init(cfg.modelPath, cfg.threads, cfg.wtype, cfg.taesdPath, cfg.vaeTiling,
                     cfg.useGpu);
             if (err != null && err.isEmpty()) {
@@ -190,6 +202,72 @@ public final class SdModelManager {
         }
     }
 
+    /**
+     * Loads the NPU backend (built model {@code cfg.npuModelId}, see NpuManager) and frees the
+     * native engine. First use compiles the graphs for the HTP (minutes). "" on success.
+     */
+    public synchronized String loadNpu(LoadConfig cfg, NpuManager mgr, NpuPipeline.Log log) {
+        if (cfg.equals(loaded)) {
+            return "";
+        }
+        busy = true;
+        try {
+            loaded = null;
+            closeNpu();
+            sd.free();                       // the native model would only take memory now
+            npu = mgr.open(cfg.npuModelId, log);
+            loadedBackend = "NPU";
+            loaded = cfg;
+            return "";
+        } catch (Throwable t) {
+            closeNpu();
+            return t.getMessage() != null ? t.getMessage() : t.toString();
+        } finally {
+            busy = false;
+        }
+    }
+
+    private void closeNpu() {
+        if (npu != null) {
+            npu.close();
+            npu = null;
+        }
+    }
+
+    /** NPU generation (fixed 512x512, LCM). Caller holds the lock. */
+    private Result npuGenerate(byte[] initRgb, String prompt, String negativePrompt, int width, int height,
+                               int steps, float cfgScale, float strength, long seed) {
+        if (width != NpuPipeline.SIZE || height != NpuPipeline.SIZE) {
+            return new Result(null, width, height, seed, false, "NPU は 512×512 のみ対応です");
+        }
+        busy = true;
+        try {
+            byte[] rgb = npu.generate(prompt, negativePrompt, steps, cfgScale, seed, initRgb, strength,
+                    new NpuPipeline.Listener() {
+                        @Override public void onStep(int step, int total) {
+                            Listener l = listener;
+                            if (l != null) l.onProgress(StableDiffusionNative.PHASE_SAMPLING, step, total);
+                        }
+
+                        @Override public void onPreview(byte[] p, int w, int h) {
+                            Listener l = listener;
+                            if (l != null) l.onPreview(p, w, h);
+                        }
+
+                        @Override public boolean isCancelled() {
+                            return cancelRequested;
+                        }
+                    });
+            long used = npu.getLastSeed();
+            if (rgb == null) return new Result(null, width, height, used, true, "");
+            return new Result(rgb, width, height, used, false, "");
+        } catch (Throwable t) {
+            return new Result(null, width, height, seed, false, "NPU 生成エラー: " + t.getMessage());
+        } finally {
+            busy = false;
+        }
+    }
+
     /** Generate one image. Blocking. */
     public synchronized Result txt2img(String prompt, String negativePrompt, int width, int height,
                                        int steps, float cfgScale, long seed, int sampleMethod) {
@@ -198,6 +276,9 @@ public final class SdModelManager {
         }
         if (cancelRequested) {
             return new Result(null, width, height, seed, true, "");
+        }
+        if (npu != null) {
+            return npuGenerate(null, prompt, negativePrompt, width, height, steps, cfgScale, 1.0f, seed);
         }
         busy = true;
         try {
@@ -218,6 +299,9 @@ public final class SdModelManager {
         }
         if (cancelRequested) {
             return new Result(null, width, height, seed, true, "");
+        }
+        if (npu != null) {
+            return npuGenerate(initRgb, prompt, negativePrompt, width, height, steps, cfgScale, strength, seed);
         }
         busy = true;
         try {
@@ -256,6 +340,7 @@ public final class SdModelManager {
 
     /** Frees the native context (e.g. before deleting the model file it was loaded from). */
     public synchronized void release() {
+        closeNpu();
         sd.free();
         loaded = null;
     }

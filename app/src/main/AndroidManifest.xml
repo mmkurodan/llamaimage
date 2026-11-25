@@ -30,6 +30,12 @@
             android:name="libOpenCL.so"
             android:required="false" />
 
+        <!-- NPU generation: QNN's HTP backend talks to the Hexagon DSP through the vendor FastRPC
+             driver, which apps targeting API 31+ must declare. -->
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
+
         <!-- configChanges: the code-built UI adapts to these by itself. Without it, rotating or
              resizing recreated the Activity, which lost the image/inputs and re-ran startup. -->
         <activity

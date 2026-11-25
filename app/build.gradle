@@ -82,11 +82,17 @@ android {
             // The Khronos ICD loader is built only to LINK libsd_jni_gpu.so; at runtime the
             // device's vendor libOpenCL.so must be used, so never ship the loader.
             excludes += ['**/libOpenCL.so']
+            // NPU (QNN HTP via ONNX Runtime): only the HTP backend is used — drop the Qualcomm DSP
+            // (V66) and GPU backends that qnn-runtime also ships.
+            excludes += ['**/libQnnDsp.so', '**/libQnnDspV66Skel.so', '**/libQnnDspV66Stub.so', '**/libQnnGpu.so']
         }
     }
 }
 
 dependencies {
+    // NPU backend: ONNX Runtime (MIT) with the QNN execution provider; pulls
+    // com.qualcomm.qti:qnn-runtime (QTI AI Stack License — redistributable as part of this app).
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0'
     if (!prebuiltNative) {
         implementation project(':sdjni-fp16')
         implementation project(':sdjni-gpu')

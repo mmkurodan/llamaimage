@@ -76,7 +76,10 @@ public class MainActivity extends Activity {
     static final String PREFS_TAESD_LEGACY = "taesd_path";   // old versions: picked file path
     static final String PREFS_USE_TAESD = "use_taesd";
     static final String PREFS_VAE_TILING = "vae_tiling";
-    static final String PREFS_USE_GPU = "use_gpu";
+    static final String PREFS_USE_GPU = "use_gpu";   // legacy (before the NPU): true = GPU
+    static final String PREFS_BACKEND = "backend";   // BACKEND_*
+    static final int BACKEND_CPU = 0, BACKEND_GPU = 1, BACKEND_NPU = 2;
+    static final String[] BACKEND_LABELS = {"CPU", "GPU（OpenCL）", "NPU（Hexagon）"};
     static final String PREFS_MODEL_ID = "model_id";
     static final String PREFS_PENDING_MODEL = "pending_model_id";  // select after download
     static final String PREFS_STEPS = "steps";
@@ -122,7 +125,8 @@ public class MainActivity extends Activity {
     private boolean nsfwRestriction = false;
     private boolean useTaesd = false;
     private boolean vaeTiling = false;
-    private boolean useGpu = false;           // OpenCL GPU backend (only if the library has a device)
+    private int backend = BACKEND_CPU;        // preferred backend; falls back when unavailable
+    private com.micklab.llamaimage.npu.NpuManager npuManager;
     private int selectedSize = 512;
 
     // --- UI state (main thread) ---
@@ -1093,7 +1097,7 @@ public class MainActivity extends Activity {
             dot = C_WARN;
         } else if (manager != null && manager.isModelLoaded()) {
             String be = manager.activeBackend();
-            state = "準備完了 ・ " + (be.isEmpty() || "CPU".equals(be) ? "CPU" : "GPU") + " ・ "
+            state = "準備完了 ・ " + ("NPU".equals(be) ? "NPU" : be.isEmpty() || "CPU".equals(be) ? "CPU" : "GPU") + " ・ "
                     + s.recommendedLabel();
             dot = C_OK;
         } else if (store.installedFile(s) != null) {
@@ -1495,6 +1499,7 @@ public class MainActivity extends Activity {
                             manager.release();
                         }
                         store.delete(spec);
+                        npu().delete(spec.id);
                         runOnUiThread(() -> {
                             loading = false;
                             appendLog("削除しました: " + spec.title);
@@ -1516,9 +1521,21 @@ public class MainActivity extends Activity {
     private SdModelManager.LoadConfig buildLoadConfig(File modelFile) {
         File taesd = useTaesd ? store.installedTaesd() : null;
         int threads = nThreads > 0 ? nThreads : CpuInfo.defaultThreads();
-        boolean gpu = useGpu && manager != null && !manager.gpuDevice().isEmpty();
+        ModelCatalog.ModelSpec spec = currentSpec();
+        String npuId = backend == BACKEND_NPU && npuUsable(spec) ? spec.id : null;
+        boolean gpu = npuId == null && backend == BACKEND_GPU && manager != null && !manager.gpuDevice().isEmpty();
         return new SdModelManager.LoadConfig(modelFile.getAbsolutePath(), threads, wtype,
-                taesd != null ? taesd.getAbsolutePath() : "", vaeTiling, gpu);
+                taesd != null ? taesd.getAbsolutePath() : "", vaeTiling, gpu, npuId);
+    }
+
+    private com.micklab.llamaimage.npu.NpuManager npu() {
+        if (npuManager == null) npuManager = new com.micklab.llamaimage.npu.NpuManager(this);
+        return npuManager;
+    }
+
+    /** NPU backend possible for this model on this device (SD1.5 LCM safetensors, Snapdragon). */
+    static boolean npuUsable(ModelCatalog.ModelSpec spec) {
+        return spec != null && spec.npuCapable() && com.micklab.llamaimage.npu.NpuManager.deviceMayHaveHtp();
     }
 
     /**
@@ -1561,8 +1578,19 @@ public class MainActivity extends Activity {
             long t0 = SystemClock.elapsedRealtime();
             try {
                 store.ensureVerified(spec, file, pct -> setStatusUi("モデルを検証中… " + pct + "%"));
-                setStatusUi("モデル読込中… " + spec.title);
-                err = manager.load(cfg);
+                if (cfg.npuModelId != null) {
+                    com.micklab.llamaimage.npu.NpuManager nm = npu();
+                    nm.ensureAssets(this::setStatusUi);
+                    if (!nm.isBuilt(spec.id, spec.sha256)) {
+                        appendLogUi("NPU 用モデルを端末で作成します（初回のみ・約 2GB）");
+                        nm.ensureBuilt(spec.id, file, spec.sha256, this::setStatusUi);
+                    }
+                    setStatusUi("NPU を準備中…（初回は最適化に数分かかります）");
+                    err = manager.loadNpu(cfg, nm, this::appendLogUi);
+                } else {
+                    setStatusUi("モデル読込中… " + spec.title);
+                    err = manager.load(cfg);
+                }
             } catch (Throwable t) {
                 err = t.getMessage() != null ? t.getMessage() : t.toString();
             }
@@ -1572,14 +1600,14 @@ public class MainActivity extends Activity {
                 loading = false;
                 if (e.isEmpty()) {
                     appendLog("モデル読込成功: " + spec.title + " (" + (ms / 1000) + "s, "
-                            + (cfg.useGpu ? "GPU " + manager.activeBackend() + ", " : "CPU ")
+                            + (cfg.npuModelId != null ? "NPU, " : cfg.useGpu ? "GPU " + manager.activeBackend() + ", " : "CPU ")
                             + cfg.threads + "スレッド" + wtypeSuffix()
                             + (cfg.taesdPath.isEmpty() ? "" : ", TAESD") + (cfg.vaeTiling ? ", VAEタイル" : "") + ")");
                     setStatus("準備完了 — プロンプトを入力して「生成する」");
-                } else if (cfg.useGpu) {
-                    // GPU load failed (driver / memory): fall back to the CPU and remember it.
-                    appendLog("GPU での読込に失敗したため CPU に切り替えます: " + e);
-                    useGpu = false;
+                } else if (cfg.useGpu || cfg.npuModelId != null) {
+                    // GPU / NPU load failed (driver, memory, unsupported SoC): fall back to the CPU.
+                    appendLog((cfg.npuModelId != null ? "NPU" : "GPU") + " での読込に失敗したため CPU に切り替えます: " + e);
+                    backend = BACKEND_CPU;
                     saveGenSettings();
                 } else {
                     appendLog("モデル読込失敗: " + e);
@@ -1631,7 +1659,10 @@ public class MainActivity extends Activity {
         final String rawNegative = negativeEdit.getText().toString().trim();
         final int steps = Math.min(MAX_STEPS, parseInt(stepsEdit.getText().toString(), 6));
         stepsEdit.setText(String.valueOf(steps));
-        final int size = snapTo64(selectedSize);
+        SdModelManager.LoadConfig lc = manager.getLoadedConfig();
+        final boolean onNpu = lc != null && lc.npuModelId != null;
+        final int size = onNpu ? com.micklab.llamaimage.npu.NpuPipeline.SIZE : snapTo64(selectedSize);
+        if (onNpu && selectedSize != size) appendLog("NPU は 512px 固定のため 512px で生成します");
         final long seed = parseLong(seedEdit.getText().toString(), -1);
         final float strength = strengthValue();
         final float cfg = cfgScale;
@@ -1924,20 +1955,25 @@ public class MainActivity extends Activity {
                 + (store.installedTaesd() == null ? "初回のみ " + ModelCatalog.TAESD.sizeLabel() + " をダウンロード。" : ""));
 
         final String gpuDev = manager != null ? manager.gpuDevice() : "";
-        final boolean[] selGpu = {useGpu && !gpuDev.isEmpty()};
-        addLabel(c, "GPU で生成（OpenCL）", dp(12));
-        Button gpuBtn = new Button(this);
-        gpuBtn.setText(onOff("GPU", selGpu[0]));
-        gpuBtn.setEnabled(!gpuDev.isEmpty());
-        gpuBtn.setOnClickListener(v -> {
-            selGpu[0] = !selGpu[0];
-            gpuBtn.setText(onOff("GPU", selGpu[0]));
+        final boolean npuOk = npuUsable(spec);
+        final int[] selBackend = {backend};
+        addLabel(c, "実行デバイス", dp(12));
+        Button beBtn = new Button(this);
+        beBtn.setText("実行: " + BACKEND_LABELS[selBackend[0]]);
+        beBtn.setOnClickListener(v -> {
+            int nb = selBackend[0];
+            for (int i = 0; i < 3; i++) {
+                nb = (nb + 1) % 3;
+                if (nb == BACKEND_CPU || (nb == BACKEND_GPU && !gpuDev.isEmpty()) || (nb == BACKEND_NPU && npuOk)) break;
+            }
+            selBackend[0] = nb;
+            beBtn.setText("実行: " + BACKEND_LABELS[nb]);
         });
-        c.addView(gpuBtn);
-        addHint(c, gpuDev.isEmpty()
-                ? "この端末では GPU（OpenCL）を利用できません。"
-                : "デバイス: " + gpuDev + "。モデルを GPU で実行します（切替時は再読込）。"
-                        + "読込に失敗した場合は自動で CPU に戻ります。");
+        c.addView(beBtn);
+        addHint(c, "CPU：標準。 GPU：" + (gpuDev.isEmpty() ? "この端末では利用不可" : gpuDev + "（この端末では CPU より遅い場合あり）")
+                + "。 NPU：" + (npuOk ? "Snapdragon の NPU で高速生成（512px 固定・LCM）。初回のみ端末で変換（約 2GB）と最適化に数分"
+                : "このモデル／端末では利用不可（SD1.5 LCM の safetensors モデル＋Snapdragon が必要）")
+                + "。読込に失敗した場合は自動で CPU に戻ります。");
 
         final boolean[] selTiling = {vaeTiling};
         addLabel(c, "省メモリ VAE（タイル処理）", dp(12));
@@ -1993,7 +2029,7 @@ public class MainActivity extends Activity {
                     nsfwRestriction = selNsfw[0];
                     useTaesd = selTaesd[0];
                     vaeTiling = selTiling[0];
-                    useGpu = selGpu[0];
+                    backend = selBackend[0];
                     saveGenSettings();
                     persistInputs();
                     Toast.makeText(this, "生成設定を保存しました", Toast.LENGTH_SHORT).show();
@@ -2285,7 +2321,7 @@ public class MainActivity extends Activity {
         // On by default: the final decode drops from ~28s to ~2s at 512px with near-identical output.
         // (Old versions stored a picked TAESD file path; ModelStore adopts that file.)
         useTaesd = p.getBoolean(PREFS_USE_TAESD, true);
-        useGpu = p.getBoolean(PREFS_USE_GPU, false);
+        backend = p.getInt(PREFS_BACKEND, p.getBoolean(PREFS_USE_GPU, false) ? BACKEND_GPU : BACKEND_CPU);
         vaeTiling = p.getBoolean(PREFS_VAE_TILING, CpuInfo.totalRamBytes(this) > 0
                 && CpuInfo.totalRamBytes(this) < LOW_RAM_BYTES);
     }
@@ -2300,7 +2336,8 @@ public class MainActivity extends Activity {
                 .putInt(PREFS_SIZE, selectedSize)
                 .putBoolean(PREFS_USE_TAESD, useTaesd)
                 .putBoolean(PREFS_VAE_TILING, vaeTiling)
-                .putBoolean(PREFS_USE_GPU, useGpu)
+                .putInt(PREFS_BACKEND, backend)
+                .remove(PREFS_USE_GPU)
                 .remove(PREFS_TAESD_LEGACY)
                 .apply();
     }

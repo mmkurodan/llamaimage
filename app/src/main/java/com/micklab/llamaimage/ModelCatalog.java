@@ -60,6 +60,14 @@ public final class ModelCatalog {
             return MainActivity.samplerLabel(sampler) + " / " + steps + "step / CFG " + cfgScale;
         }
 
+        /**
+         * Can run on the NPU backend: an SD1.5 single-file .safetensors with LCM settings (the NPU
+         * path converts it on the device and samples with LCM only).
+         */
+        public boolean npuCapable() {
+            return NPU_IDS.contains(id);
+        }
+
         /** Downloadable from the built-in URL (false for a file adopted from an older version). */
         public boolean downloadable() {
             return url != null;
@@ -68,9 +76,24 @@ public final class ModelCatalog {
 
     private static final String HF = "https://huggingface.co/";
 
+    /**
+     * Lykon's official DreamShaper 8 LCM single file (fp16 safetensors) — the checkpoint the NPU
+     * templates were made from; also runs on CPU/GPU (sd.cpp loads safetensors).
+     */
+    public static final ModelSpec DREAMSHAPER8_LCM_ST = new ModelSpec(
+            "dreamshaper8_lcm_st",
+            "DreamShaper 8 LCM（推奨・NPU 対応）",
+            "高品質・高速な SD1.5 系 LCM モデル（公式 fp16 版）。CPU／GPU に加え NPU でも動作。"
+                    + "4〜8 step / CFG 1。",
+            HF + "Lykon/dreamshaper-8-lcm/resolve/4645d8bc6a8e6b106d21606d63e8460cdad4f1a6/DreamShaper8_LCM.safetensors",
+            "DreamShaper8_LCM.safetensors",
+            2133804992L,
+            "a4f3e1526c5dc4fcbe342f5c410d83ae202c7a415fcefcbb92e0f93fcd0a87c3",
+            StableDiffusionNative.SAMPLE_LCM, 6, 1.0f);
+
     public static final ModelSpec DREAMSHAPER8_LCM = new ModelSpec(
             "dreamshaper8_lcm",
-            "DreamShaper 8 LCM（推奨）",
+            "DreamShaper 8 LCM（Q8・軽量）",
             "高品質・高速。LCM 蒸留済みで 4〜8 step / CFG 1 で仕上がる SD1.5 系モデル。",
             HF + "haven-ai-companion/dreamshaper8-lcm-gguf/resolve/main/DreamShaper8_LCM_q8_0.gguf",
             "DreamShaper8_LCM_q8_0.gguf",
@@ -178,10 +201,14 @@ public final class ModelCatalog {
 
     /** Selectable image-generation models, recommended first. */
     public static final List<ModelSpec> MODELS = Collections.unmodifiableList(Arrays.asList(
-            DREAMSHAPER8_LCM, ABSOLUTE_REALITY_LCM, PHOTON_LCM, SD_TURBO,
+            DREAMSHAPER8_LCM_ST, DREAMSHAPER8_LCM, ABSOLUTE_REALITY_LCM, PHOTON_LCM, SD_TURBO,
             ABSOLUTE_REALITY, PHOTON, JUGGERNAUT_REBORN, SD15_BASE));
 
-    public static final ModelSpec DEFAULT_MODEL = DREAMSHAPER8_LCM;
+    public static final ModelSpec DEFAULT_MODEL = DREAMSHAPER8_LCM_ST;
+
+    /** Models the NPU backend can convert (SD1.5 LCM, fp16 single-file safetensors). */
+    static final java.util.Set<String> NPU_IDS = new java.util.HashSet<>(Arrays.asList(
+            "dreamshaper8_lcm_st", "absolutereality_lcm", "photon_lcm"));
 
     /** Id of the model adopted from an older version that matches no catalog entry. */
     public static final String IMPORTED_ID = "imported";
