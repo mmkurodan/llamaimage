@@ -93,6 +93,10 @@ def fix_resize_params(model):
             model.graph.initializer[i].CopyFrom(numpy_helper.from_array(
                 numpy_helper.to_array(init).astype(np.float32), init.name))
             fixed += 1
+    # Drop stale (float16) type annotations for those tensors; shape inference re-derives them.
+    keep = [vi for vi in model.graph.value_info if vi.name not in wanted]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(keep)
     if fixed:
         print(f"[export] restored {fixed} Resize roi/scales tensors to float32")
 
