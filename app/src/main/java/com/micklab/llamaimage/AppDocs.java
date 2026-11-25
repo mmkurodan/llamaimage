@@ -140,7 +140,7 @@ final class AppDocs {
                 + "リバースエンジニアリング・逆コンパイル・逆アセンブルは禁止されています。"
                 + "このソフトウェアは「現状のまま」提供され、Qualcomm はいかなる保証も行いません。"
                 + "同梱のサードパーティ通知は Qualcomm の NOTICE に従います。\n\n"
-                + "--- NPU 用ファイル（本プロジェクトの GitHub Release npu-models-v1）---\n"
+                + "--- NPU 用ファイル（本プロジェクトの GitHub Release npu-models-v2）---\n"
                 + "DreamShaper 8 LCM（Lykon、CreativeML OpenRAIL-M）から作成した ONNX テンプレート、"
                 + "TAESD（Ollin Boer Bohan、MIT License）、CLIP トークナイザ。端末内で作成される NPU 用モデルにも"
                 + "元モデルのライセンス（OpenRAIL-M の利用制限を含む）が適用されます。\n\n"
