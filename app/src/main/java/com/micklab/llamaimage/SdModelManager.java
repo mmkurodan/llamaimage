@@ -234,15 +234,15 @@ public final class SdModelManager {
         }
     }
 
-    /** NPU generation (fixed 512x512, LCM). Caller holds the lock. */
+    /** NPU generation (fixed 512x512; LCM / Euler a / Euler / DPM++ 2M). Caller holds the lock. */
     private Result npuGenerate(byte[] initRgb, String prompt, String negativePrompt, int width, int height,
-                               int steps, float cfgScale, float strength, long seed) {
+                               int steps, float cfgScale, float strength, long seed, int sampleMethod) {
         if (width != NpuPipeline.SIZE || height != NpuPipeline.SIZE) {
             return new Result(null, width, height, seed, false, "NPU は 512×512 のみ対応です");
         }
         busy = true;
         try {
-            byte[] rgb = npu.generate(prompt, negativePrompt, steps, cfgScale, seed, initRgb, strength,
+            byte[] rgb = npu.generate(prompt, negativePrompt, steps, cfgScale, seed, initRgb, strength, sampleMethod,
                     new NpuPipeline.Listener() {
                         @Override public void onStep(int step, int total) {
                             Listener l = listener;
@@ -278,7 +278,7 @@ public final class SdModelManager {
             return new Result(null, width, height, seed, true, "");
         }
         if (npu != null) {
-            return npuGenerate(null, prompt, negativePrompt, width, height, steps, cfgScale, 1.0f, seed);
+            return npuGenerate(null, prompt, negativePrompt, width, height, steps, cfgScale, 1.0f, seed, sampleMethod);
         }
         busy = true;
         try {
@@ -301,7 +301,7 @@ public final class SdModelManager {
             return new Result(null, width, height, seed, true, "");
         }
         if (npu != null) {
-            return npuGenerate(initRgb, prompt, negativePrompt, width, height, steps, cfgScale, strength, seed);
+            return npuGenerate(initRgb, prompt, negativePrompt, width, height, steps, cfgScale, strength, seed, sampleMethod);
         }
         busy = true;
         try {

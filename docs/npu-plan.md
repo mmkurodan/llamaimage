@@ -25,6 +25,11 @@ init image (img2img) ─ taesd_encoder.onnx ─ add noise ──┘             
 - Weights fp16, float32 I/O; HTP runs fp16 (`enable_htp_fp16_precision=1`). If fp16 is too slow or
   too large for the HTP, the next step is W8A16 quantization (calibration from the reference
   pipeline's activations).
+- Samplers: LCM (LCM checkpoints) and, for regular SD1.5 checkpoints, Euler a / Euler / DPM++ 2M
+  (`KDiffusionSampler`, a port of sd.cpp's CompVisDenoiser + DiscreteSchedule + img2img t_enc rule,
+  so CPU and NPU settings mean the same) with CFG (two UNet passes per step). The templates fit any
+  SD1.5 fp16 single file with the standard keys: AbsoluteReality 1.8.1, Photon v1 and Juggernaut
+  Reborn were checked against every map key + shape from their safetensors headers (2026-11-25).
 - Java side: tokenizer + LCM scheduler + loop + previews (latent projection, as on CPU) + cancel
   between steps. `scripts/npu/reference_pipeline.py` is the executable spec (golden token ids,
   timesteps, images).

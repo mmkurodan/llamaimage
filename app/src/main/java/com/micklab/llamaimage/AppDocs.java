@@ -64,10 +64,11 @@ final class AppDocs {
                 + "・GPU／NPU で読み込めない：自動で CPU に戻ります。生成設定の「実行デバイス」で選び直せます。\n\n"
                 + "9. NPU（Snapdragon の Hexagon NPU）\n"
                 + "・生成設定の「実行デバイス」で NPU を選ぶと、NPU 対応モデル（DreamShaper 8 LCM（推奨・NPU 対応）、"
-                + "AbsoluteReality LCM、Photon LCM）を NPU で生成します。\n"
+                + "AbsoluteReality LCM、Photon LCM、AbsoluteReality 1.8.1、Photon v1、Juggernaut Reborn）を NPU で生成します。\n"
                 + "・初回のみ、ダウンロード済みのモデルから NPU 用ファイル（約 2GB）を端末内で作成し、"
                 + "NPU 向けの最適化（数分）を行います。2 回目以降はすぐに使えます。\n"
-                + "・NPU は 512×512・LCM 固定です（サイズ・サンプラー設定は使われません）。\n"
+                + "・NPU は 512×512 固定です（サイズ設定は使われません）。サンプラーは LCM／Euler a／Euler／DPM++ 2M に対応"
+                + "（その他は LCM）。LCM 以外のモデルは 20 step・CFG 7 程度のため、LCM モデルより時間がかかります。\n"
                 + "・画面下部のログに詳細が表示されます（長押しで選択・コピー可）。\n";
     }
 

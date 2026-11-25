@@ -61,8 +61,9 @@ public final class ModelCatalog {
         }
 
         /**
-         * Can run on the NPU backend: an SD1.5 single-file .safetensors with LCM settings (the NPU
-         * path converts it on the device and samples with LCM only).
+         * Can run on the NPU backend: an SD1.5 single-file .safetensors whose tensors fit the NPU
+         * templates (checked against every template map key + shape). The NPU path converts it on
+         * the device; LCM models sample with LCM, regular ones with Euler a / Euler / DPM++ 2M + CFG.
          */
         public boolean npuCapable() {
             return NPU_IDS.contains(id);
@@ -131,7 +132,7 @@ public final class ModelCatalog {
             "absolutereality_lcm",
             "AbsoluteReality LCM（写実・高速）",
             "DreamShaper の作者 Lykon による写実特化モデルの公式 LCM 版。肌や髪の質感が得意。"
-                    + "4〜8 step / CFG 1〜2、LCM サンプラー専用。配布元: Civitai。",
+                    + "4〜8 step / CFG 1〜2、LCM サンプラー専用。NPU 対応。配布元: Civitai。",
             CIVITAI + "256668?fileId=199166",
             "AbsoluteReality_LCM.safetensors",
             2133804992L,
@@ -146,7 +147,7 @@ public final class ModelCatalog {
             "photon_lcm",
             "Photon LCM（写実・高速）",
             "写真表現に強い Photon を LCM 化したモデル（コミュニティ版）。4〜6 step / CFG 1 で仕上がる。"
-                    + "配布元: Hugging Face（Civitai 版と同一ファイル）。",
+                    + "NPU 対応。配布元: Hugging Face（Civitai 版と同一ファイル）。",
             HF + "moonshotmillion/Photon_LCM_1.5/resolve/965ff0a137f5baeb46bab41656f52ab1375da6cf/"
                     + "photonLCM_v10.safetensors",
             "Photon_LCM.safetensors",
@@ -158,7 +159,7 @@ public final class ModelCatalog {
             "absolutereality_181",
             "AbsoluteReality 1.8.1（写実・低速）",
             "Lykon の写実特化モデル（公式リポジトリ）。高品質だが 20 step / CFG 7 が必要で、"
-                    + "1 枚に数分かかる。",
+                    + "CPU では 1 枚に数分かかる。NPU 対応。",
             HF + "Lykon/AbsoluteReality/resolve/df7c3efce8f54d02cf73a21fcecd908a0fde2898/"
                     + "AbsoluteReality_1.8.1_pruned.safetensors",
             "AbsoluteReality_1.8.1_pruned.safetensors",
@@ -169,7 +170,7 @@ public final class ModelCatalog {
     public static final ModelSpec PHOTON = new ModelSpec(
             "photon_v1",
             "Photon v1（写真・低速）",
-            "プロンプト追従性の高いフォトリアル SD1.5 モデル。20 step / CFG 6 が必要で、1 枚に数分かかる。",
+            "プロンプト追従性の高いフォトリアル SD1.5 モデル。20 step / CFG 6 が必要で、CPU では 1 枚に数分かかる。NPU 対応。",
             HF + "sam749/Photon-v1/resolve/73bb8facb8576b69224315bfc77b14eb11b5591c/photon_v1.safetensors",
             "photon_v1.safetensors",
             2132625918L,
@@ -180,7 +181,7 @@ public final class ModelCatalog {
             "juggernaut_reborn",
             "Juggernaut Reborn（写実・低速）",
             "人物写真が安定する SD1.5 版 Juggernaut（KandooAI / RunDiffusion）。"
-                    + "20 step / CFG 7 が必要で、1 枚に数分かかる。",
+                    + "20 step / CFG 7 が必要で、CPU では 1 枚に数分かかる。NPU 対応。",
             HF + "HyperX-Sentience/Juggernaut-Reborn/resolve/7431787c76a081f7b5fb3bc24d780478bd1e6344/"
                     + "juggernaut_reborn.safetensors",
             "juggernaut_reborn.safetensors",
@@ -206,9 +207,13 @@ public final class ModelCatalog {
 
     public static final ModelSpec DEFAULT_MODEL = DREAMSHAPER8_LCM_ST;
 
-    /** Models the NPU backend can convert (SD1.5 LCM, fp16 single-file safetensors). */
+    /**
+     * Models the NPU backend can convert (SD1.5 fp16 single-file safetensors; all template map keys
+     * present with the DreamShaper shapes — verified from the safetensors headers 2026-11-25).
+     */
     static final java.util.Set<String> NPU_IDS = new java.util.HashSet<>(Arrays.asList(
-            "dreamshaper8_lcm_st", "absolutereality_lcm", "photon_lcm"));
+            "dreamshaper8_lcm_st", "absolutereality_lcm", "photon_lcm",
+            "absolutereality_181", "photon_v1", "juggernaut_reborn"));
 
     /** Id of the model adopted from an older version that matches no catalog entry. */
     public static final String IMPORTED_ID = "imported";

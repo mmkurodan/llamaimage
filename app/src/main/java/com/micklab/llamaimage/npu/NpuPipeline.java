@@ -15,7 +15,7 @@ import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
 
 /**
- * SD1.5 LCM txt2img / img2img over ONNX models (512x512 static shapes): text_encoder, unet,
+ * SD1.5 txt2img / img2img (LCM, or Euler a / Euler / DPM++ 2M for regular checkpoints) over ONNX models (512x512 static shapes): text_encoder, unet,
  * taesd_encoder, taesd_decoder + CLIP tokenizer files, all in one directory. Runs on the Hexagon
  * NPU through ONNX Runtime's QNN execution provider ({@code qnnOptions} != null), otherwise on the
  * ORT CPU provider (used by the CI test). Independent of Android so it can be tested on a JVM.
@@ -58,6 +58,7 @@ public final class NpuPipeline implements Closeable {
     private final OrtSession[] unet = new OrtSession[UNET_PARTS.length];
     private final ClipTokenizer tokenizer;
     private final LcmScheduler scheduler = new LcmScheduler();
+    private final KDiffusionSampler kSampler = new KDiffusionSampler();
     private long lastSeed = -1;
 
     public NpuPipeline(File dir, Map<String, String> qnnOptions, File cacheDir, Log log) throws IOException {
@@ -168,16 +169,27 @@ public final class NpuPipeline implements Closeable {
         return lastSeed;
     }
 
+    /** LCM sampling (the original NPU API; LCM-distilled checkpoints). */
+    public byte[] generate(String prompt, String negative, int steps, float cfg, long seed, byte[] initRgb,
+                           float strength, Listener listener) throws OrtException {
+        return generate(prompt, negative, steps, cfg, seed, initRgb, strength, KDiffusionSampler.LCM, listener);
+    }
+
     /**
      * Returns 512*512*3 RGB bytes, or null if cancelled. {@code initRgb} (512*512*3) switches to
      * img2img with {@code strength} in (0, 1]. cfg &gt; 1 adds an unconditional pass per step.
+     * {@code sampler} = KDiffusionSampler id: LCM for LCM checkpoints, EULER_A / EULER / DPMPP2M
+     * (same schedules as the CPU engine) for regular SD1.5 checkpoints; anything else = LCM.
      */
     public byte[] generate(String prompt, String negative, int steps, float cfg, long seed, byte[] initRgb,
-                           float strength, Listener listener) throws OrtException {
+                           float strength, int sampler, Listener listener) throws OrtException {
         lastSeed = seed >= 0 ? seed : (new Random().nextLong() & 0x7FFFFFFFL);
         Random rng = new Random(lastSeed);
         float[] cond = encodeText(prompt);
         float[] uncond = cfg > 1.0f ? encodeText(negative == null ? "" : negative) : null;
+        if (KDiffusionSampler.supports(sampler)) {
+            return generateK(sampler, steps, cfg, cond, uncond, rng, initRgb, strength, listener);
+        }
 
         int[] ts = scheduler.timesteps(steps, initRgb != null ? strength : 1.0f);
         float[] latents = new float[LATENT_LEN];
@@ -193,16 +205,62 @@ public final class NpuPipeline implements Closeable {
         for (int s = 0; s < ts.length; s++) {
             if (listener != null && listener.isCancelled()) return null;
             if (listener != null) listener.onStep(s, ts.length);
-            float[] eps = unet(latents, ts[s], cond);
-            if (uncond != null) {
-                float[] epsU = unet(latents, ts[s], uncond);
-                for (int i = 0; i < eps.length; i++) eps[i] = epsU[i] + cfg * (eps[i] - epsU[i]);
-            }
+            float[] eps = guidedEps(latents, ts[s], cond, uncond, cfg);
             scheduler.step(eps, ts[s], s + 1 < ts.length ? ts[s + 1] : -1, latents, denoised, rng);
             if (listener != null) listener.onPreview(preview(denoised), LATENT, LATENT);
         }
         if (listener != null) listener.onStep(ts.length, ts.length);
         return decode(denoised);
+    }
+
+    private byte[] generateK(int sampler, int steps, float cfg, float[] cond, float[] uncond, Random rng,
+                             byte[] initRgb, float strength, Listener listener) throws OrtException {
+        float[] sigmas = kSampler.schedule(steps, strength, initRgb != null);
+        float[] x = new float[LATENT_LEN];
+        for (int i = 0; i < LATENT_LEN; i++) x[i] = (float) rng.nextGaussian() * sigmas[0];
+        if (initRgb != null) {
+            float[] init = encodeImage(initRgb);
+            for (int i = 0; i < LATENT_LEN; i++) x[i] += init[i];
+        }
+        final int total = sigmas.length - 1;
+        float[] in = new float[LATENT_LEN];
+        if (listener != null) listener.onStep(0, total);
+        boolean done;
+        try {
+            done = kSampler.sample(sampler, x, sigmas, (xs, sigma, t) -> {
+                if (listener != null && listener.isCancelled()) throw new CancelledException();
+                float cIn = (float) (1 / Math.sqrt(sigma * sigma + 1));
+                for (int i = 0; i < LATENT_LEN; i++) in[i] = xs[i] * cIn;
+                float[] eps = guidedEps(in, t, cond, uncond, cfg);
+                for (int i = 0; i < LATENT_LEN; i++) eps[i] = xs[i] - sigma * eps[i];   // -> x0 estimate
+                return eps;
+            }, rng, (step, n, den) -> {
+                if (listener == null) return true;
+                listener.onPreview(preview(den), LATENT, LATENT);
+                listener.onStep(step, n);
+                return !listener.isCancelled() || step == n;
+            });
+        } catch (CancelledException e) {
+            return null;
+        } catch (OrtException | RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return done ? decode(x) : null;
+    }
+
+    private static final class CancelledException extends Exception {
+    }
+
+    /** eps(x, t) with classifier-free guidance when {@code uncond} != null. */
+    private float[] guidedEps(float[] x, float t, float[] cond, float[] uncond, float cfg) throws OrtException {
+        float[] eps = unet(x, t, cond);
+        if (uncond != null) {
+            float[] epsU = unet(x, t, uncond);
+            for (int i = 0; i < eps.length; i++) eps[i] = epsU[i] + cfg * (eps[i] - epsU[i]);
+        }
+        return eps;
     }
 
     private float[] encodeText(String text) throws OrtException {
@@ -214,7 +272,7 @@ public final class NpuPipeline implements Closeable {
     }
 
     /** Runs the UNet parts in order; each takes its inputs by name from the earlier tensors. */
-    private float[] unet(float[] sample, int t, float[] hidden) throws OrtException {
+    private float[] unet(float[] sample, float t, float[] hidden) throws OrtException {
         Map<String, OnnxTensor> vals = new HashMap<>();
         java.util.List<OrtSession.Result> results = new java.util.ArrayList<>();
         try {

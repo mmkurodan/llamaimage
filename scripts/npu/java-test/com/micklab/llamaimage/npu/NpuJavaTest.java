@@ -72,6 +72,40 @@ public final class NpuJavaTest {
             save(img2, new File(out, "java_img2img.png"));
             System.out.println("[java] img2img ok");
         }
+
+        // 4. optional: a regular (non-LCM) SD1.5 checkpoint with the k-diffusion samplers + CFG.
+        if (a.length > 4) {
+            File ck2 = new File(a[4]);
+            for (String name : names) NpuModelAssembler.assemble(assets, name, ck2, model, q -> { });
+            System.out.println("[java] assembled the regular checkpoint " + ck2.getName());
+            String prompt = "a photo of a cat sitting on a wooden table, soft light";
+            String neg = "blurry, lowres, bad anatomy, watermark";
+            try (NpuPipeline p = new NpuPipeline(model, null, null, System.out::println)) {
+                int[][] runs = {{KDiffusionSampler.DPMPP2M, 20}, {KDiffusionSampler.EULER_A, 20}};
+                String[] tags = {"dpmpp2m", "euler_a"};
+                byte[] first = null;
+                for (int r = 0; r < runs.length; r++) {
+                    long t0 = System.currentTimeMillis();
+                    byte[] img = p.generate(prompt, neg, runs[r][1], 7.0f, 42, null, 1f, runs[r][0], null);
+                    System.out.println("[java] " + tags[r] + " " + runs[r][1] + "step CFG7 "
+                            + (System.currentTimeMillis() - t0) + "ms, pixel std " + String.format("%.1f", std(img)));
+                    if (std(img) < 10) throw new IllegalStateException(tags[r] + ": image is flat");
+                    save(img, new File(out, "java_" + tags[r] + ".png"));
+                    if (first == null) first = img;
+                }
+                byte[] i2 = p.generate(prompt, neg, 20, 7.0f, 7, first, 0.55f, KDiffusionSampler.DPMPP2M, null);
+                save(i2, new File(out, "java_dpmpp2m_img2img.png"));
+                System.out.println("[java] k-diffusion img2img ok");
+            }
+        }
+    }
+
+    private static double std(byte[] rgb) {
+        double m = 0, v = 0;
+        for (byte b : rgb) m += b & 0xFF;
+        m /= rgb.length;
+        for (byte b : rgb) v += ((b & 0xFF) - m) * ((b & 0xFF) - m);
+        return Math.sqrt(v / rgb.length);
     }
 
     private static void save(byte[] rgb, File f) throws Exception {

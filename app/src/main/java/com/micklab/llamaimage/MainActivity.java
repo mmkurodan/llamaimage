@@ -1692,7 +1692,7 @@ public class MainActivity extends Activity {
         return npuManager;
     }
 
-    /** NPU backend possible for this model on this device (SD1.5 LCM safetensors, Snapdragon). */
+    /** NPU backend possible for this model on this device (SD1.5 safetensors, Snapdragon). */
     static boolean npuUsable(ModelCatalog.ModelSpec spec) {
         return spec != null && spec.npuCapable() && com.micklab.llamaimage.npu.NpuManager.deviceMayHaveHtp();
     }
@@ -2147,8 +2147,8 @@ public class MainActivity extends Activity {
         });
         c.addView(beBtn);
         addHint(c, "CPU：標準。 GPU：" + (gpuDev.isEmpty() ? "この端末では利用不可" : gpuDev + "（この端末では CPU より遅い場合あり）")
-                + "。 NPU：" + (npuOk ? "Snapdragon の NPU で高速生成（512px 固定・LCM）。初回のみ端末で変換（約 2GB）と最適化に数分"
-                : "このモデル／端末では利用不可（SD1.5 LCM の safetensors モデル＋Snapdragon が必要）")
+                + "。 NPU：" + (npuOk ? "Snapdragon の NPU で高速生成（512px 固定。サンプラーは LCM／Euler a／Euler／DPM++ 2M）。初回のみ端末で変換（約 2GB）と最適化に数分"
+                : "このモデル／端末では利用不可（SD1.5 の safetensors モデル＋Snapdragon が必要）")
                 + "。読込に失敗した場合は自動で CPU に戻ります。");
 
         final boolean[] selTiling = {vaeTiling};

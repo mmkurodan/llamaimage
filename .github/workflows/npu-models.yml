@@ -89,8 +89,10 @@ jobs:
           CK=$(python -c "from huggingface_hub import hf_hub_download as d; print(d('Lykon/dreamshaper-8-lcm','DreamShaper8_LCM.safetensors',revision='4645d8bc6a8e6b106d21606d63e8460cdad4f1a6'))")
           # NpuManager / NpuAssets are the Android glue (android.*); everything else is plain Java.
           javac -d jt/classes -cp "jt/lib/*" $(find app/src/main/java/com/micklab/llamaimage/npu scripts/npu/java-test -name '*.java' ! -name NpuManager.java ! -name NpuAssets.java)
-          java -Xmx6g -cp "jt/classes:jt/lib/*" com.micklab.llamaimage.npu.NpuJavaTest jt/assets "$CK" jt/tokens.json npu-ref/java
-          python scripts/npu/assemble.py --templates npu-templates --checkpoint "$CK" --out jt/py
+          # Regular (non-LCM) SD1.5 checkpoint for the k-diffusion samplers (same templates).
+          CK2=$(python -c "from huggingface_hub import hf_hub_download as d; print(d('Lykon/AbsoluteReality','AbsoluteReality_1.8.1_pruned.safetensors',revision='df7c3efce8f54d02cf73a21fcecd908a0fde2898'))")
+          java -Xmx6g -cp "jt/classes:jt/lib/*" com.micklab.llamaimage.npu.NpuJavaTest jt/assets "$CK" jt/tokens.json npu-ref/java "$CK2"
+          python scripts/npu/assemble.py --templates npu-templates --checkpoint "$CK2" --out jt/py
           for f in text_encoder.weights unet_0.weights unet_1.weights unet_2.weights; do
             a=$(sha256sum npu-ref/java/model/$f | cut -d' ' -f1); b=$(sha256sum jt/py/$f | cut -d' ' -f1)
             echo "$f java=$a python=$b"; [ "$a" = "$b" ]
