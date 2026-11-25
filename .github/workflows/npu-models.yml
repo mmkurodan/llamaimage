@@ -11,6 +11,12 @@ on:
       - 'scripts/npu/**'
       - '.github/workflows/npu-models.yml'
 
+permissions:
+  contents: write   # publish the models as a GitHub Release (npu-models-v1)
+
+env:
+  NPU_RELEASE_TAG: npu-models-v1
+
 jobs:
   export:
     runs-on: ubuntu-latest
@@ -40,15 +46,45 @@ jobs:
       - name: Sizes
         run: ls -la npu-models npu-models/tokenizer npu-ref
 
+      # Release assets are flat files: tokenizer/* -> tokenizer_*. Licenses travel with the models
+      # (CreativeML OpenRAIL-M for DreamShaper 8 LCM incl. its use restrictions, MIT for TAESD).
+      - name: Stage release assets
+        run: |
+          set -e
+          mkdir -p release
+          cp npu-models/*.onnx npu-models/scheduler_config.json npu-models/SOURCES.json release/
+          cp npu-models/tokenizer/vocab.json release/tokenizer_vocab.json
+          cp npu-models/tokenizer/merges.txt release/tokenizer_merges.txt
+          curl -fsSL https://huggingface.co/spaces/CompVis/stable-diffusion-license/raw/main/license.txt \
+            -o release/LICENSE-DreamShaper8-LCM-CreativeML-OpenRAIL-M.txt
+          curl -fsSL https://raw.githubusercontent.com/madebyollin/taesd/main/LICENSE -o release/LICENSE-TAESD-MIT.txt
+          cat > release/README.txt <<'EOF'
+          NPU models for llamaimage (ONNX Runtime QNN execution provider, Hexagon HTP).
+          DreamShaper 8 LCM by Lykon (https://huggingface.co/Lykon/dreamshaper-8-lcm), converted to ONNX
+          (static 512x512, fp16 weights, float32 I/O). License: CreativeML OpenRAIL-M — the use-based
+          restrictions in Attachment A apply to these converted files and to all outputs.
+          TAESD by Ollin Boer Bohan (https://huggingface.co/madebyollin/taesd), MIT License.
+          Exact sources/revisions: SOURCES.json. Checksums: SHA256SUMS.
+          EOF
+          sed -i 's/^          //' release/README.txt
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -la release; cat release/SHA256SUMS
+
+      # Published once per tag; delete the release to republish (the app pins size + SHA-256).
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$NPU_RELEASE_TAG" > /dev/null 2>&1; then
+            echo "release $NPU_RELEASE_TAG exists — not republishing"; exit 0
+          fi
+          gh release create "$NPU_RELEASE_TAG" release/* --target "$GITHUB_SHA" --prerelease \
+            --title "NPU models v1: DreamShaper 8 LCM + TAESD (ONNX, 512px)" \
+            --notes-file release/README.txt
+
       - name: Upload reference images
         uses: actions/upload-artifact@v4.6.2
         with:
           name: npu-reference
           path: npu-ref
 
-      - name: Upload ONNX models
-        uses: actions/upload-artifact@v4.6.2
-        with:
-          name: npu-onnx-dreamshaper8-lcm-512
-          path: npu-models
-          compression-level: 0
