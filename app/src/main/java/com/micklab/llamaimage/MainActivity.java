@@ -36,9 +36,11 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.NumberPicker;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -88,6 +90,7 @@ public class MainActivity extends Activity {
     static final String PREFS_PROMPT = "prompt";
     static final String PREFS_NEGATIVE = "negative";
     static final String PREFS_TAB = "main_tab";
+    static final String PREFS_COUNT = "batch_count";
 
     private static final int TAB_TXT2IMG = 0, TAB_IMG2IMG = 1, TAB_API = 2;
     private static final int STRENGTH_MIN_PCT = 5, STRENGTH_MAX_PCT = 100;
@@ -95,6 +98,8 @@ public class MainActivity extends Activity {
     private static final int[] SIZE_VALUES = {512, 448, 384, 256};
     private static final String[] SIZE_LABELS = {"512px（標準）", "448px", "384px（高速）", "256px（最速）"};
     static final int MAX_STEPS = 50;
+    static final int MAX_COUNT = 30;       // images per 連続生成 run
+    static final int GALLERY_MAX = 40;     // thumbnails kept (oldest dropped)
     private static final int MAX_LOG_CHARS = 20000;
     static final long LOW_RAM_BYTES = 6L * 1024 * 1024 * 1024;
 
@@ -189,6 +194,17 @@ public class MainActivity extends Activity {
     private Bitmap lastBitmap;
     private long lastSeed = -1;
     private Bitmap initBitmap;                // selected img2img input (square, cropped)
+
+    // 連続生成 (batch) + gallery of finished images (thumbnails; tap = full-screen viewer, swipe = next)
+    private int batchCount = 1;
+    private int batchIndex = 0, batchTotal = 1;   // current run (UI thread)
+    private Button countButton;
+    private LinearLayout genRow;
+    private HorizontalScrollView galleryScroll;
+    private LinearLayout galleryRow;
+    private final java.util.ArrayList<Bitmap> galleryBmp = new java.util.ArrayList<>();
+    private final java.util.ArrayList<Long> gallerySeed = new java.util.ArrayList<>();
+    private int galleryPos = -1;
 
     private final SdModelManager.Listener genListener = new SdModelManager.Listener() {
         @Override public void onProgress(int phase, int step, int steps) {
@@ -691,8 +707,17 @@ public class MainActivity extends Activity {
         genArea.addView(translatedPromptView);
 
         // --- generate / cancel (same slot) ---
+        // [N 枚] [生成する]: the count button picks how many images one run makes (連続生成).
+        genRow = new LinearLayout(this);
+        genRow.setOrientation(LinearLayout.HORIZONTAL);
+        countButton = button("", BTN_SECONDARY);
+        countButton.setOnClickListener(v -> showCountPicker());
+        genRow.addView(countButton, new LinearLayout.LayoutParams(dp(96), dp(56)));
         generateButton = button("生成する", BTN_PRIMARY);
-        genArea.addView(generateButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 0, 12, 0, 0));
+        LinearLayout.LayoutParams genLp = new LinearLayout.LayoutParams(0, dp(56), 1f);
+        genLp.leftMargin = dp(8);
+        genRow.addView(generateButton, genLp);
+        genArea.addView(genRow, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 0, 12, 0, 0));
         cancelButton = button("中止", BTN_SECONDARY);
         cancelButton.setVisibility(View.GONE);
         genArea.addView(cancelButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 0, 12, 0, 0));
@@ -713,6 +738,9 @@ public class MainActivity extends Activity {
             }
         };
         imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        imageView.setOnClickListener(v -> {
+            if (!generating && galleryPos >= 0) openViewer(galleryPos);
+        });
         canvas.addView(imageView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         placeholderView = new LinearLayout(this);
@@ -753,6 +781,15 @@ public class MainActivity extends Activity {
         imageActions.addView(reworkButton, reworkLp);
         imageActions.addView(seedButton, seedLp);
         genArea.addView(imageActions, marginLp(0, 12, 0, 0));
+
+        // --- gallery: thumbnails of this session's images (tap = enlarge, swipe there = next) ---
+        galleryScroll = new HorizontalScrollView(this);
+        galleryScroll.setHorizontalScrollBarEnabled(false);
+        galleryScroll.setVisibility(View.GONE);
+        galleryRow = new LinearLayout(this);
+        galleryRow.setOrientation(LinearLayout.HORIZONTAL);
+        galleryScroll.addView(galleryRow);
+        genArea.addView(galleryScroll, marginLp(0, 12, 0, 0));
 
         // --- folded: negative prompt and the other parameters ---
         LinearLayout adv = new LinearLayout(this);
@@ -830,6 +867,8 @@ public class MainActivity extends Activity {
         negativeEdit.setText(p.getString(PREFS_NEGATIVE, ""));
         stepsEdit.setText(String.valueOf(p.getInt(PREFS_STEPS, 6)));
         seedEdit.setText(String.valueOf(p.getLong(PREFS_SEED, -1)));
+        batchCount = Math.max(1, Math.min(MAX_COUNT, p.getInt(PREFS_COUNT, 1)));
+        countButton.setText(batchCount + " 枚");
         setStrength(p.getFloat(PREFS_STRENGTH, 0.6f));
         sizeButton.setText(sizeLabelFor(selectedSize));
         updateModelText();
@@ -1201,7 +1240,7 @@ public class MainActivity extends Activity {
         else label = "生成する";
         generateButton.setText(label);
         setEnabledStyled(generateButton, idle && (modelReady || canDownload));
-        generateButton.setVisibility(generating ? View.GONE : View.VISIBLE);
+        genRow.setVisibility(generating ? View.GONE : View.VISIBLE);
         cancelButton.setVisibility(generating ? View.VISIBLE : View.GONE);
         setEnabledStyled(pickInitButton, !generating);
         imageActions.setVisibility(lastBitmap != null && !generating ? View.VISIBLE : View.GONE);
@@ -1845,9 +1884,12 @@ public class MainActivity extends Activity {
         final int method = sampler;
         final boolean nsfw = nsfwRestriction;
         final Bitmap src = initBitmap;
+        final int count = batchCount;
         persistInputs();
 
         generating = true;
+        batchIndex = 0;
+        batchTotal = count;
         sampleSteps = 0;
         samplingStartMs = 0;
         samplingEndMs = 0;
@@ -1888,14 +1930,23 @@ public class MainActivity extends Activity {
                 });
                 appendLogUi((fromImage ? "img2img: \"" : "生成: \"") + p.prompt + "\" " + size + "px "
                         + steps + "step " + samplerLabel(method) + " CFG " + cfg
-                        + (seed >= 0 ? " seed=" + seed : ""));
-                if (fromImage) {
-                    byte[] init = bitmapToRgb(Bitmap.createScaledBitmap(src, size, size, true));
-                    int[] sched = img2imgSchedule(steps, strength);
-                    float sdStrength = (sched[1] - 0.5f) / sched[0];
-                    r = manager.img2img(init, p.prompt, p.negative, size, size, sched[0], cfg, sdStrength, seed, method);
-                } else {
-                    r = manager.txt2img(p.prompt, p.negative, size, size, steps, cfg, seed, method);
+                        + (seed >= 0 ? " seed=" + seed : "") + (count > 1 ? " ×" + count + " 枚" : ""));
+                byte[] init = fromImage ? bitmapToRgb(Bitmap.createScaledBitmap(src, size, size, true)) : null;
+                // 連続生成: a fixed seed advances by one per image (reproducible set); -1 stays random.
+                for (int i = 0; ; i++) {
+                    long s = seed >= 0 ? seed + i : -1;
+                    if (fromImage) {
+                        int[] sched = img2imgSchedule(steps, strength);
+                        float sdStrength = (sched[1] - 0.5f) / sched[0];
+                        r = manager.img2img(init, p.prompt, p.negative, size, size, sched[0], cfg, sdStrength, s, method);
+                    } else {
+                        r = manager.txt2img(p.prompt, p.negative, size, size, steps, cfg, s, method);
+                    }
+                    if (i == count - 1 || !r.ok()) break;   // the last image / cancel / error ends the run
+                    final SdModelManager.Result one = r;
+                    final Bitmap b = rgbToBitmap(one.rgb, one.width, one.height);
+                    final int next = i + 1;
+                    runOnUiThread(() -> onBatchImage(one, b, next));
                 }
             } catch (Throwable t) {
                 r = null;
@@ -1915,19 +1966,18 @@ public class MainActivity extends Activity {
         double totalSec = (now - genStartMs) / 1000.0;
         if (r.ok()) {
             if (samplingEndMs > 0) lastDecodeMs = now - samplingEndMs;
-            lastBitmap = bmp;
-            lastSeed = r.seed;
-            showImage(bmp);
+            addToGallery(bmp, r.seed);
             String timing = String.format(Locale.US, "%.1fs", totalSec);
             if (samplingStartMs > 0 && samplingEndMs > 0) {
                 timing += String.format(Locale.US, "（サンプリング %.1fs / デコード %.1fs）",
                         (samplingEndMs - samplingStartMs) / 1000.0, (now - samplingEndMs) / 1000.0);
             }
-            appendLog("生成完了 seed=" + r.seed + " " + timing);
-            finishGeneration("完了 seed=" + r.seed + " (" + String.format(Locale.US, "%.1fs", totalSec) + ")");
+            appendLog(batchTag() + "生成完了 seed=" + r.seed + " " + timing);
+            finishGeneration((batchTotal > 1 ? batchTotal + " 枚 " : "") + "完了 seed=" + r.seed
+                    + " (" + String.format(Locale.US, "%.1fs", totalSec) + ")");
         } else if (r.cancelled) {
-            appendLog("生成を中止しました");
-            finishGeneration("中止しました");
+            appendLog(batchTag() + "生成を中止しました");
+            finishGeneration(batchTotal > 1 ? "中止しました（" + batchIndex + "/" + batchTotal + " 枚 完了）" : "中止しました");
         } else {
             String e = r.error.isEmpty() ? "原因不明（ログ参照）" : r.error;
             appendLog("生成失敗: " + e);
@@ -1935,9 +1985,174 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** One image of a 連続生成 run is done (not the last one); {@code next} = index of the next. */
+    private void onBatchImage(SdModelManager.Result r, Bitmap bmp, int next) {
+        long now = SystemClock.elapsedRealtime();
+        appendLog(batchTag() + "生成完了 seed=" + r.seed + " "
+                + String.format(Locale.US, "%.1fs", (now - genStartMs) / 1000.0));
+        if (samplingEndMs > 0) lastDecodeMs = now - samplingEndMs;
+        addToGallery(bmp, r.seed);
+        batchIndex = next;
+        genStartMs = now;
+        sampleSteps = 0;
+        samplingStartMs = 0;
+        samplingEndMs = 0;
+        if (!manager.isCancelRequested()) {
+            cancelButton.setEnabled(true);
+            cancelButton.setText("中止");
+        }
+        progressBar.setIndeterminate(true);
+        setStatus(batchTag() + "生成開始…");
+    }
+
+    /** "[2/5] " while a 連続生成 run of more than one image is going, else "". */
+    private String batchTag() {
+        return batchTotal > 1 ? "[" + Math.min(batchIndex + 1, batchTotal) + "/" + batchTotal + "] " : "";
+    }
+
+    private void showCountPicker() {
+        NumberPicker np = new NumberPicker(this);
+        np.setMinValue(1);
+        np.setMaxValue(MAX_COUNT);
+        np.setValue(batchCount);
+        np.setWrapSelectorWheel(false);
+        new AlertDialog.Builder(this)
+                .setTitle("連続生成の枚数")
+                .setMessage("「生成する」1 回で作る枚数。シードを固定している場合は 1 枚ごとに +1 します。")
+                .setView(np)
+                .setPositiveButton("決定", (d, w) -> {
+                    np.clearFocus();
+                    batchCount = np.getValue();
+                    countButton.setText(batchCount + " 枚");
+                    prefs().edit().putInt(PREFS_COUNT, batchCount).apply();
+                })
+                .setNegativeButton("キャンセル", null)
+                .show();
+    }
+
+    // --- gallery ---
+
+    private void addToGallery(Bitmap bmp, long seed) {
+        galleryBmp.add(bmp);
+        gallerySeed.add(seed);
+        if (galleryBmp.size() > GALLERY_MAX) {
+            galleryBmp.remove(0);
+            gallerySeed.remove(0);
+        }
+        rebuildGallery();
+        selectGallery(galleryBmp.size() - 1);
+        galleryScroll.post(() -> galleryScroll.fullScroll(View.FOCUS_RIGHT));
+    }
+
+    private void rebuildGallery() {
+        galleryRow.removeAllViews();
+        for (int i = 0; i < galleryBmp.size(); i++) {
+            final int idx = i;
+            ImageView t = new ImageView(this);
+            t.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            t.setImageBitmap(galleryBmp.get(i));
+            t.setClipToOutline(true);
+            t.setOnClickListener(v -> {
+                if (generating) selectGallery(idx);
+                else openViewer(idx);
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(72), dp(72));
+            if (i > 0) lp.leftMargin = dp(6);
+            galleryRow.addView(t, lp);
+        }
+        galleryScroll.setVisibility(galleryBmp.size() > 1 ? View.VISIBLE : View.GONE);
+    }
+
+    /** Makes image {@code i} the current one (canvas, 保存 / 再加工 / シード固定). */
+    private void selectGallery(int i) {
+        if (i < 0 || i >= galleryBmp.size()) return;
+        galleryPos = i;
+        lastBitmap = galleryBmp.get(i);
+        lastSeed = gallerySeed.get(i);
+        if (!generating) showImage(lastBitmap);
+        for (int k = 0; k < galleryRow.getChildCount(); k++) {
+            View t = galleryRow.getChildAt(k);
+            t.setBackground(rounded(C_SURFACE, 10, k == i ? C_ACCENT : C_STROKE));
+            t.setPadding(dp(2), dp(2), dp(2), dp(2));
+            t.setAlpha(k == i ? 1f : 0.7f);
+        }
+    }
+
+    /** Full-screen viewer: swipe left / right for the next / previous image, tap ✕ or back to close. */
+    private void openViewer(int start) {
+        if (galleryBmp.isEmpty()) return;
+        final android.app.Dialog dlg = new android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(0xFF000000);
+        final ImageView iv = new ImageView(this);
+        iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        root.addView(iv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        final TextView info = text("", 13, 0xFFEDEDF0);
+        info.setPadding(dp(16), dp(16), dp(16), dp(16));
+        root.addView(info, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START));
+        TextView close = text("✕", 22, 0xFFEDEDF0);
+        close.setPadding(dp(18), dp(10), dp(18), dp(10));
+        close.setOnClickListener(v -> dlg.dismiss());
+        root.addView(close, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END));
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setPadding(dp(16), dp(12), dp(16), dp(24));
+        Button save = button("↓  保存", BTN_SECONDARY);
+        save.setOnClickListener(v -> saveImage());
+        Button rework = button("↻  再加工", BTN_SECONDARY);
+        rework.setOnClickListener(v -> {
+            dlg.dismiss();
+            useResultAsInput();
+        });
+        bar.addView(save, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        rlp.leftMargin = dp(8);
+        bar.addView(rework, rlp);
+        root.addView(bar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+
+        final int[] pos = {Math.max(0, Math.min(start, galleryBmp.size() - 1))};
+        final Runnable show = () -> {
+            selectGallery(pos[0]);
+            iv.setImageBitmap(galleryBmp.get(pos[0]));
+            long sd = gallerySeed.get(pos[0]);
+            info.setText((pos[0] + 1) + " / " + galleryBmp.size() + (sd >= 0 ? "   seed " + sd : ""));
+        };
+        show.run();
+        final android.view.GestureDetector gd = new android.view.GestureDetector(this,
+                new android.view.GestureDetector.SimpleOnGestureListener() {
+                    @Override public boolean onDown(MotionEvent e) {
+                        return true;
+                    }
+
+                    @Override public boolean onFling(MotionEvent e1, MotionEvent e2, float vx, float vy) {
+                        if (e1 == null || Math.abs(vx) < Math.abs(vy) || Math.abs(e2.getX() - e1.getX()) < dp(40)) return false;
+                        int dir = vx < 0 ? 1 : -1;           // swipe left = next
+                        int np = pos[0] + dir;
+                        if (np < 0 || np >= galleryBmp.size()) {
+                            iv.animate().translationX(-dir * dp(24)).setDuration(90)
+                                    .withEndAction(() -> iv.animate().translationX(0).setDuration(120)).start();
+                            return true;
+                        }
+                        pos[0] = np;
+                        show.run();
+                        iv.setTranslationX(dir * iv.getWidth() * 0.35f);
+                        iv.setAlpha(0.3f);
+                        iv.animate().translationX(0).alpha(1f).setDuration(180).start();
+                        return true;
+                    }
+                });
+        iv.setOnTouchListener((v, e) -> gd.onTouchEvent(e));
+        dlg.setContentView(root);
+        dlg.show();
+    }
+
     /** Common end of a generation. Shows the last finished image (drops a leftover preview). */
     private void finishGeneration(String status) {
         generating = false;
+        batchTotal = 1;
         showImage(lastBitmap);   // null clears the view
         progressBar.setIndeterminate(false);
         progressBar.setVisibility(View.GONE);
@@ -1969,7 +2184,7 @@ public class MainActivity extends Activity {
                     cancelButton.setEnabled(false);
                     cancelButton.setText("仕上げ中…");
                 }
-                setStatus("仕上げ（VAEデコード）中… " + elapsed + "s"
+                setStatus(batchTag() + "仕上げ（VAEデコード）中… " + elapsed + "s"
                         + (lastDecodeMs > 0 ? " 残り約" + formatDuration(lastDecodeMs / 1000) : ""));
                 return;
             }
@@ -1979,13 +2194,13 @@ public class MainActivity extends Activity {
                 long remainMs = perStep * (steps - step) + lastDecodeMs;
                 eta = " 残り約" + formatDuration(remainMs / 1000);
             }
-            setStatus("生成中 " + step + "/" + steps + "（" + elapsed + "s" + eta + "）");
+            setStatus(batchTag() + "生成中 " + step + "/" + steps + "（" + elapsed + "s" + eta + "）");
         } else if (phase == StableDiffusionNative.PHASE_DECODE) {
             // VAE tiling reports its tiles through the same callback; keep it as one final phase.
             progressBar.setIndeterminate(false);
             progressBar.setMax(sampleSteps + 1);
             progressBar.setProgress(sampleSteps);
-            setStatus("仕上げ（VAEデコード）中… タイル " + Math.min(step, steps) + "/" + steps);
+            setStatus(batchTag() + "仕上げ（VAEデコード）中… タイル " + Math.min(step, steps) + "/" + steps);
         }
     }
 
