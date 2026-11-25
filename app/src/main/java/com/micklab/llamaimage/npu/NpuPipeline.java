@@ -29,6 +29,10 @@ public final class NpuPipeline implements Closeable {
 
     public interface Log {
         void log(String msg);
+
+        /** Session {@code index} (1-based) of {@code total} is being created (compiled on first use). */
+        default void stage(int index, int total, String name) {
+        }
     }
 
     public interface Listener {
@@ -52,9 +56,13 @@ public final class NpuPipeline implements Closeable {
         tokenizer = new ClipTokenizer(new File(dir, "tokenizer_vocab.json"), new File(dir, "tokenizer_merges.txt"));
         OrtSession te = null, un = null, de = null, en = null;
         try {
+            log.stage(1, 4, "text_encoder");
             te = open(new File(dir, "text_encoder.onnx"), qnnOptions, cacheDir, log);
+            log.stage(2, 4, "unet");
             un = open(new File(dir, "unet.onnx"), qnnOptions, cacheDir, log);
+            log.stage(3, 4, "taesd_decoder");
             de = open(new File(dir, "taesd_decoder.onnx"), qnnOptions, cacheDir, log);
+            log.stage(4, 4, "taesd_encoder");
             en = open(new File(dir, "taesd_encoder.onnx"), qnnOptions, cacheDir, log);
         } catch (OrtException | RuntimeException e) {
             for (OrtSession s : new OrtSession[]{te, un, de, en}) closeQuietly(s);

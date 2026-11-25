@@ -323,6 +323,60 @@ public class MainActivity extends Activity {
     }
 
     /** Decide what to do once native is ready: resume a download, load a model, or ask. */
+    // --- NPU preparation progress -----------------------------------------------------------
+    // ORT compiles each graph in one blocking call without progress, so the bar shows the stage
+    // (weighted by its typical share of the time: the UNet dominates) plus the elapsed time.
+    private static final int[] NPU_STAGE_WEIGHT = {0, 8, 80, 6, 6};   // index 1..4, sums to 100
+    private static final String[] NPU_STAGE_LABEL = {"", "テキストエンコーダ", "UNet", "デコーダ", "エンコーダ"};
+    private int npuStage = 0, npuStages = 0;
+    private long npuStageStart = 0, npuPrepStart = 0;
+    private final Runnable npuTicker = new Runnable() {
+        @Override public void run() {
+            if (npuStage <= 0) return;
+            long now = SystemClock.elapsedRealtime();
+            setStatus("NPU 向け最適化中 " + npuStage + "/" + npuStages + "（" + NPU_STAGE_LABEL[npuStage] + "）… "
+                    + formatDuration((now - npuStageStart) / 1000) + "（合計 " + formatDuration((now - npuPrepStart) / 1000)
+                    + "・初回のみ数分）");
+            ui.postDelayed(this, 1000);
+        }
+    };
+
+    private void startNpuStage(int index, int total, String name) {
+        if (npuPrepStart == 0) npuPrepStart = SystemClock.elapsedRealtime();
+        npuStage = Math.min(index, 4);
+        npuStages = total;
+        npuStageStart = SystemClock.elapsedRealtime();
+        int done = 0;
+        for (int i = 1; i < npuStage; i++) done += NPU_STAGE_WEIGHT[i];
+        progressBar.setVisibility(View.VISIBLE);
+        progressBar.setIndeterminate(false);
+        progressBar.setMax(100);
+        progressBar.setProgress(done);
+        progressBar.setSecondaryProgress(done + NPU_STAGE_WEIGHT[npuStage]);
+        ui.removeCallbacks(npuTicker);
+        npuTicker.run();
+    }
+
+    private void stopNpuStage() {
+        npuStage = 0;
+        npuPrepStart = 0;
+        ui.removeCallbacks(npuTicker);
+        if (!generating) progressBar.setVisibility(View.GONE);
+    }
+
+    /** "NPU 用に変換中（UNet） 42%" -> status + determinate bar. */
+    private void showBuildProgress(String status) {
+        setStatus(status);
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\d+)%").matcher(status);
+        if (m.find()) {
+            progressBar.setVisibility(View.VISIBLE);
+            progressBar.setIndeterminate(false);
+            progressBar.setMax(100);
+            progressBar.setProgress(Integer.parseInt(m.group(1)));
+            progressBar.setSecondaryProgress(0);
+        }
+    }
+
     /** Keeps the screen on (app stays foreground, not killed by OEM memory governors) while busy. */
     private void updateKeepScreenOn() {
         if (loading || generating) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -930,6 +984,7 @@ public class MainActivity extends Activity {
         bar.setProgressTintList(ColorStateList.valueOf(C_ACCENT));
         bar.setProgressBackgroundTintList(ColorStateList.valueOf(0x33FFFFFF));
         bar.setIndeterminateTintList(ColorStateList.valueOf(C_ACCENT));
+        bar.setSecondaryProgressTintList(ColorStateList.valueOf(0x667C3AED));   // current NPU stage span
     }
 
     private LinearLayout.LayoutParams marginLp(int l, int t, int r, int b) {
@@ -1609,12 +1664,21 @@ public class MainActivity extends Activity {
                     appendLogUi("NPU: 補助ファイル OK");
                     if (!nm.isBuilt(spec.id, spec.sha256)) {
                         appendLogUi("NPU 用モデルを端末で作成します（初回のみ・約 2GB）");
-                        nm.ensureBuilt(spec.id, file, spec.sha256, this::setStatusUi);
+                        nm.ensureBuilt(spec.id, file, spec.sha256, s -> runOnUiThread(() -> showBuildProgress(s)));
                         appendLogUi("NPU: モデル作成 完了");
                     }
                     setStatusUi("NPU を準備中…（初回は最適化に数分かかります）");
                     appendLogUi("NPU: セッション作成（初回は NPU 向け最適化）開始");
-                    err = manager.loadNpu(cfg, nm, this::appendLogUi);
+                    err = manager.loadNpu(cfg, nm, new com.micklab.llamaimage.npu.NpuPipeline.Log() {
+                        @Override public void log(String msg) {
+                            appendLogUi(msg);
+                        }
+
+                        @Override public void stage(int index, int total, String name) {
+                            runOnUiThread(() -> startNpuStage(index, total, name));
+                        }
+                    });
+                    runOnUiThread(this::stopNpuStage);
                     prefs().edit().putBoolean(PREFS_NPU_PENDING, false).commit();
                 } else {
                     setStatusUi("モデル読込中… " + spec.title);
@@ -1628,6 +1692,7 @@ public class MainActivity extends Activity {
             prefs().edit().putBoolean(PREFS_NPU_PENDING, false).commit();   // finished (ok or error)
             runOnUiThread(() -> {
                 loading = false;
+                stopNpuStage();
                 if (e.isEmpty()) {
                     appendLog("モデル読込成功: " + spec.title + " (" + (ms / 1000) + "s, "
                             + (cfg.npuModelId != null ? "NPU, " : cfg.useGpu ? "GPU " + manager.activeBackend() + ", " : "CPU ")
