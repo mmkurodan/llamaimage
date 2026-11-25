@@ -40,6 +40,33 @@ jobs:
       - name: Reference pipeline (CPU)
         run: python scripts/npu/reference_pipeline.py --models npu-models --out npu-ref
 
+      # On-device conversion: weightless templates + weight maps, checked against the export.
+      - name: Templates + device-equivalent assembly (DreamShaper 8 LCM, byte-verified)
+        run: |
+          set -e
+          CK=$(python -c "from huggingface_hub import hf_hub_download as d; print(d('Lykon/dreamshaper-8-lcm','DreamShaper8_LCM.safetensors',revision='4645d8bc6a8e6b106d21606d63e8460cdad4f1a6'))")
+          python scripts/npu/make_template.py --models npu-models --checkpoint "$CK" --out npu-templates
+          python scripts/npu/assemble.py --templates npu-templates --checkpoint "$CK" --out asm-ds --verify npu-models --run
+          rm -rf asm-ds
+
+      - name: Assembly from another SD1.5 checkpoint (AbsoluteReality LCM) + reference image
+        run: |
+          set -e
+          curl -fsSL -o ar_lcm.safetensors "https://civitai.com/api/download/models/256668?fileId=199166"
+          echo "0501f9c30cf36a777f0e3722e497b8cc5e8d9fde839e2459b80621e02f8ed98d  ar_lcm.safetensors" | sha256sum -c
+          python scripts/npu/assemble.py --templates npu-templates --checkpoint ar_lcm.safetensors --out asm-ar --run
+          cp -r npu-models/taesd_*.onnx npu-models/tokenizer npu-models/scheduler_config.json asm-ar/
+          python scripts/npu/reference_pipeline.py --models asm-ar --out npu-ref/absolutereality \
+            --prompt "portrait photo of a young woman in a cafe, natural window light"
+          rm -rf asm-ar ar_lcm.safetensors
+
+      - name: Upload templates to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$NPU_RELEASE_TAG" npu-templates/* --clobber
+          gh release view "$NPU_RELEASE_TAG" --json assets -q '.assets[]|"\(.size)\t\(.name)"'
+
       - name: Diagnose (ONNX vs PyTorch fp32, diffusers reference images)
         run: python scripts/npu/diagnose.py --models npu-models --out npu-ref
 
