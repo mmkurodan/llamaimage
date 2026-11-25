@@ -34,6 +34,9 @@ jobs:
       - name: Reference pipeline (CPU)
         run: python scripts/npu/reference_pipeline.py --models npu-models --out npu-ref
 
+      - name: Diagnose (ONNX vs PyTorch fp32, diffusers reference images)
+        run: python scripts/npu/diagnose.py --models npu-models --out npu-ref
+
       - name: Sizes
         run: ls -la npu-models npu-models/tokenizer npu-ref
 
