@@ -9,9 +9,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 
 /**
  * Builds a runnable ONNX model on the device from a weightless template + weight map (published by
@@ -35,8 +32,7 @@ public final class NpuModelAssembler {
             throws IOException {
         JSONObject map;
         try {
-            map = new JSONObject(new String(Files.readAllBytes(new File(templateDir, name + ".map.json").toPath()),
-                    StandardCharsets.UTF_8));
+            map = new JSONObject(IoUtil.readString(new File(templateDir, name + ".map.json")));
         } catch (org.json.JSONException e) {
             throw new IOException(name + ".map.json を解析できません", e);
         }
@@ -103,10 +99,9 @@ public final class NpuModelAssembler {
         }
         File model = new File(outDir, name + ".onnx");
         File tmpModel = new File(outDir, name + ".onnx.tmp");
-        Files.copy(new File(templateDir, name + ".template.onnx").toPath(), tmpModel.toPath(),
-                StandardCopyOption.REPLACE_EXISTING);
-        Files.move(tmpWeights.toPath(), weights.toPath(), StandardCopyOption.REPLACE_EXISTING);
-        Files.move(tmpModel.toPath(), model.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        IoUtil.copy(new File(templateDir, name + ".template.onnx"), tmpModel);
+        IoUtil.move(tmpWeights, weights);
+        IoUtil.move(tmpModel, model);
         return model;
     }
 }

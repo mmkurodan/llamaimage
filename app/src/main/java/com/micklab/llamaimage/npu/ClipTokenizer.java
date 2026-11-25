@@ -5,7 +5,6 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -33,7 +32,7 @@ public final class ClipTokenizer {
 
     public ClipTokenizer(File vocabJson, File mergesTxt) throws IOException {
         try {
-            JSONObject v = new JSONObject(new String(Files.readAllBytes(vocabJson.toPath()), StandardCharsets.UTF_8));
+            JSONObject v = new JSONObject(IoUtil.readString(vocabJson));
             for (Iterator<String> it = v.keys(); it.hasNext(); ) {
                 String k = it.next();
                 vocab.put(k, v.getInt(k));
@@ -41,7 +40,7 @@ public final class ClipTokenizer {
         } catch (org.json.JSONException e) {
             throw new IOException("tokenizer vocab を解析できません", e);
         }
-        List<String> lines = Files.readAllLines(mergesTxt.toPath(), StandardCharsets.UTF_8);
+        List<String> lines = IoUtil.readLines(mergesTxt);
         // transformers: merges[1 : 49152 - 256 - 2 + 1] (skip the "#version" header line)
         int end = Math.min(lines.size(), 49152 - 256 - 2 + 1);
         for (int i = 1; i < end; i++) {
