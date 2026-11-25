@@ -11,6 +11,9 @@ import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Matrix;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
@@ -213,6 +216,11 @@ public class MainActivity extends Activity {
     private Button vStartButton, vColorButton, vPlayButton;
     private boolean vFromInput = false, vColorLock = true;
     private Uri lastVideoUri;
+    // 変化させる範囲: mask over initBitmap (null = whole image); video: 0 全体 / 1 顔（自動・毎コマ） / 2 入力画像の範囲
+    private byte[] initMask;
+    private Button maskButton, vMaskButton;
+    private int vMaskMode = 0;
+    private static final String[] V_MASK_LABELS = {"範囲: 全体", "範囲: 顔（自動）", "範囲: 入力画像で指定"};
 
     private final SdModelManager.Listener genListener = new SdModelManager.Listener() {
         @Override public void onProgress(int phase, int step, int steps) {
@@ -697,6 +705,16 @@ public class MainActivity extends Activity {
                 new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         strengthEnds.addView(text("大きく変える", 10, C_TEXT3));
         strengthCol.addView(strengthEnds);
+        maskButton = button("範囲: 全体 ›", BTN_GHOST);
+        maskButton.setTextSize(13);
+        maskButton.setOnClickListener(v -> {
+            if (initBitmap == null) {
+                Toast.makeText(this, "先に入力画像を選択してください", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            openMaskEditor(initBitmap, initMask, this::setInitMask);
+        });
+        strengthCol.addView(maskButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(40), 0, 6, 0, 0));
         img2imgPanel.addView(strengthCol,
                 new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         genArea.addView(img2imgPanel, marginLp(0, 0, 0, 10));
@@ -1218,6 +1236,7 @@ public class MainActivity extends Activity {
     private void useResultAsInput() {
         if (lastBitmap == null || generating) return;
         initBitmap = lastBitmap;   // already square; scaled to the target size at generation time
+        setInitMask(null);
         initThumb.setImageBitmap(initBitmap);
         initThumbHint.setVisibility(View.GONE);
         selectTab(TAB_IMG2IMG);
@@ -1943,6 +1962,7 @@ public class MainActivity extends Activity {
         final int method = sampler;
         final boolean nsfw = nsfwRestriction;
         final Bitmap src = initBitmap;
+        final byte[] mask = fromImage ? initMask : null;
         final int count = batchCount;
         persistInputs();
 
@@ -2003,7 +2023,7 @@ public class MainActivity extends Activity {
                     }
                     if (i == count - 1 || !r.ok()) break;   // the last image / cancel / error ends the run
                     final SdModelManager.Result one = r;
-                    final Bitmap b = rgbToBitmap(one.rgb, one.width, one.height);
+                    final Bitmap b = masked(rgbToBitmap(one.rgb, one.width, one.height), src, mask);
                     final int next = i + 1;
                     runOnUiThread(() -> onBatchImage(one, b, next));
                 }
@@ -2015,7 +2035,7 @@ public class MainActivity extends Activity {
                 return;
             }
             final SdModelManager.Result res = r;
-            final Bitmap bmp = res.ok() ? rgbToBitmap(res.rgb, res.width, res.height) : null;
+            final Bitmap bmp = res.ok() ? masked(rgbToBitmap(res.rgb, res.width, res.height), src, mask) : null;
             runOnUiThread(() -> onGenerationResult(res, bmp));
         });
     }
@@ -2263,6 +2283,18 @@ public class MainActivity extends Activity {
         row3.addView(vColorButton, clp);
         v.addView(row3, marginLp(0, 10, 0, 0));
 
+        vMaskButton = button("", BTN_GHOST);
+        vMaskButton.setTextSize(13);
+        vMaskButton.setOnClickListener(x -> {
+            vMaskMode = (vMaskMode + 1) % V_MASK_LABELS.length;
+            if (vMaskMode == 2 && initMask == null) {
+                Toast.makeText(this, "「画像→画像」タブの入力画像で「範囲」を指定すると選べます", Toast.LENGTH_SHORT).show();
+                vMaskMode = 0;
+            }
+            updateVideoButtons();
+        });
+        v.addView(vMaskButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(44), 0, 8, 0, 0));
+
         vPlayButton = button("▶  前回の動画を再生", BTN_SECONDARY);
         vPlayButton.setVisibility(View.GONE);
         vPlayButton.setOnClickListener(x -> openVideoPlayer(lastVideoUri));
@@ -2287,6 +2319,8 @@ public class MainActivity extends Activity {
     private void updateVideoButtons() {
         vStartButton.setText(vFromInput ? "開始: 入力画像から" : "開始: プロンプトから");
         vColorButton.setText(onOff("色を固定", vColorLock));
+        if (vMaskMode == 2 && initMask == null) vMaskMode = 0;
+        if (vMaskButton != null) vMaskButton.setText(V_MASK_LABELS[vMaskMode]);
         if (vPlayButton != null) vPlayButton.setVisibility(lastVideoUri != null ? View.VISIBLE : View.GONE);
     }
 
@@ -2335,6 +2369,13 @@ public class MainActivity extends Activity {
         final boolean nsfw = nsfwRestriction;
         final boolean colorLock = vColorLock;
         final Bitmap start = vFromInput ? initBitmap : null;
+        if (vMaskMode == 2 && !vFromInput) {
+            Toast.makeText(this, "「入力画像で指定」の範囲は、開始を「入力画像から」にしたときに使えます", Toast.LENGTH_LONG).show();
+            return;
+        }
+        final int maskMode = vMaskMode;
+        final byte[] paintedMask = maskMode == 2 && initMask != null
+                ? ChangeMask.resize(initMask, initBitmap.getWidth(), initBitmap.getHeight(), size, size) : null;
         persistInputs();
 
         generating = true;
@@ -2376,6 +2417,8 @@ public class MainActivity extends Activity {
                 appendLogUi("動画: \"" + p.prompt + "\" " + frames + " コマ " + fps + "fps 変化量 " + strength
                         + " ズーム " + zoom + " " + size + "px " + steps + "step " + samplerLabel(method) + " CFG " + cfg);
                 Bitmap prev = null, first = null;
+                byte[] frameMask = paintedMask;   // follows the zoom frame by frame
+                int faceMisses = 0;
                 try (VideoEncoder enc = new VideoEncoder(tmp, size, size, fps)) {
                     for (int k = 0; k < frames; k++) {
                         SdModelManager.Result r;
@@ -2394,6 +2437,16 @@ public class MainActivity extends Activity {
                         }
                         if (seedUsed < 0) seedUsed = r.seed;   // one seed for every frame (less flicker)
                         Bitmap frame = rgbToBitmap(r.rgb, r.width, r.height);
+                        Bitmap base = k == 0 ? (start != null ? Bitmap.createScaledBitmap(start, size, size, true) : null)
+                                : zoomBitmap(prev, zoom);
+                        if (base != null && maskMode == 1) {
+                            byte[] fm = ChangeMask.faces(base, 4);   // the face moves with the zoom: detect per frame
+                            if (fm != null) frame = ChangeMask.composite(frame, base, fm);
+                            else faceMisses++;
+                        } else if (base != null && maskMode == 2 && frameMask != null) {
+                            if (k > 0) frameMask = ChangeMask.zoom(frameMask, size, size, zoom);
+                            frame = ChangeMask.composite(frame, base, frameMask);
+                        }
                         if (first == null) first = frame;
                         else if (colorLock) frame = matchColors(frame, first);
                         enc.addFrame(frame);
@@ -2406,6 +2459,7 @@ public class MainActivity extends Activity {
                     }
                     if (done >= 2) enc.finish();
                 }
+                if (faceMisses > 0) appendLogUi("動画: 顔が見つからなかったコマ " + faceMisses + " 枚は全体を変化させました");
             } catch (Throwable t) {
                 error = t.toString();
             }
@@ -2457,6 +2511,13 @@ public class MainActivity extends Activity {
                     : "中止しました（2 コマ未満のため動画は保存していません）");
         }
         if (error != null && error.startsWith(SdModelManager.NPU_CRASH)) handleNpuCrash(error);
+    }
+
+    /** Keeps {@code orig} outside {@code mask} (mask over orig's size; null = no change). */
+    private static Bitmap masked(Bitmap gen, Bitmap orig, byte[] mask) {
+        if (mask == null || orig == null) return gen;
+        byte[] m = ChangeMask.resize(mask, orig.getWidth(), orig.getHeight(), gen.getWidth(), gen.getHeight());
+        return ChangeMask.composite(gen, orig, m);
     }
 
     private static int clamp(int v, int lo, int hi) {
@@ -2585,6 +2646,140 @@ public class MainActivity extends Activity {
         dlg.show();
     }
 
+    // =====================================================================================
+    // 変化させる範囲 (change mask) for img2img and video
+    // =====================================================================================
+
+    private void setInitMask(byte[] m) {
+        initMask = ChangeMask.isEmpty(m) ? null : m;
+        updateMaskButton();
+    }
+
+    private void updateMaskButton() {
+        if (maskButton != null) maskButton.setText(initMask == null ? "範囲: 全体 ›" : "範囲: 指定あり ›");
+    }
+
+    interface MaskResult {
+        void onMask(byte[] mask);
+    }
+
+    /** Finger-painted mask over {@code img}: 塗る / 消す, brush size, 顔を自動選択, 反転, 全消去. */
+    private void openMaskEditor(Bitmap img, byte[] current, MaskResult done) {
+        final int w = img.getWidth(), h = img.getHeight();
+        final Bitmap mask = current != null ? ChangeMask.toAlpha(current, w, h)
+                : Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        final Canvas mc = new Canvas(mask);
+        final boolean[] erase = {false};
+        final float[] brush = {w / 14f};
+        final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Paint overlay = new Paint();
+        overlay.setColorFilter(new android.graphics.PorterDuffColorFilter(0x99E0407B, android.graphics.PorterDuff.Mode.SRC_IN));
+        final View canvasView = new View(this) {
+            final android.graphics.Matrix toView = new android.graphics.Matrix(), toImg = new android.graphics.Matrix();
+            float lastX = -1, lastY = -1;
+
+            @Override protected void onMeasure(int ws, int hs) {
+                super.onMeasure(ws, ws);
+            }
+
+            @Override protected void onSizeChanged(int vw, int vh, int ow, int oh) {
+                toView.setRectToRect(new RectF(0, 0, w, h), new RectF(0, 0, vw, vh), android.graphics.Matrix.ScaleToFit.CENTER);
+                toView.invert(toImg);
+            }
+
+            @Override protected void onDraw(Canvas c) {
+                c.drawBitmap(img, toView, null);
+                c.drawBitmap(mask, toView, overlay);
+            }
+
+            @Override public boolean onTouchEvent(MotionEvent e) {
+                getParent().requestDisallowInterceptTouchEvent(true);
+                float[] pt = {e.getX(), e.getY()};
+                toImg.mapPoints(pt);
+                paint.setColor(0xFFFFFFFF);
+                paint.setXfermode(erase[0] ? new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR) : null);
+                paint.setStrokeWidth(brush[0] * 2);
+                paint.setStrokeCap(Paint.Cap.ROUND);
+                if (e.getActionMasked() == MotionEvent.ACTION_DOWN || lastX < 0) {
+                    mc.drawCircle(pt[0], pt[1], brush[0], paint);
+                } else {
+                    mc.drawLine(lastX, lastY, pt[0], pt[1], paint);
+                }
+                lastX = pt[0];
+                lastY = pt[1];
+                if (e.getActionMasked() == MotionEvent.ACTION_UP || e.getActionMasked() == MotionEvent.ACTION_CANCEL) lastX = -1;
+                invalidate();
+                return true;
+            }
+        };
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(12), dp(8), dp(12), dp(4));
+        TextView how = text("変化させたい部分を指でなぞってください（ピンク＝変化する範囲。それ以外は入力画像のまま）", 12, C_TEXT2);
+        root.addView(how, marginLp(0, 0, 0, 8));
+        root.addView(canvasView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout tools = new LinearLayout(this);
+        tools.setOrientation(LinearLayout.HORIZONTAL);
+        Button modeB = button("塗る", BTN_GHOST), sizeB = button("ブラシ 中", BTN_GHOST);
+        modeB.setOnClickListener(v -> {
+            erase[0] = !erase[0];
+            modeB.setText(erase[0] ? "消す" : "塗る");
+        });
+        sizeB.setOnClickListener(v -> {
+            float s = brush[0] * 14f / w;
+            brush[0] = w / (s > 1.5f ? 28f : s > 0.75f ? 7f : 14f);
+            float n = brush[0] * 14f / w;
+            sizeB.setText(n > 1.5f ? "ブラシ 大" : n < 0.75f ? "ブラシ 小" : "ブラシ 中");
+        });
+        tools.addView(modeB, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        slp.leftMargin = dp(6);
+        tools.addView(sizeB, slp);
+        root.addView(tools, marginLp(0, 8, 0, 0));
+        LinearLayout tools2 = new LinearLayout(this);
+        tools2.setOrientation(LinearLayout.HORIZONTAL);
+        Button faceB = button("顔を自動選択", BTN_GHOST), invB = button("反転", BTN_GHOST), clrB = button("全消去", BTN_GHOST);
+        faceB.setOnClickListener(v -> {
+            byte[] f = ChangeMask.faces(img, 4);
+            if (f == null) {
+                Toast.makeText(this, "顔が見つかりませんでした（指で塗ってください）", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            Paint p = new Paint();
+            p.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.LIGHTEN));
+            mc.drawBitmap(ChangeMask.toAlpha(f, w, h), 0, 0, p);
+            canvasView.invalidate();
+        });
+        invB.setOnClickListener(v -> {
+            byte[] m = ChangeMask.fromAlpha(mask);
+            for (int i = 0; i < m.length; i++) m[i] = (byte) (255 - (m[i] & 0xFF));
+            mask.eraseColor(0);
+            mc.drawBitmap(ChangeMask.toAlpha(m, w, h), 0, 0, null);
+            canvasView.invalidate();
+        });
+        clrB.setOnClickListener(v -> {
+            mask.eraseColor(0);
+            canvasView.invalidate();
+        });
+        tools2.addView(faceB, new LinearLayout.LayoutParams(0, dp(44), 1.4f));
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        ilp.leftMargin = dp(6);
+        tools2.addView(invB, ilp);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        clp.leftMargin = dp(6);
+        tools2.addView(clrB, clp);
+        root.addView(tools2, marginLp(0, 6, 0, 0));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(root);
+        new AlertDialog.Builder(this)
+                .setTitle("変化させる範囲")
+                .setView(sv)
+                .setPositiveButton("決定", (d, x) -> done.onMask(ChangeMask.fromAlpha(mask)))
+                .setNeutralButton("全体に戻す", (d, x) -> done.onMask(null))
+                .setNegativeButton("キャンセル", null)
+                .show();
+    }
+
     /** Common end of a generation. Shows the last finished image (drops a leftover preview). */
     private void finishGeneration(String status) {
         generating = false;
@@ -2669,6 +2864,7 @@ public class MainActivity extends Activity {
                 appendLogUi("入力画像を選択 (" + bmp.getWidth() + "x" + bmp.getHeight() + "、中央を正方形に切り抜き)");
                 runOnUiThread(() -> {
                     initBitmap = bmp;
+                    setInitMask(null);
                     initThumb.setImageBitmap(bmp);
                     initThumbHint.setVisibility(View.GONE);
                     setStatus("入力画像を選択しました — 変化量を調整して「生成する」");
