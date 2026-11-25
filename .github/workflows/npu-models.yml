@@ -1,9 +1,15 @@
 name: NPU models (ONNX export)
 
-# 手動実行のみ。DreamShaper 8 LCM + TAESD を NPU (ONNX Runtime QNN EP) 用の静的形状 ONNX に
+# 手動実行、または NPU スクリプト変更時。DreamShaper 8 LCM + TAESD を NPU (ONNX Runtime QNN EP) 用の静的形状 ONNX に
 # 書き出し、CPU の参照パイプラインで画像が正しく出ることを確かめて成果物にする。
 on:
   workflow_dispatch:
+  # workflow_dispatch only works once this file is on the default branch; until then (and when the
+  # export changes) run on pushes that touch it.
+  push:
+    paths:
+      - 'scripts/npu/**'
+      - '.github/workflows/npu-models.yml'
 
 jobs:
   export:
