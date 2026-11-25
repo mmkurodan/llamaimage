@@ -72,14 +72,18 @@ jobs:
         # injected signing は使わず、app/build.gradle の署名設定を使う
         run: ./gradlew --no-daemon --console=plain bundleRelease
 
-      # libsd_jni.so (armv8-a) と libsd_jni_fp16.so (armv8.2-a+fp16+dotprod, :sdjni-fp16) の
-      # 両方が APK に入っていることを確認する (実行時に CPU 機能で選択される)。
+      # libsd_jni.so (armv8-a)・libsd_jni_fp16.so (armv8.2-a+fp16+dotprod, :sdjni-fp16)・
+      # libsd_jni_gpu.so (fp16 + OpenCL, :sdjni-gpu) が APK に入り、リンク専用の ICD ローダー
+      # libOpenCL.so が入っていないことを確認する (実行時に端末の OpenCL / CPU 機能で選択される)。
       - name: Verify native libraries in APKs
         run: |
           for apk in app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/release/app-release.apk; do
-            for lib in libsd_jni.so libsd_jni_fp16.so; do
+            for lib in libsd_jni.so libsd_jni_fp16.so libsd_jni_gpu.so; do
               unzip -l "$apk" "lib/arm64-v8a/$lib" > /dev/null || { echo "::error::$lib missing in $apk"; exit 1; }
             done
+            if unzip -l "$apk" 'lib/*/libOpenCL.so' > /dev/null 2>&1; then
+              echo "::error::libOpenCL.so (ICD loader) must not be packaged in $apk"; exit 1
+            fi
             echo "$apk:"; unzip -l "$apk" 'lib/*' | awk '$4 ~ /\.so$/ {print "  " $1 " " $4}'
           done
 

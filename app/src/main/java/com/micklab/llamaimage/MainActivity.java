@@ -76,6 +76,7 @@ public class MainActivity extends Activity {
     static final String PREFS_TAESD_LEGACY = "taesd_path";   // old versions: picked file path
     static final String PREFS_USE_TAESD = "use_taesd";
     static final String PREFS_VAE_TILING = "vae_tiling";
+    static final String PREFS_USE_GPU = "use_gpu";
     static final String PREFS_MODEL_ID = "model_id";
     static final String PREFS_PENDING_MODEL = "pending_model_id";  // select after download
     static final String PREFS_STEPS = "steps";
@@ -121,6 +122,7 @@ public class MainActivity extends Activity {
     private boolean nsfwRestriction = false;
     private boolean useTaesd = false;
     private boolean vaeTiling = false;
+    private boolean useGpu = false;           // OpenCL GPU backend (only if the library has a device)
     private int selectedSize = 512;
 
     // --- UI state (main thread) ---
@@ -1503,8 +1505,9 @@ public class MainActivity extends Activity {
     private SdModelManager.LoadConfig buildLoadConfig(File modelFile) {
         File taesd = useTaesd ? store.installedTaesd() : null;
         int threads = nThreads > 0 ? nThreads : CpuInfo.defaultThreads();
+        boolean gpu = useGpu && manager != null && !manager.gpuDevice().isEmpty();
         return new SdModelManager.LoadConfig(modelFile.getAbsolutePath(), threads, wtype,
-                taesd != null ? taesd.getAbsolutePath() : "", vaeTiling);
+                taesd != null ? taesd.getAbsolutePath() : "", vaeTiling, gpu);
     }
 
     /**
@@ -1558,9 +1561,15 @@ public class MainActivity extends Activity {
                 loading = false;
                 if (e.isEmpty()) {
                     appendLog("モデル読込成功: " + spec.title + " (" + (ms / 1000) + "s, "
+                            + (cfg.useGpu ? "GPU " + manager.activeBackend() + ", " : "CPU ")
                             + cfg.threads + "スレッド" + wtypeSuffix()
                             + (cfg.taesdPath.isEmpty() ? "" : ", TAESD") + (cfg.vaeTiling ? ", VAEタイル" : "") + ")");
                     setStatus("準備完了 — プロンプトを入力して「生成する」");
+                } else if (cfg.useGpu) {
+                    // GPU load failed (driver / memory): fall back to the CPU and remember it.
+                    appendLog("GPU での読込に失敗したため CPU に切り替えます: " + e);
+                    useGpu = false;
+                    saveGenSettings();
                 } else {
                     appendLog("モデル読込失敗: " + e);
                     setStatus("読込失敗: " + e);
@@ -1903,6 +1912,22 @@ public class MainActivity extends Activity {
         addHint(c, "仕上げの VAE デコードが数十倍速くなり省メモリ（細部はわずかに甘くなる）。"
                 + (store.installedTaesd() == null ? "初回のみ " + ModelCatalog.TAESD.sizeLabel() + " をダウンロード。" : ""));
 
+        final String gpuDev = manager != null ? manager.gpuDevice() : "";
+        final boolean[] selGpu = {useGpu && !gpuDev.isEmpty()};
+        addLabel(c, "GPU で生成（OpenCL）", dp(12));
+        Button gpuBtn = new Button(this);
+        gpuBtn.setText(onOff("GPU", selGpu[0]));
+        gpuBtn.setEnabled(!gpuDev.isEmpty());
+        gpuBtn.setOnClickListener(v -> {
+            selGpu[0] = !selGpu[0];
+            gpuBtn.setText(onOff("GPU", selGpu[0]));
+        });
+        c.addView(gpuBtn);
+        addHint(c, gpuDev.isEmpty()
+                ? "この端末では GPU（OpenCL）を利用できません。"
+                : "デバイス: " + gpuDev + "。モデルを GPU で実行します（切替時は再読込）。"
+                        + "読込に失敗した場合は自動で CPU に戻ります。");
+
         final boolean[] selTiling = {vaeTiling};
         addLabel(c, "省メモリ VAE（タイル処理）", dp(12));
         Button tileBtn = new Button(this);
@@ -1957,6 +1982,7 @@ public class MainActivity extends Activity {
                     nsfwRestriction = selNsfw[0];
                     useTaesd = selTaesd[0];
                     vaeTiling = selTiling[0];
+                    useGpu = selGpu[0];
                     saveGenSettings();
                     persistInputs();
                     Toast.makeText(this, "生成設定を保存しました", Toast.LENGTH_SHORT).show();
@@ -2248,6 +2274,7 @@ public class MainActivity extends Activity {
         // On by default: the final decode drops from ~28s to ~2s at 512px with near-identical output.
         // (Old versions stored a picked TAESD file path; ModelStore adopts that file.)
         useTaesd = p.getBoolean(PREFS_USE_TAESD, true);
+        useGpu = p.getBoolean(PREFS_USE_GPU, false);
         vaeTiling = p.getBoolean(PREFS_VAE_TILING, CpuInfo.totalRamBytes(this) > 0
                 && CpuInfo.totalRamBytes(this) < LOW_RAM_BYTES);
     }
@@ -2262,6 +2289,7 @@ public class MainActivity extends Activity {
                 .putInt(PREFS_SIZE, selectedSize)
                 .putBoolean(PREFS_USE_TAESD, useTaesd)
                 .putBoolean(PREFS_VAE_TILING, vaeTiling)
+                .putBoolean(PREFS_USE_GPU, useGpu)
                 .remove(PREFS_TAESD_LEGACY)
                 .apply();
     }

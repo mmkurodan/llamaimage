@@ -58,7 +58,12 @@ public final class CpuInfo {
      */
     public static List<String> nativeLibraryCandidates() {
         List<String> libs = new ArrayList<>();
-        if (hasFp16AndDotprod()) libs.add("sd_jni_fp16");
+        if (hasFp16AndDotprod()) {
+            // fp16 kernels + OpenCL GPU backend. Links the vendor libOpenCL.so, so it fails to load
+            // (UnsatisfiedLinkError) on devices without OpenCL and the CPU-only library is used.
+            libs.add("sd_jni_gpu");
+            libs.add("sd_jni_fp16");
+        }
         libs.add("sd_jni");
         return libs;
     }

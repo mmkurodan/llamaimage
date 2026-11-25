@@ -230,8 +230,9 @@ public final class ApiGenerator {
         long ram = CpuInfo.totalRamBytes(app);
         boolean vaeTiling = p.getBoolean(MainActivity.PREFS_VAE_TILING,
                 ram > 0 && ram < MainActivity.LOW_RAM_BYTES);
+        boolean gpu = p.getBoolean(MainActivity.PREFS_USE_GPU, false) && !manager.gpuDevice().isEmpty();
         SdModelManager.LoadConfig cfg = new SdModelManager.LoadConfig(file.getAbsolutePath(),
-                threads, wtype, taesd != null ? taesd.getAbsolutePath() : "", vaeTiling);
+                threads, wtype, taesd != null ? taesd.getAbsolutePath() : "", vaeTiling, gpu);
         if (!manager.isLoaded(cfg)) {
             log("API: loading model " + spec.title);
             store.ensureVerified(spec, file, pct -> { });

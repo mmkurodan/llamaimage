@@ -8,6 +8,9 @@
 /app/.cxx/
 /sdjni-fp16/build/
 /sdjni-fp16/.cxx/
+/sdjni-gpu/build/
+/sdjni-gpu/.cxx/
+/app/src/main/cpp/opencl/
 local.properties
 *.iml
 .idea/

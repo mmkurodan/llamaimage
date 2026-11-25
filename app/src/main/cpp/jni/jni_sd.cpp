@@ -1,18 +1,16 @@
 // JNI bridge for stable-diffusion.cpp (SD1.x / SD2.x txt2img + img2img).
 //
-// Mirrors the design of the LLM AI Server's jni_llama.cpp: a single global engine context,
-// dynamic JNI naming (Java_<pkg>_<class>_<method>), a String-returning init that yields "" on
-// success / an error message on failure, and progress/preview callbacks bridged back to Java.
-// CPU backend only (see CMakeLists.txt). The same source is built once per CPU variant
-// (SD_JNI_VARIANT, e.g. baseline armv8-a vs. armv8.2-a+fp16+dotprod); Java picks the library.
+// Targets the option-based C API of stable-diffusion.cpp (sd_ctx_opt_t / sd_img_gen_opt_t,
+// pinned in scripts/fetch-sdcpp.sh). Cancellation, staged progress and latent previews are
+// built into that API, so the engine is used unpatched.
 //
-// Relies on the out-of-tree sd.cpp hooks applied by scripts/patch-sdcpp.sh:
-//   g_sd_step_latent  current denoised latent during a sampling-step callback (preview)
-//   g_sd_phase        1 = sampling steps, 2 = VAE decode tiles (both share the progress callback)
-//   sd_unwind_cleanup frees work buffers when the cancel exception unwinds through sd.cpp
+// One global engine context (like the LLM AI Server's single model), dynamic JNI naming
+// (Java_<pkg>_<class>_<method>), a String-returning init that yields "" on success / an error
+// message on failure, and progress/preview callbacks bridged back to Java.
 //
-// Also compiles on a host toolchain so the bridge can be sanity-checked off-device
-// (android/log.h usage is guarded by __ANDROID__).
+// The same source is built once per library variant (SD_JNI_VARIANT): CPU baseline, CPU
+// fp16+dotprod and fp16+OpenCL (SD_JNI_GPU). The GPU variant can still run on the CPU — the
+// backend is chosen per model load (nativeInit useGpu), Java picks the library.
 
 #include <jni.h>
 
@@ -21,7 +19,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <mutex>
 #include <random>
 #include <string>
@@ -29,8 +26,6 @@
 #include <vector>
 
 #include "stable-diffusion.h"
-#include "util.h"                     // g_sd_step_latent, g_sd_phase (scripts/patch-sdcpp.sh)
-#include "ggml/include/ggml.h"        // ggml_tensor for latent preview
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -50,30 +45,27 @@
 
 // Progress phases reported to Java (must match StableDiffusionNative.PHASE_*).
 static const int kPhaseSampling = 1;
-[[maybe_unused]] static const int kPhaseDecode = 2;   // VAE-decode tiles (only forwarded)
+static const int kPhaseDecode   = 2;
 
 // ---------------------------------------------------------------------------
-// Global engine state (single context, like ModelManager's single model).
+// Global engine state (single context).
 // ---------------------------------------------------------------------------
-static std::mutex          g_mutex;               // serializes init / generate / free
-static sd_ctx_t*           g_ctx = nullptr;
-static std::atomic<int64_t> g_last_seed{-1};
-static std::atomic<bool>   g_cancel{false};       // set by nativeCancel, cleared by nativeClearCancel
-static std::atomic<bool>   g_cancelled{false};    // last generate ended because of a cancel
-static std::mutex          g_err_mutex;
-static std::string         g_last_error;          // last native error (e.g. out-of-memory)
+static std::mutex             g_mutex;               // serializes init / generate / free
+static std::atomic<sd_ctx_t*> g_ctx{nullptr};        // atomic: nativeCancel reads it without g_mutex
+static std::atomic<int64_t>   g_last_seed{-1};
+static std::atomic<bool>      g_cancel{false};       // set by nativeCancel, cleared by nativeClearCancel
+static std::atomic<bool>      g_cancelled{false};    // last generate ended because of a cancel
+static std::mutex             g_err_mutex;
+static std::string            g_last_error;          // last native error (e.g. out-of-memory)
+static std::string            g_backend = "CPU";     // backend of the loaded model (guarded by g_mutex)
 
-static JavaVM*             g_vm = nullptr;
-static std::mutex          g_listener_mutex;      // guards the listener ref + method ids
-static jobject             g_listener = nullptr;  // global ref, may be null
-static jmethodID           g_on_progress = nullptr;  // void onProgress(int phase, int step, int steps)
-static jmethodID           g_on_preview  = nullptr;  // void onPreview(byte[] rgb, int w, int h)
-static std::mutex          g_log_mutex;
-static std::string         g_log_path;            // optional log file (INFO and above)
-
-// Thrown from the progress callback to abort sampling; caught in nativeTxt2img/nativeImg2img.
-// Deliberately not derived from std::exception so nothing in between can mistake it for an error.
-struct sd_jni_cancelled {};
+static JavaVM*     g_vm = nullptr;
+static std::mutex  g_listener_mutex;                 // guards the listener ref + method ids
+static jobject     g_listener = nullptr;             // global ref, may be null
+static jmethodID   g_on_progress = nullptr;          // void onProgress(int phase, int step, int steps)
+static jmethodID   g_on_preview  = nullptr;          // void onPreview(byte[] rgb, int w, int h)
+static std::mutex  g_log_mutex;
+static std::string g_log_path;                       // optional log file (INFO and above)
 
 static void set_error(const std::string& e) {
     std::lock_guard<std::mutex> lk(g_err_mutex);
@@ -81,21 +73,7 @@ static void set_error(const std::string& e) {
 }
 
 // ---------------------------------------------------------------------------
-// Latent → RGB approximation (the widely used SD1.x/2.x "cheap approximation";
-// keturn, also used by A1111/ComfyUI previews): rgb = latent · coeff, image = rgb * 0.5 + 0.5.
-// Maps the 4 latent channels to RGB at latent resolution (W/8 x H/8).
-// ---------------------------------------------------------------------------
-static const float kLatentRgbCoeff[4][3] = {
-    //    R        G        B
-    { 0.298f,  0.207f,  0.208f },   // L0
-    { 0.187f,  0.286f,  0.173f },   // L1
-    {-0.158f,  0.189f,  0.264f },   // L2
-    {-0.184f, -0.271f, -0.473f },   // L3
-};
-
-// ---------------------------------------------------------------------------
-// Logging: forward sd.cpp log lines to logcat and (INFO and above) to a log file,
-// matching the parent app's "everything also goes to a log file" behaviour.
+// Logging: forward sd.cpp log lines to logcat and (INFO and above) to a log file.
 // ---------------------------------------------------------------------------
 static void sd_log_to_file(const char* text) {
     if (text == nullptr) {
@@ -108,6 +86,10 @@ static void sd_log_to_file(const char* text) {
     FILE* f = fopen(g_log_path.c_str(), "a");
     if (f) {
         fputs(text, f);
+        size_t n = strlen(text);
+        if (n == 0 || text[n - 1] != '\n') {
+            fputc('\n', f);
+        }
         fclose(f);
     }
 }
@@ -118,6 +100,7 @@ static void sd_log_cb(enum sd_log_level_t level, const char* text, void* /*data*
     }
     switch (level) {
         case SD_LOG_DEBUG:
+        case SD_LOG_VERBOSE:
             ALOGD("%s", text);
             return;  // per-tensor/buffer chatter: logcat only
         case SD_LOG_ERROR:
@@ -132,7 +115,7 @@ static void sd_log_cb(enum sd_log_level_t level, const char* text, void* /*data*
 
 // ---------------------------------------------------------------------------
 // UTF-16 (Java) -> standard UTF-8. GetStringUTFChars returns *modified* UTF-8 (surrogate pairs
-// as 6 bytes), which sd.cpp's tokenizer rejects (utf8_to_utf32 throws), so convert by hand.
+// as 6 bytes), which sd.cpp's tokenizer rejects, so convert by hand.
 // ---------------------------------------------------------------------------
 static std::string jstr(JNIEnv* env, jstring s) {
     std::string out;
@@ -173,92 +156,150 @@ static std::string jstr(JNIEnv* env, jstring s) {
 }
 
 // ---------------------------------------------------------------------------
-// Progress: sd.cpp invokes this synchronously on the generating thread (the Java worker thread
-// that called txt2img). g_sd_phase tells sampling steps (1) from VAE-decode tiles (2) — both use
-// this callback. During a sampling step g_sd_step_latent holds the current denoised latent,
-// which we turn into a lightweight RGB preview.
+// Callbacks into Java. sd.cpp calls them synchronously during sd_generate_image(); they may run
+// on an engine thread, so attach when needed. They must not throw (C API contract).
 // ---------------------------------------------------------------------------
-static void emit_preview(JNIEnv* env, const struct ggml_tensor* lat) {
-    if (g_on_preview == nullptr || lat == nullptr || lat->type != GGML_TYPE_F32) {
-        return;
-    }
-    const int W = (int)lat->ne[0];  // latent width  (image_w / 8)
-    const int H = (int)lat->ne[1];  // latent height (image_h / 8)
-    const int C = (int)lat->ne[2];  // 4 for SD1.x / SD2.x
-    if (W <= 0 || H <= 0 || C < 4) {
-        return;
-    }
-    std::vector<jbyte> rgb((size_t)W * H * 3);
-    for (int h = 0; h < H; ++h) {
-        for (int w = 0; w < W; ++w) {
-            float L[4];
-            for (int c = 0; c < 4; ++c) {
-                L[c] = *(const float*)((const char*)lat->data + c * lat->nb[2] + h * lat->nb[1] + w * lat->nb[0]);
-            }
-            for (int ch = 0; ch < 3; ++ch) {
-                float v = 0.0f;
-                for (int c = 0; c < 4; ++c) {
-                    v += kLatentRgbCoeff[c][ch] * L[c];
-                }
-                int iv = (int)((v * 0.5f + 0.5f) * 255.0f + 0.5f);
-                iv = iv < 0 ? 0 : (iv > 255 ? 255 : iv);
-                rgb[((size_t)h * W + w) * 3 + ch] = (jbyte)iv;
-            }
-        }
-    }
-    jbyteArray arr = env->NewByteArray((jsize)rgb.size());
-    if (arr == nullptr) {
-        env->ExceptionClear();
-        return;
-    }
-    env->SetByteArrayRegion(arr, 0, (jsize)rgb.size(), rgb.data());
-    env->CallVoidMethod(g_listener, g_on_preview, arr, W, H);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-    }
-    env->DeleteLocalRef(arr);
-}
-
-static void sd_progress_cb(int step, int steps, float /*time*/, void* /*data*/) {
-    const int phase = g_sd_phase;
-    // Cancel only between sampling steps: nothing is mid-flight there, and the unwind is cleaned
-    // up by sd_unwind_cleanup (patch-sdcpp.sh). The VAE decode is short and runs to completion.
-    if (phase == kPhaseSampling && g_cancel.load()) {
-        throw sd_jni_cancelled();
-    }
-    if (g_vm == nullptr) {
-        return;
-    }
+struct JniEnvScope {
     JNIEnv* env = nullptr;
     bool attached = false;
-    if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-#ifdef __ANDROID__
-        jint rc = g_vm->AttachCurrentThread(&env, nullptr);
-#else
-        jint rc = g_vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
-#endif
-        if (rc != JNI_OK) {
+    JniEnvScope() {
+        if (g_vm == nullptr) {
             return;
         }
-        attached = true;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_listener_mutex);
-        if (g_listener != nullptr) {
-            if (g_on_progress != nullptr) {
-                env->CallVoidMethod(g_listener, g_on_progress, phase, step, steps);
-                if (env->ExceptionCheck()) {
-                    env->ExceptionClear();
-                }
+        if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+#ifdef __ANDROID__
+            jint rc = g_vm->AttachCurrentThread(&env, nullptr);
+#else
+            jint rc = g_vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
+#endif
+            if (rc != JNI_OK) {
+                env = nullptr;
+                return;
             }
-            if (phase == kPhaseSampling && step > 0) {
-                emit_preview(env, g_sd_step_latent);
-            }
+            attached = true;
         }
     }
-    if (attached) {
-        g_vm->DetachCurrentThread();
+    ~JniEnvScope() {
+        if (attached) {
+            g_vm->DetachCurrentThread();
+        }
     }
+};
+
+// Generation progress events: stage "sampling" = denoising steps, anything after it (VAE
+// decode, tiles) is reported as the decode phase. Also where a pending cancel is applied.
+static void generation_progress_cb(const sd_generation_progress_t* p, void* /*data*/) {
+    if (p == nullptr) {
+        return;
+    }
+    if (g_cancel.load()) {
+        sd_ctx_t* ctx = g_ctx.load();
+        if (ctx != nullptr) {
+            sd_cancel_generation(ctx, SD_CANCEL_ALL);
+        }
+    }
+    const bool sampling = p->stage != nullptr && strcmp(p->stage, "sampling") == 0;
+    const bool decoding = p->stage != nullptr && (strstr(p->stage, "decode") != nullptr);
+    if (!sampling && !decoding) {
+        return;  // loading / conditioning / encode: not shown as steps
+    }
+    JniEnvScope scope;
+    if (scope.env == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_listener_mutex);
+    if (g_listener != nullptr && g_on_progress != nullptr) {
+        scope.env->CallVoidMethod(g_listener, g_on_progress, sampling ? kPhaseSampling : kPhaseDecode,
+                                  (jint)p->completed, (jint)p->total);
+        if (scope.env->ExceptionCheck()) {
+            scope.env->ExceptionClear();
+        }
+    }
+}
+
+// Latent previews ("proj" mode: a cheap latent -> RGB projection at latent resolution).
+// frames[0] is a U8 [C, W, H] tensor, i.e. interleaved RGB rows.
+static void preview_cb(int /*step*/, int frame_count, const sd_tensor_t* const* frames, bool /*is_noisy*/,
+                       void* /*data*/) {
+    if (frame_count < 1 || frames == nullptr || frames[0] == nullptr) {
+        return;
+    }
+    const sd_tensor_t* t = frames[0];
+    if (sd_tensor_type(t) != SD_TENSOR_U8 || sd_tensor_rank(t) < 3) {
+        return;
+    }
+    const int C = (int)sd_tensor_dim(t, 0);
+    const int W = (int)sd_tensor_dim(t, 1);
+    const int H = (int)sd_tensor_dim(t, 2);
+    if (C < 3 || W <= 0 || H <= 0) {
+        return;
+    }
+    const uint8_t* src = static_cast<const uint8_t*>(sd_tensor_data(t));
+    std::vector<jbyte> rgb((size_t)W * H * 3);
+    for (size_t i = 0; i < (size_t)W * H; ++i) {
+        rgb[i * 3 + 0] = (jbyte)src[i * C + 0];
+        rgb[i * 3 + 1] = (jbyte)src[i * C + 1];
+        rgb[i * 3 + 2] = (jbyte)src[i * C + 2];
+    }
+    JniEnvScope scope;
+    if (scope.env == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_listener_mutex);
+    if (g_listener == nullptr || g_on_preview == nullptr) {
+        return;
+    }
+    jbyteArray arr = scope.env->NewByteArray((jsize)rgb.size());
+    if (arr == nullptr) {
+        scope.env->ExceptionClear();
+        return;
+    }
+    scope.env->SetByteArrayRegion(arr, 0, (jsize)rgb.size(), rgb.data());
+    scope.env->CallVoidMethod(g_listener, g_on_preview, arr, W, H);
+    if (scope.env->ExceptionCheck()) {
+        scope.env->ExceptionClear();
+    }
+    scope.env->DeleteLocalRef(arr);
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+// Lines of "name<TAB>description" from sd_list_devices().
+static std::vector<std::pair<std::string, std::string>> list_devices() {
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t need = sd_list_devices(nullptr, 0);
+    if (need == 0) {
+        return out;
+    }
+    std::string buf(need + 1, '\0');
+    sd_list_devices(&buf[0], buf.size());
+    buf.resize(strlen(buf.c_str()));
+    size_t pos = 0;
+    while (pos < buf.size()) {
+        size_t nl = buf.find('\n', pos);
+        std::string line = buf.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = nl == std::string::npos ? buf.size() : nl + 1;
+        if (line.empty()) {
+            continue;
+        }
+        size_t tab = line.find('\t');
+        out.emplace_back(line.substr(0, tab), tab == std::string::npos ? "" : line.substr(tab + 1));
+    }
+    return out;
+}
+
+// First non-CPU device name (e.g. the Adreno OpenCL device), or "" if none.
+static std::string first_gpu_device() {
+    for (const auto& d : list_devices()) {
+        std::string lower = d.first;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.rfind("cpu", 0) != 0) {
+            return d.first;
+        }
+    }
+    return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -267,14 +308,34 @@ static void sd_progress_cb(int step, int steps, float /*time*/, void* /*data*/) 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
     g_vm = vm;
     sd_set_log_callback(sd_log_cb, nullptr);
-    sd_set_progress_callback(sd_progress_cb, nullptr);
+    // Preview every denoised step as a cheap latent projection (no extra decoder run).
+    sd_set_preview_callback(preview_cb, "proj", 1, true, false, nullptr);
     return JNI_VERSION_1_6;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeSystemInfo(JNIEnv* env, jobject) {
-    std::string info = std::string("libsd_jni variant: ") + SD_JNI_VARIANT + "\n" + sd_get_system_info();
+    std::string info = std::string("libsd_jni variant: ") + SD_JNI_VARIANT + " / sd.cpp " + sd_version() + " ("
+                       + sd_commit() + ")\n" + sd_get_system_info();
+    auto devs = list_devices();
+    info += "\ndevices:";
+    for (const auto& d : devs) {
+        info += " [" + d.first + (d.second.empty() ? "" : ": " + d.second) + "]";
+    }
     return env->NewStringUTF(info.c_str());
+}
+
+// Name of a usable GPU device in this library ("" = CPU only / no OpenCL).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeGpuDevice(JNIEnv* env, jobject) {
+    return env->NewStringUTF(first_gpu_device().c_str());
+}
+
+// Backend the current model was loaded on ("CPU" or the GPU device name).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_micklab_llamaimage_StableDiffusionNative_nativeActiveBackend(JNIEnv* env, jobject) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return env->NewStringUTF(g_ctx.load() == nullptr ? "" : g_backend.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -313,14 +374,32 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeSetListener(JNIEnv* env,
     g_listener = env->NewGlobalRef(listener);
 }
 
+static std::string last_sd_error(const char* fallback) {
+    const char* e = sd_get_last_error();
+    return (e != nullptr && *e) ? std::string(e) : std::string(fallback);
+}
+
+static void free_ctx_locked() {
+    sd_ctx_t* ctx = g_ctx.exchange(nullptr);
+    if (ctx != nullptr) {
+        sd_set_generation_progress_callback(ctx, nullptr, nullptr);
+        sd_ctx_free(ctx);
+    }
+    g_backend = "CPU";
+}
+
 // Load a single-file SD checkpoint (GGUF/safetensors/ckpt). Returns "" on success or an error.
 // wtype: an sd_type_t to re-quantize weights to at load (<0 keeps the file's types).
 // taesdPath: optional TAESD weights for a fast, low-memory final VAE decode ("" = full VAE).
-// vaeTiling: decode the VAE in tiles (caps peak memory; costs ~2x decode time at 512px).
+// vaeTiling: kept for API compatibility; tiling is applied per generation (g_vae_tiling).
+// useGpu: run the model graphs on the first GPU device of this library (falls back to an error
+// if there is none — Java then reloads on the CPU).
+static std::atomic<bool> g_vae_tiling{false};
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobject, jstring modelPath,
                                                              jint nThreads, jint wtype, jstring taesdPath,
-                                                             jboolean vaeTiling) {
+                                                             jboolean vaeTiling, jboolean useGpu) {
     std::lock_guard<std::mutex> lk(g_mutex);
     std::string model = jstr(env, modelPath);
     if (model.empty()) {
@@ -328,71 +407,71 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeInit(JNIEnv* env, jobjec
     }
     std::string taesd = jstr(env, taesdPath);
     set_error("");
+    free_ctx_locked();
+    g_vae_tiling = vaeTiling == JNI_TRUE;
 
-    // Free + recreate inside try/catch so a failure (e.g. std::bad_alloc on a large
-    // model) surfaces as an error string instead of crashing the process.
-    try {
-        if (g_ctx != nullptr) {
-            free_sd_ctx(g_ctx);
-            g_ctx = nullptr;
-        }
-
-        int threads = nThreads;
-        if (threads <= 0) {
-            // Java normally passes an explicit count (performance cores). Note: sd.cpp's own
-            // get_num_physical_cores() mis-builds its sysfs path at this pin and returns n/2.
-            unsigned hc = std::thread::hardware_concurrency();
-            threads = hc > 0 ? (int)hc : 4;
-        }
-
-        // <0 or out-of-range -> keep original weight types (SD_TYPE_COUNT).
-        sd_type_t wt = (wtype >= 0 && wtype < SD_TYPE_COUNT) ? (sd_type_t)wtype : SD_TYPE_COUNT;
-
-        ALOGI("init: model=%s threads=%d wtype=%d taesd=%s vae_tiling=%d variant=%s",
-              model.c_str(), threads, (int)wtype, taesd.empty() ? "-" : taesd.c_str(),
-              vaeTiling ? 1 : 0, SD_JNI_VARIANT);
-
-        // Single-file checkpoint: only model_path is set, everything else is empty.
-        g_ctx = new_sd_ctx(
-            model.c_str(),
-            "",            // clip_l_path
-            "",            // clip_g_path
-            "",            // t5xxl_path
-            "",            // diffusion_model_path
-            "",            // vae_path
-            taesd.c_str(), // taesd_path ("" = full VAE)
-            "",            // control_net_path
-            "",            // lora_model_dir
-            "",            // embed_dir
-            "",            // stacked_id_embed_dir
-            false,         // vae_decode_only=false: load the VAE encoder too, so img2img works
-            vaeTiling == JNI_TRUE,  // vae_tiling: only on low-RAM devices (Java decides)
-            false,         // free_params_immediately: keep weights for repeated generations
-            threads,       // n_threads
-            wt,            // wtype
-            STD_DEFAULT_RNG,
-            DEFAULT,       // schedule
-            false,         // keep_clip_on_cpu
-            false,         // keep_control_net_cpu
-            false,         // keep_vae_on_cpu
-            false);        // diffusion_flash_attn: no gain on CPU at this pin (SD1.x never engages it)
-    } catch (const std::exception& e) {
-        g_ctx = nullptr;
-        set_error(std::string("init 例外: ") + e.what());
-    } catch (...) {
-        g_ctx = nullptr;
-        set_error("init 不明な例外");
+    int threads = nThreads;
+    if (threads <= 0) {
+        unsigned hc = std::thread::hardware_concurrency();
+        threads = hc > 0 ? (int)hc : 4;
     }
-
-    if (g_ctx == nullptr) {
-        std::string err;
-        {
-            std::lock_guard<std::mutex> elk(g_err_mutex);
-            err = g_last_error.empty() ? "new_sd_ctx failed (see log)" : g_last_error;
+    std::string backend = "cpu";
+    if (useGpu == JNI_TRUE) {
+        backend = first_gpu_device();
+        if (backend.empty()) {
+            std::string err = "GPU デバイスが見つかりません（OpenCL 非対応）";
+            set_error(err);
+            return env->NewStringUTF(err.c_str());
         }
+    }
+    ALOGI("init: model=%s threads=%d wtype=%d taesd=%s vae_tiling=%d backend=%s variant=%s", model.c_str(), threads,
+          (int)wtype, taesd.empty() ? "-" : taesd.c_str(), vaeTiling ? 1 : 0, backend.c_str(), SD_JNI_VARIANT);
+
+    std::string err;
+    sd_ctx_opt_t* opt = sd_ctx_opt_create();
+    sd_ctx_t* ctx = nullptr;
+    auto check = [&](sd_status_t st, const char* what) {
+        if (st != SD_STATUS_OK && err.empty()) {
+            err = std::string(what) + ": " + last_sd_error("error");
+        }
+    };
+    if (opt == nullptr) {
+        err = "オプションを確保できません";
+    } else {
+        check(sd_opt_set_string(opt, "model_path", model.c_str()), "model_path");
+        check(sd_opt_set_int(opt, "n_threads", threads), "n_threads");
+        check(sd_opt_set_string(opt, "backend", backend.c_str()), "backend");
+        check(sd_opt_set_string(opt, "rng_type", "std_default"), "rng_type");
+        check(sd_opt_set_bool(opt, "eager_load", true), "eager_load");   // load now, not on first generate
+        if (!taesd.empty()) {
+            check(sd_opt_set_string(opt, "taesd_path", taesd.c_str()), "taesd_path");
+        }
+        if (wtype >= 0 && wtype < SD_TYPE_COUNT) {
+            check(sd_opt_set_string(opt, "wtype", sd_type_name((sd_type_t)wtype)), "wtype");
+        }
+        if (err.empty()) {
+            check(sd_ctx_create(opt, &ctx), "sd_ctx_create");
+        }
+        sd_opt_free(opt);
+    }
+    if (err.empty() && ctx != nullptr && !sd_ctx_supports_image_generation(ctx)) {
+        err = "このモデルは画像生成に対応していません: " + last_sd_error(sd_get_model_version_name(ctx));
+    }
+    if (!err.empty() || ctx == nullptr) {
+        if (ctx != nullptr) {
+            sd_ctx_free(ctx);
+        }
+        if (err.empty()) {
+            err = "sd_ctx_create failed (see log)";
+        }
+        set_error(err);
         ALOGE("%s", err.c_str());
+        sd_log_to_file(err.c_str());
         return env->NewStringUTF(err.c_str());
     }
+    sd_set_generation_progress_callback(ctx, generation_progress_cb, nullptr);
+    g_backend = backend == "cpu" ? "CPU" : backend;
+    g_ctx = ctx;
     return env->NewStringUTF("");
 }
 
@@ -404,39 +483,118 @@ static int64_t resolve_seed(jlong seed) {
     return (int64_t)(rng() & 0x7FFFFFFFULL);
 }
 
-static sample_method_t resolve_method(jint m) {
-    return (m >= 0 && m < N_SAMPLE_METHODS) ? (sample_method_t)m : EULER_A;
+// Must match StableDiffusionNative.SAMPLE_*.
+static const char* method_name(jint m) {
+    switch (m) {
+        case 1: return "euler";
+        case 5: return "dpm++2m";
+        case 9: return "lcm";
+        default: return "euler_a";
+    }
 }
 
-// Copies the first result image into a Java byte[] and frees the sd.cpp result.
-static jbyteArray take_result(JNIEnv* env, sd_image_t* results, const char* what) {
-    if (results == nullptr || results[0].data == nullptr) {
-        set_error(std::string(what) + ": 画像が生成されませんでした（ログ参照）");
-        ALOGE("%s returned no image", what);
-        if (results) {
-            free(results);
-        }
-        return nullptr;
-    }
-    const jsize n_bytes = (jsize)(results[0].width * results[0].height * results[0].channel);
-    jbyteArray arr = env->NewByteArray(n_bytes);
-    if (arr != nullptr) {
-        env->SetByteArrayRegion(arr, 0, n_bytes, reinterpret_cast<const jbyte*>(results[0].data));
-    } else {
-        env->ExceptionClear();
-        set_error(std::string(what) + ": 結果バッファを確保できませんでした");
-    }
-    free(results[0].data);
-    free(results);
-    return arr;
-}
-
-// Records an exception escaping sd.cpp. Returns nullptr for convenient `return fail(...)`.
+// Records an error. Returns nullptr for convenient `return fail(...)`.
 static jbyteArray fail(const std::string& msg) {
     set_error(msg);
     ALOGE("%s", msg.c_str());
-    sd_log_to_file((msg + "\n").c_str());
+    sd_log_to_file(msg.c_str());
     return nullptr;
+}
+
+// Runs one generation (init_rgb == nullptr -> txt2img). Returns width*height*3 RGB bytes, or
+// null on failure / cancel. Caller holds g_mutex.
+static jbyteArray generate_locked(JNIEnv* env, const char* what, const std::string& prompt,
+                                  const std::string& negative, int width, int height, int steps, float cfg,
+                                  int64_t seed, jint method, int clip_skip, const std::vector<uint8_t>* init_rgb,
+                                  float strength) {
+    sd_ctx_t* ctx = g_ctx.load();
+    if (ctx == nullptr) {
+        return fail(std::string(what) + ": モデルが読み込まれていません");
+    }
+    sd_img_gen_opt_t* opt = sd_img_gen_opt_create();
+    if (opt == nullptr) {
+        return fail(std::string(what) + ": オプションを確保できません");
+    }
+    std::string err;
+    auto check = [&](sd_status_t st, const char* key) {
+        if (st != SD_STATUS_OK && err.empty()) {
+            err = std::string(key) + ": " + last_sd_error("error");
+        }
+    };
+    sd_tensor_t* init = nullptr;
+    check(sd_opt_set_string(opt, "prompt", prompt.c_str()), "prompt");
+    check(sd_opt_set_string(opt, "negative_prompt", negative.c_str()), "negative_prompt");
+    check(sd_opt_set_int(opt, "width", width), "width");
+    check(sd_opt_set_int(opt, "height", height), "height");
+    check(sd_opt_set_int(opt, "sample.steps", steps), "sample.steps");
+    check(sd_opt_set_string(opt, "sample.method", method_name(method)), "sample.method");
+    check(sd_opt_set_float(opt, "sample.guidance.txt_cfg", cfg), "txt_cfg");
+    check(sd_opt_set_int(opt, "seed", seed), "seed");
+    if (clip_skip > 0) {
+        check(sd_opt_set_int(opt, "clip_skip", clip_skip), "clip_skip");
+    }
+    if (g_vae_tiling.load()) {
+        check(sd_opt_set_bool(opt, "vae_tiling.enabled", true), "vae_tiling.enabled");
+    }
+    if (init_rgb != nullptr) {
+        const int64_t shape[3] = {3, width, height};
+        init = sd_tensor_create(SD_TENSOR_U8, 3, shape, init_rgb->data(), init_rgb->size());
+        if (init == nullptr) {
+            err = "init_image: " + last_sd_error("tensor");
+        } else {
+            check(sd_opt_set_tensor(opt, "init_image", init), "init_image");
+            check(sd_opt_set_float(opt, "strength", strength), "strength");
+        }
+    }
+    if (!err.empty()) {
+        if (init) sd_tensor_free(init);
+        sd_opt_free(opt);
+        return fail(std::string(what) + ": " + err);
+    }
+
+    sd_cancel_generation(ctx, SD_CANCEL_RESET);
+    sd_result_t* result = nullptr;
+    sd_status_t st = g_cancel.load() ? SD_STATUS_CANCELLED : sd_generate_image(ctx, opt, &result);
+    if (init) sd_tensor_free(init);
+    sd_opt_free(opt);
+
+    if (st == SD_STATUS_CANCELLED || (st != SD_STATUS_OK && g_cancel.load())) {
+        sd_result_free(result);
+        g_cancelled = true;
+        set_error("cancelled");
+        return nullptr;
+    }
+    if (st != SD_STATUS_OK || result == nullptr || sd_result_get_image_count(result) < 1) {
+        std::string e = last_sd_error("画像が生成されませんでした（ログ参照）");
+        sd_result_free(result);
+        return fail(std::string(what) + ": " + e);
+    }
+    const sd_tensor_t* img = sd_result_get_image(result, 0);
+    const int C = (int)sd_tensor_dim(img, 0);
+    const int W = (int)sd_tensor_dim(img, 1);
+    const int H = (int)sd_tensor_dim(img, 2);
+    const uint8_t* src = static_cast<const uint8_t*>(sd_tensor_data(img));
+    jbyteArray arr = nullptr;
+    if (C >= 3 && W == width && H == height && src != nullptr) {
+        std::vector<jbyte> rgb((size_t)W * H * 3);
+        for (size_t i = 0; i < (size_t)W * H; ++i) {
+            rgb[i * 3 + 0] = (jbyte)src[i * C + 0];
+            rgb[i * 3 + 1] = (jbyte)src[i * C + 1];
+            rgb[i * 3 + 2] = (jbyte)src[i * C + 2];
+        }
+        arr = env->NewByteArray((jsize)rgb.size());
+        if (arr != nullptr) {
+            env->SetByteArrayRegion(arr, 0, (jsize)rgb.size(), rgb.data());
+        } else {
+            env->ExceptionClear();
+            set_error(std::string(what) + ": 結果バッファを確保できませんでした");
+        }
+    } else {
+        set_error(std::string(what) + ": 想定外の出力形式 (" + std::to_string(C) + "x" + std::to_string(W) + "x"
+                  + std::to_string(H) + ")");
+    }
+    sd_result_free(result);
+    return arr;
 }
 
 // txt2img -> returns width*height*3 RGB bytes, or null on failure / cancel.
@@ -449,62 +607,15 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeTxt2img(
     std::lock_guard<std::mutex> lk(g_mutex);
     set_error("");
     g_cancelled = false;
-    if (g_ctx == nullptr) {
-        return fail("txt2img: モデルが読み込まれていません");
-    }
-    std::string p = jstr(env, prompt);
-    std::string n = jstr(env, negativePrompt);
     const int64_t used_seed = resolve_seed(seed);
     g_last_seed = used_seed;
-
-    sd_image_t* results = nullptr;
-    g_sd_phase = 0;
-    try {
-        if (g_cancel.load()) {
-            throw sd_jni_cancelled();
-        }
-        results = txt2img(
-            g_ctx,
-            p.c_str(),
-            n.c_str(),
-            clipSkip,          // clip_skip (<=0 == model default)
-            cfgScale,          // cfg_scale (1.0 skips the unconditional pass)
-            3.5f,              // guidance (flux-only; ignored)
-            width,
-            height,
-            resolve_method(sampleMethod),
-            steps,
-            used_seed,
-            1,                 // batch_count
-            nullptr,           // control_cond
-            0.9f,              // control_strength
-            20.0f,             // style_strength (pmid-only)
-            false,             // normalize_input
-            "",                // input_id_images_path
-            nullptr,           // skip_layers
-            0,                 // skip_layers_count
-            0.0f,              // slg_scale
-            0.01f,             // skip_layer_start
-            0.2f);             // skip_layer_end
-    } catch (const sd_jni_cancelled&) {
-        g_sd_phase = 0;
-        g_cancelled = true;
-        set_error("cancelled");
-        return nullptr;
-    } catch (const std::exception& e) {
-        g_sd_phase = 0;
-        return fail(std::string("txt2img 例外: ") + e.what());
-    } catch (...) {
-        g_sd_phase = 0;
-        return fail("txt2img 不明な例外");
-    }
-    g_sd_phase = 0;
-    return take_result(env, results, "txt2img");
+    return generate_locked(env, "txt2img", jstr(env, prompt), jstr(env, negativePrompt), width, height, steps,
+                           cfgScale, used_seed, sampleMethod, clipSkip, nullptr, 0.0f);
 }
 
 // img2img -> returns width*height*3 RGB bytes, or null on failure / cancel.
 // initRgb is an initW*initH*3 RGB image (must equal width x height); strength in (0,1] controls
-// how far the result departs from it (sd.cpp runs about steps*strength sampling steps).
+// how far the result departs from it.
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
         JNIEnv* env, jobject,
@@ -515,80 +626,28 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeImg2img(
     std::lock_guard<std::mutex> lk(g_mutex);
     set_error("");
     g_cancelled = false;
-    if (g_ctx == nullptr) {
-        return fail("img2img: モデルが読み込まれていません");
-    }
     if (initRgb == nullptr || env->GetArrayLength(initRgb) < (jsize)(initW * initH * 3)) {
         return fail("img2img: 入力画像が不正です");
     }
     if (initW != width || initH != height) {
         return fail("img2img: 入力画像のサイズが出力サイズと一致しません");
     }
-    std::string p = jstr(env, prompt);
-    std::string n = jstr(env, negativePrompt);
-    const int64_t used_seed = resolve_seed(seed);
-    g_last_seed = used_seed;
-
     std::vector<uint8_t> init_data((size_t)initW * initH * 3);
     env->GetByteArrayRegion(initRgb, 0, (jsize)init_data.size(), reinterpret_cast<jbyte*>(init_data.data()));
-
-    sd_image_t init_image;
-    init_image.width   = (uint32_t)initW;
-    init_image.height  = (uint32_t)initH;
-    init_image.channel = 3;
-    init_image.data    = init_data.data();
-
-    sd_image_t* results = nullptr;
-    g_sd_phase = 0;
-    try {
-        if (g_cancel.load()) {
-            throw sd_jni_cancelled();
-        }
-        results = img2img(
-            g_ctx,
-            init_image,
-            p.c_str(),
-            n.c_str(),
-            clipSkip,
-            cfgScale,
-            3.5f,              // guidance (flux-only; ignored)
-            width,
-            height,
-            resolve_method(sampleMethod),
-            steps,
-            strength,
-            used_seed,
-            1,                 // batch_count
-            nullptr,           // control_cond
-            0.9f,              // control_strength
-            20.0f,             // style_strength
-            false,             // normalize_input
-            "",                // input_id_images_path
-            nullptr,           // skip_layers
-            0,                 // skip_layers_count
-            0.0f,              // slg_scale
-            0.01f,             // skip_layer_start
-            0.2f);             // skip_layer_end
-    } catch (const sd_jni_cancelled&) {
-        g_sd_phase = 0;
-        g_cancelled = true;
-        set_error("cancelled");
-        return nullptr;
-    } catch (const std::exception& e) {
-        g_sd_phase = 0;
-        return fail(std::string("img2img 例外: ") + e.what());
-    } catch (...) {
-        g_sd_phase = 0;
-        return fail("img2img 不明な例外");
-    }
-    g_sd_phase = 0;
-    return take_result(env, results, "img2img");
+    const int64_t used_seed = resolve_seed(seed);
+    g_last_seed = used_seed;
+    return generate_locked(env, "img2img", jstr(env, prompt), jstr(env, negativePrompt), width, height, steps,
+                           cfgScale, used_seed, sampleMethod, clipSkip, &init_data, strength);
 }
 
 // Request cancellation of the running (or next) generation. Lock-free: callable from any thread.
 extern "C" JNIEXPORT void JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeCancel(JNIEnv*, jobject) {
     g_cancel = true;
+    sd_ctx_t* ctx = g_ctx.load();
+    if (ctx != nullptr) {
+        sd_cancel_generation(ctx, SD_CANCEL_ALL);   // no-op when idle
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -616,11 +675,5 @@ Java_com_micklab_llamaimage_StableDiffusionNative_nativeLastError(JNIEnv* env, j
 extern "C" JNIEXPORT void JNICALL
 Java_com_micklab_llamaimage_StableDiffusionNative_nativeFree(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    try {
-        if (g_ctx != nullptr) {
-            free_sd_ctx(g_ctx);
-        }
-    } catch (...) {
-    }
-    g_ctx = nullptr;
+    free_ctx_locked();
 }

@@ -20,7 +20,8 @@ rootProject.name = "llamaimage"
 include(":app")
 
 // -PsdPrebuiltNative=true (build-local.sh): package CI-built .so files from app/src/main/jniLibs
-// instead of compiling native code, so the fp16 variant module is not needed.
+// instead of compiling native code, so the variant modules are not needed.
 if (!providers.gradleProperty("sdPrebuiltNative").getOrElse("false").toBoolean()) {
     include(":sdjni-fp16")
+    include(":sdjni-gpu")
 }

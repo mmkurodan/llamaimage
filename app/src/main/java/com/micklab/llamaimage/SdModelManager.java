@@ -26,24 +26,31 @@ public final class SdModelManager {
         public final int wtype;
         public final String taesdPath;   // "" = full VAE
         public final boolean vaeTiling;
+        public final boolean useGpu;     // run on the GPU (OpenCL) if this library has one
 
         public LoadConfig(String modelPath, int threads, int wtype, String taesdPath, boolean vaeTiling) {
+            this(modelPath, threads, wtype, taesdPath, vaeTiling, false);
+        }
+
+        public LoadConfig(String modelPath, int threads, int wtype, String taesdPath, boolean vaeTiling,
+                          boolean useGpu) {
             this.modelPath = modelPath;
             this.threads = threads;
             this.wtype = wtype;
             this.taesdPath = taesdPath == null ? "" : taesdPath;
             this.vaeTiling = vaeTiling;
+            this.useGpu = useGpu;
         }
 
         @Override public boolean equals(Object o) {
             if (!(o instanceof LoadConfig)) return false;
             LoadConfig c = (LoadConfig) o;
             return threads == c.threads && wtype == c.wtype && vaeTiling == c.vaeTiling
-                    && Objects.equals(modelPath, c.modelPath) && Objects.equals(taesdPath, c.taesdPath);
+                    && useGpu == c.useGpu && Objects.equals(modelPath, c.modelPath) && Objects.equals(taesdPath, c.taesdPath);
         }
 
         @Override public int hashCode() {
-            return Objects.hash(modelPath, threads, wtype, taesdPath, vaeTiling);
+            return Objects.hash(modelPath, threads, wtype, taesdPath, vaeTiling, useGpu);
         }
     }
 
@@ -127,6 +134,16 @@ public final class SdModelManager {
         return StableDiffusionNative.LIBRARY;
     }
 
+    /** GPU device of the loaded native library ("" = none: CPU only). */
+    public String gpuDevice() {
+        return sd.gpuDevice();
+    }
+
+    /** Backend the current model runs on ("CPU" or the GPU device name; "" = not loaded). */
+    public String activeBackend() {
+        return sd.activeBackend();
+    }
+
     public boolean isModelLoaded() {
         return loaded != null;
     }
@@ -155,7 +172,8 @@ public final class SdModelManager {
         busy = true;
         try {
             loaded = null;
-            String err = sd.init(cfg.modelPath, cfg.threads, cfg.wtype, cfg.taesdPath, cfg.vaeTiling);
+            String err = sd.init(cfg.modelPath, cfg.threads, cfg.wtype, cfg.taesdPath, cfg.vaeTiling,
+                    cfg.useGpu);
             if (err != null && err.isEmpty()) {
                 loaded = cfg;
                 return "";

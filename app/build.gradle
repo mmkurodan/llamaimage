@@ -74,6 +74,9 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // The Khronos ICD loader is built only to LINK libsd_jni_gpu.so; at runtime the
+            // device's vendor libOpenCL.so must be used, so never ship the loader.
+            excludes += ['**/libOpenCL.so']
         }
     }
 }
@@ -81,5 +84,6 @@ android {
 dependencies {
     if (!prebuiltNative) {
         implementation project(':sdjni-fp16')
+        implementation project(':sdjni-gpu')
     }
 }

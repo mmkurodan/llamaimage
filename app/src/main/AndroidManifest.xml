@@ -23,6 +23,13 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">
 
+        <!-- GPU generation (libsd_jni_gpu.so) links the device's own OpenCL driver. Apps targeting
+             API 31+ must declare vendor libraries they load; optional, so devices without OpenCL
+             still install (the CPU library is used there). -->
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+
         <!-- configChanges: the code-built UI adapts to these by itself. Without it, rotating or
              resizing recreated the Activity, which lost the image/inputs and re-ran startup. -->
         <activity

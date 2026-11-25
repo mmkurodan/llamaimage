@@ -16,6 +16,9 @@ endif()
 #
 #   SD_CPU_VARIANT=""      -> libsd_jni.so       armv8-a baseline (runs on every arm64 device)
 #   SD_CPU_VARIANT="fp16"  -> libsd_jni_fp16.so  armv8.2-a + fp16 + dotprod (Cortex-A55/A75 and later)
+#   SD_CPU_VARIANT="gpu"   -> libsd_jni_gpu.so   fp16 kernels + the OpenCL backend (Adreno). Links the
+#                             vendor libOpenCL.so, so it only loads where OpenCL exists; Java then
+#                             falls back to libsd_jni_fp16.so. It can still run a model on the CPU.
 #
 # Why: this ggml pin selects its SIMD kernels at COMPILE time. With the NDK default (-march=armv8-a)
 # the F16 conv/matmul path — most of the UNet and VAE work, since sd.cpp keeps conv weights in F16 —
@@ -30,6 +33,9 @@ if(SD_CPU_VARIANT STREQUAL "")
     set(SD_ARCH     "armv8-a")
 elseif(SD_CPU_VARIANT STREQUAL "fp16")
     set(SD_JNI_LIB  sd_jni_fp16)
+    set(SD_ARCH     "armv8.2-a+fp16+dotprod")
+elseif(SD_CPU_VARIANT STREQUAL "gpu")
+    set(SD_JNI_LIB  sd_jni_gpu)
     set(SD_ARCH     "armv8.2-a+fp16+dotprod")
 else()
     message(FATAL_ERROR "Unknown SD_CPU_VARIANT '${SD_CPU_VARIANT}'")
@@ -50,15 +56,14 @@ string(APPEND CMAKE_CXX_FLAGS_DEBUG " -O2")
 # ---------------------------------------------------------------------------
 set(SD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/sd)
 set(FETCH_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/../../../../scripts/fetch-sdcpp.sh)
-if(NOT EXISTS ${SD_DIR}/stable-diffusion.h)
-    message(STATUS "stable-diffusion.cpp not found — running ${FETCH_SCRIPT}")
-    execute_process(
-        COMMAND bash ${FETCH_SCRIPT} ${SD_DIR}
-        RESULT_VARIABLE SD_FETCH_RC)
-    if(NOT SD_FETCH_RC EQUAL 0)
-        message(FATAL_ERROR "fetch-sdcpp.sh failed (rc=${SD_FETCH_RC})")
-    endif()
+# Always run it: it is a no-op when the pinned sources are present and replaces an older pin.
+execute_process(
+    COMMAND bash ${FETCH_SCRIPT} ${SD_DIR}
+    RESULT_VARIABLE SD_FETCH_RC)
+if(NOT SD_FETCH_RC EQUAL 0)
+    message(FATAL_ERROR "fetch-sdcpp.sh failed (rc=${SD_FETCH_RC})")
 endif()
+set(SD_OPENCL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/opencl)
 
 # ---------------------------------------------------------------------------
 # ggml / stable-diffusion build options — CPU backend only, cross-compile safe.
@@ -75,8 +80,26 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 set(SD_BUILD_EXAMPLES    OFF CACHE BOOL "" FORCE)
 set(SD_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(SD_WEBP              OFF CACHE BOOL "" FORCE)  # image I/O happens in Java
+set(SD_WEBM              OFF CACHE BOOL "" FORCE)
 
-# Pulls in: stable-diffusion (STATIC) + ggml + thirdparty/zip.
+if(SD_CPU_VARIANT STREQUAL "gpu")
+    # OpenCL backend (ggml-opencl, Adreno kernels embedded). Build the Khronos ICD loader only as
+    # the link-time libOpenCL.so: the library records NEEDED libOpenCL.so and the device's vendor
+    # library satisfies it at runtime (the loader itself is never packaged).
+    set(OPENCL_ICD_LOADER_HEADERS_DIR ${SD_OPENCL_DIR}/headers CACHE PATH "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(OPENCL_ICD_LOADER_BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)  # NEEDED libOpenCL.so (Android: unversioned)
+    set(ENABLE_OPENCL_LAYERINFO OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${SD_OPENCL_DIR}/icd-loader ${CMAKE_BINARY_DIR}/icd-loader EXCLUDE_FROM_ALL)
+    set(OpenCL_INCLUDE_DIR ${SD_OPENCL_DIR}/headers CACHE PATH "" FORCE)
+    set(OpenCL_LIBRARY OpenCL CACHE STRING "" FORCE)
+    set(SD_OPENCL ON CACHE BOOL "" FORCE)
+else()
+    set(SD_OPENCL OFF CACHE BOOL "" FORCE)
+endif()
+
+# Pulls in: stable-diffusion (STATIC) + ggml (+ ggml-opencl for the gpu variant) + thirdparty.
 add_subdirectory(${SD_DIR} ${CMAKE_BINARY_DIR}/sd-build)
 
 # ---------------------------------------------------------------------------
@@ -84,7 +107,7 @@ add_subdirectory(${SD_DIR} ${CMAKE_BINARY_DIR}/sd-build)
 # ---------------------------------------------------------------------------
 add_library(${SD_JNI_LIB} SHARED jni/jni_sd.cpp)
 
-target_include_directories(${SD_JNI_LIB} PRIVATE ${SD_DIR})
+target_include_directories(${SD_JNI_LIB} PRIVATE ${SD_DIR}/include)
 target_compile_definitions(${SD_JNI_LIB} PRIVATE SD_JNI_VARIANT="${SD_ARCH}")
 
 target_link_libraries(${SD_JNI_LIB} PRIVATE

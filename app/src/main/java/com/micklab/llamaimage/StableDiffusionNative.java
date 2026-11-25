@@ -63,7 +63,9 @@ public class StableDiffusionNative {
     private native void nativeSetLogPath(String path);
     private native void nativeSetListener(Callbacks listener);
     private native String nativeInit(String modelPath, int nThreads, int wtype, String taesdPath,
-                                     boolean vaeTiling);
+                                     boolean vaeTiling, boolean useGpu);
+    private native String nativeGpuDevice();
+    private native String nativeActiveBackend();
     private native byte[] nativeTxt2img(String prompt, String negativePrompt,
                                         int width, int height, int steps,
                                         float cfgScale, long seed, int sampleMethod, int clipSkip);
@@ -100,8 +102,18 @@ public class StableDiffusionNative {
      * {@code taesdPath} points at optional TAESD weights ("" keeps the model's full VAE).
      * {@code vaeTiling} decodes the VAE in tiles: lower peak memory, roughly 2x slower decode.
      */
-    public String init(String modelPath, int nThreads, int wtype, String taesdPath, boolean vaeTiling) {
-        return nativeInit(modelPath, nThreads, wtype, taesdPath == null ? "" : taesdPath, vaeTiling);
+    public String init(String modelPath, int nThreads, int wtype, String taesdPath, boolean vaeTiling,
+                       boolean useGpu) {
+        return nativeInit(modelPath, nThreads, wtype, taesdPath == null ? "" : taesdPath, vaeTiling, useGpu);
+    }
+
+    /** First GPU device of the loaded library ("" if it has none or OpenCL is unavailable). */
+    public String gpuDevice() {
+        return nativeGpuDevice();
+    }
+
+    public String activeBackend() {
+        return nativeActiveBackend();
     }
 
     /**

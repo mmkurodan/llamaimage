@@ -121,7 +121,7 @@ if [ "$LOCAL_NATIVE" -eq 1 ]; then
   echo "== local native build: NDK $NDK_VER, android-$MIN_SDK, $NATIVE_TYPE, linker $LOCAL_LD =="
   bash "$REPO_ROOT/scripts/fetch-sdcpp.sh"   # as in CI: fetch if missing, always (idempotently) patch
   rm -rf "$JNILIBS"; mkdir -p "$JNILIBS"
-  for spec in ":sd_jni" "fp16:sd_jni_fp16"; do
+  for spec in ":sd_jni" "fp16:sd_jni_fp16" "gpu:sd_jni_gpu"; do
     cpu="${spec%%:*}"; target="${spec#*:}"
     bdir="$REPO_ROOT/.build-local-native/$NATIVE_TYPE/${cpu:-base}"; mkdir -p "$bdir"
     echo "== lib$target.so (SD_CPU_VARIANT='$cpu') in $bdir =="
@@ -130,7 +130,9 @@ if [ "$LOCAL_NATIVE" -eq 1 ]; then
       "-DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake" \
       "-DANDROID_NDK=$NDK" -DANDROID_ABI=arm64-v8a "-DANDROID_PLATFORM=android-$MIN_SDK" \
       "-DCMAKE_BUILD_TYPE=$NATIVE_TYPE" \
-      "-DCMAKE_CXX_FLAGS=-std=c++17 --driver-mode=g++" \
+      "-DCMAKE_C_FLAGS=-fintegrated-cc1" \
+      "-DCMAKE_CXX_FLAGS=-std=c++17 --driver-mode=g++ -fintegrated-cc1" \
+      "-DCMAKE_AR=$(command -v ar)" "-DCMAKE_RANLIB=$(command -v ranlib)" \
       "-DCMAKE_EXE_LINKER_FLAGS=--ld-path=$LOCAL_LD" \
       "-DCMAKE_SHARED_LINKER_FLAGS=--ld-path=$LOCAL_LD" \
       "-DCMAKE_MODULE_LINKER_FLAGS=--ld-path=$LOCAL_LD" \
@@ -154,6 +156,9 @@ fi
 ls -A "$JNILIBS" 2>/dev/null | grep -q '^libsd_jni\.so$' || { echo "no libsd_jni.so in $JNILIBS (run with --fetch)"; exit 2; }
 ls -A "$JNILIBS" 2>/dev/null | grep -q '^libsd_jni_fp16\.so$' \
   || echo "!! libsd_jni_fp16.so missing (older CI run?) — the APK will only have the slower baseline library"
+ls -A "$JNILIBS" 2>/dev/null | grep -q '^libsd_jni_gpu\.so$' \
+  || echo "!! libsd_jni_gpu.so missing (older CI run?) — the APK will have no GPU (OpenCL) support"
+rm -f "$JNILIBS/libOpenCL.so"   # link-time ICD loader only; never package it
 # Every `native` method declared in StableDiffusionNative.java must be exported by every .so,
 # otherwise the app fails at startup with UnsatisfiedLinkError (stale CI artifact).
 JNI_JAVA="$REPO_ROOT/$MODULE/src/main/java/com/micklab/llamaimage/StableDiffusionNative.java"

@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.library'
+}
+
+// Native-only module: builds the SAME sources as :app (app/src/main/cpp/CMakeLists.txt) with
+// SD_CPU_VARIANT=gpu into libsd_jni_gpu.so: the fp16+dotprod CPU kernels plus the OpenCL backend
+// (ggml-opencl) for Adreno GPUs. It links the device's vendor libOpenCL.so, so on devices without
+// OpenCL it fails to load and the app falls back to libsd_jni_fp16.so (CpuInfo).
+android {
+    namespace "com.micklab.llamaimage.sdjni.gpu"
+    compileSdk 35
+    ndkVersion "27.2.12479018"
+
+    defaultConfig {
+        minSdk 24
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17"
+                arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON", "-DSD_CPU_VARIANT=gpu"
+                targets "sd_jni_gpu"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "../app/src/main/cpp/CMakeLists.txt"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
