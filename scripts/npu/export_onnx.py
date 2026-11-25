@@ -129,11 +129,19 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
-    from diffusers import AutoencoderTiny, UNet2DConditionModel
+    from diffusers import AutoencoderTiny, StableDiffusionPipeline
     from huggingface_hub import hf_hub_download
-    from transformers import CLIPTextModel
 
-    te = CLIPTextModel.from_pretrained(DS_REPO, subfolder="text_encoder", revision=DS_REV, torch_dtype=torch.float32)
+    # Load from the SINGLE-FILE checkpoint (the format the app downloads and later converts on the
+    # device), with the repo's diffusers configs. Exported weights then equal the checkpoint's
+    # tensors bit for bit, which make_template.py relies on. (The repo's diffusers fp32 folders
+    # were saved separately and differ slightly.)
+    ckpt = hf_hub_download(DS_REPO, "DreamShaper8_LCM.safetensors", revision=DS_REV)
+    pipe = StableDiffusionPipeline.from_single_file(ckpt, config=DS_REPO, revision=DS_REV,
+                                                    torch_dtype=torch.float32, safety_checker=None,
+                                                    load_safety_checker=False)
+    te, unet = pipe.text_encoder, pipe.unet
+    del pipe
     export(TextEncoder(te), (torch.zeros(1, 77, dtype=torch.int32),), os.path.join(a.out, "text_encoder.onnx"),
            ["input_ids"], ["hidden"])
     del te
@@ -145,7 +153,6 @@ def main():
            ["image"], ["latents"])
     del vae
 
-    unet = UNet2DConditionModel.from_pretrained(DS_REPO, subfolder="unet", revision=DS_REV, torch_dtype=torch.float32)
     export(UNet(unet), (torch.zeros(1, 4, 64, 64), torch.tensor([999.0]), torch.zeros(1, 77, 768)),
            os.path.join(a.out, "unet.onnx"), ["sample", "timestep", "encoder_hidden_states"], ["noise_pred"])
     del unet
@@ -157,7 +164,8 @@ def main():
     shutil.copy(hf_hub_download(DS_REPO, "scheduler/scheduler_config.json", revision=DS_REV),
                 os.path.join(a.out, "scheduler_config.json"))
     with open(os.path.join(a.out, "SOURCES.json"), "w") as f:
-        json.dump({"dreamshaper_8_lcm": {"repo": DS_REPO, "revision": DS_REV, "license": "creativeml-openrail-m"},
+        json.dump({"dreamshaper_8_lcm": {"repo": DS_REPO, "revision": DS_REV, "file": "DreamShaper8_LCM.safetensors",
+                                         "license": "creativeml-openrail-m"},
                    "taesd": {"repo": TAESD_REPO, "revision": TAESD_REV, "license": "mit"},
                    "opset": OPSET, "weights": "fp16 (float32 I/O)", "resolution": 512}, f, indent=2)
 
