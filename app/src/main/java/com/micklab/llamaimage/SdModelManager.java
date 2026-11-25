@@ -139,10 +139,15 @@ public final class SdModelManager {
         return sd.gpuDevice();
     }
 
-    /** Backend the current model runs on ("CPU" or the GPU device name; "" = not loaded). */
+    /**
+     * Backend the current model runs on ("CPU" or the GPU device name; "" = not loaded). Cached at
+     * load: the native getter takes the engine lock, which a running generation holds.
+     */
     public String activeBackend() {
-        return sd.activeBackend();
+        return loaded == null ? "" : loadedBackend;
     }
+
+    private volatile String loadedBackend = "";
 
     public boolean isModelLoaded() {
         return loaded != null;
@@ -175,6 +180,7 @@ public final class SdModelManager {
             String err = sd.init(cfg.modelPath, cfg.threads, cfg.wtype, cfg.taesdPath, cfg.vaeTiling,
                     cfg.useGpu);
             if (err != null && err.isEmpty()) {
+                loadedBackend = sd.activeBackend();
                 loaded = cfg;
                 return "";
             }

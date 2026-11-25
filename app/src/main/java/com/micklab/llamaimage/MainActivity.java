@@ -1083,7 +1083,9 @@ public class MainActivity extends Activity {
             state = "読み込み中…";
             dot = C_WARN;
         } else if (manager != null && manager.isModelLoaded()) {
-            state = "準備完了 ・ " + s.recommendedLabel();
+            String be = manager.activeBackend();
+            state = "準備完了 ・ " + (be.isEmpty() || "CPU".equals(be) ? "CPU" : "GPU") + " ・ "
+                    + s.recommendedLabel();
             dot = C_OK;
         } else if (store.installedFile(s) != null) {
             state = "端末に保存済み";
