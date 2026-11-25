@@ -60,13 +60,6 @@ jobs:
             --prompt "portrait photo of a young woman in a cafe, natural window light"
           rm -rf asm-ar ar_lcm.safetensors
 
-      - name: Upload templates to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "$NPU_RELEASE_TAG" npu-templates/* --clobber
-          gh release view "$NPU_RELEASE_TAG" --json assets -q '.assets[]|"\(.size)\t\(.name)"'
-
       - name: Diagnose (ONNX vs PyTorch fp32, diffusers reference images)
         run: python scripts/npu/diagnose.py --models npu-models --out npu-ref
 
@@ -80,6 +73,7 @@ jobs:
           set -e
           mkdir -p release
           cp npu-models/*.onnx npu-models/scheduler_config.json npu-models/SOURCES.json release/
+          cp npu-templates/*.template.onnx npu-templates/*.map.json release/   # on-device conversion
           cp npu-models/tokenizer/vocab.json release/tokenizer_vocab.json
           cp npu-models/tokenizer/merges.txt release/tokenizer_merges.txt
           curl -fsSL https://huggingface.co/spaces/CompVis/stable-diffusion-license/raw/main/license.txt \
