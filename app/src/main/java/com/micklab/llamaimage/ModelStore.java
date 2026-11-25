@@ -322,8 +322,13 @@ public final class ModelStore {
                 throw new IOException("SHA-256 が一致しません（破損したダウンロード）");
             }
             File dst = new File(part.getParentFile(), spec.fileName);
-            if (dst.exists()) dst.delete();
-            if (!part.renameTo(dst)) throw new IOException("ファイルを配置できません: " + dst);
+            // Some DownloadManagers name the file after the server's Content-Disposition instead of
+            // our ".part" destination; Civitai sends exactly spec.fileName, so the download may
+            // already BE dst. Never delete it then (that used to destroy the verified download).
+            if (!part.getCanonicalPath().equals(dst.getCanonicalPath())) {
+                if (dst.exists()) dst.delete();
+                if (!part.renameTo(dst)) throw new IOException("ファイルを配置できません: " + dst);
+            }
             markVerified(dst);
             return dst;
         } catch (IOException e) {

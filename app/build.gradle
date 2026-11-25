@@ -46,6 +46,11 @@ android {
         release {
             minifyEnabled false
             signingConfig signingConfigs.release
+            // The engine's libraries carry hundreds of MB of DWARF (RelWithDebInfo); bundling it as
+            // native debug metadata ran the release build out of Java heap in CI. Not needed here.
+            ndk {
+                debugSymbolLevel 'none'
+            }
         }
     }
 
