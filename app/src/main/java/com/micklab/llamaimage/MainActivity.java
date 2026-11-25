@@ -218,7 +218,7 @@ public class MainActivity extends Activity {
 
         store = new ModelStore(this);
         loadSettings();
-        String prevLog = previousLogTail(40);
+        String prevLog = previousLogTail(80);
         boolean npuCrashed = prefs().getBoolean(PREFS_NPU_PENDING, false);
         if (npuCrashed) {
             // The previous NPU preparation never finished (the process died): don't retry it
@@ -341,7 +341,48 @@ public class MainActivity extends Activity {
         }
     };
 
+    /** Process RSS / device available memory, written to the persisted log while compiling. */
+    private Thread memWatch;
+
+    private String memLine() {
+        long rssKb = -1;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/self/status"))) {
+            String l;
+            while ((l = r.readLine()) != null) {
+                if (l.startsWith("VmRSS:")) rssKb = Long.parseLong(l.replaceAll("[^0-9]", ""));
+            }
+        } catch (Exception ignore) {
+        }
+        android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+        ((android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(mi);
+        return "メモリ: アプリ " + (rssKb / 1024) + " MB / 端末の空き " + (mi.availMem >> 20) + " MB"
+                + (mi.lowMemory ? "（低メモリ）" : "");
+    }
+
+    private void startMemWatch() {
+        if (memWatch != null) return;
+        memWatch = new Thread(() -> {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    persistLog("  " + memLine());   // file only: survives a kill, no UI spam
+                    Thread.sleep(3000);
+                }
+            } catch (InterruptedException ignore) {
+            }
+        }, "npu-memwatch");
+        memWatch.start();
+    }
+
+    private void stopMemWatch() {
+        if (memWatch != null) {
+            memWatch.interrupt();
+            memWatch = null;
+        }
+    }
+
     private void startNpuStage(int index, int total, String name) {
+        startMemWatch();
+        appendLog(memLine());
         if (npuPrepStart == 0) npuPrepStart = SystemClock.elapsedRealtime();
         npuStage = Math.min(index, 4);
         npuStages = total;
@@ -358,6 +399,8 @@ public class MainActivity extends Activity {
     }
 
     private void stopNpuStage() {
+        if (npuStage > 0) appendLog(memLine());
+        stopMemWatch();
         npuStage = 0;
         npuPrepStart = 0;
         ui.removeCallbacks(npuTicker);
