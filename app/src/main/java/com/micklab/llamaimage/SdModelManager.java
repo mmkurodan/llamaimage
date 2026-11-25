@@ -234,6 +234,9 @@ public final class SdModelManager {
         }
     }
 
+    /** Error prefix of a Result whose NPU run crashed the DSP (the NPU backend was unloaded). */
+    public static final String NPU_CRASH = "NPU がクラッシュしました: ";
+
     /** NPU generation (fixed 512x512; LCM / Euler a / Euler / DPM++ 2M). Caller holds the lock. */
     private Result npuGenerate(byte[] initRgb, String prompt, String negativePrompt, int width, int height,
                                int steps, float cfgScale, float strength, long seed, int sampleMethod) {
@@ -262,6 +265,13 @@ public final class SdModelManager {
             if (rgb == null) return new Result(null, width, height, used, true, "");
             return new Result(rgb, width, height, used, false, "");
         } catch (Throwable t) {
+            if (NpuPipeline.isDspCrash(t.getMessage())) {
+                // The DSP restarted: every session is dead. Unload so the next run opens it again.
+                closeNpu();
+                loaded = null;
+                loadedBackend = "";
+                return new Result(null, width, height, seed, false, NPU_CRASH + t.getMessage());
+            }
             return new Result(null, width, height, seed, false, "NPU 生成エラー: " + t.getMessage());
         } finally {
             busy = false;

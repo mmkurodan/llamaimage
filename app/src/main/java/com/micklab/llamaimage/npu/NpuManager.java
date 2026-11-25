@@ -134,6 +134,11 @@ public final class NpuManager {
         return new NpuPipeline(modelDir(modelId), qnn, cacheDir(modelId), log);
     }
 
+    /** Removes only the compiled HTP contexts of {@code modelId}: the next open recompiles them. */
+    public void deleteCompiled(String modelId) {
+        deleteTree(cacheDir(modelId));
+    }
+
     /** Removes the built model and compiled cache for {@code modelId} (e.g. when the model is deleted). */
     public void delete(String modelId) {
         deleteTree(modelDir(modelId));

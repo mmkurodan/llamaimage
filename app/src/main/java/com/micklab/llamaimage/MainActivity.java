@@ -92,7 +92,7 @@ public class MainActivity extends Activity {
     static final String PREFS_TAB = "main_tab";
     static final String PREFS_COUNT = "batch_count";
 
-    private static final int TAB_TXT2IMG = 0, TAB_IMG2IMG = 1, TAB_API = 2;
+    private static final int TAB_TXT2IMG = 0, TAB_IMG2IMG = 1, TAB_VIDEO = 2, TAB_API = 3;
     private static final int STRENGTH_MIN_PCT = 5, STRENGTH_MAX_PCT = 100;
 
     private static final int[] SIZE_VALUES = {512, 448, 384, 256};
@@ -206,6 +206,14 @@ public class MainActivity extends Activity {
     private final java.util.ArrayList<Long> gallerySeed = new java.util.ArrayList<>();
     private int galleryPos = -1;
 
+    // 動画 (video) tab: chained img2img frames -> silent MP4 (Movies/llamaimage)
+    static final String PREFS_VIDEO = "video_params";   // "frames,fps,strengthPct,zoomPermille,fromInput,colorLock"
+    private LinearLayout videoPanel;
+    private EditText vFramesEdit, vFpsEdit, vStrengthEdit, vZoomEdit;
+    private Button vStartButton, vColorButton, vPlayButton;
+    private boolean vFromInput = false, vColorLock = true;
+    private Uri lastVideoUri;
+
     private final SdModelManager.Listener genListener = new SdModelManager.Listener() {
         @Override public void onProgress(int phase, int step, int steps) {
             final long now = SystemClock.elapsedRealtime();
@@ -255,7 +263,10 @@ public class MainActivity extends Activity {
             if (why != null) appendLog(why);
         }
 
-        generateButton.setOnClickListener(v -> startGeneration(currentTab == TAB_IMG2IMG));
+        generateButton.setOnClickListener(v -> {
+            if (currentTab == TAB_VIDEO) startVideoGeneration();
+            else startGeneration(currentTab == TAB_IMG2IMG);
+        });
         cancelButton.setOnClickListener(v -> cancelGeneration());
         downloadCancelButton.setOnClickListener(v -> confirmCancelDownload());
         imageView.setOnLongClickListener(v -> {
@@ -616,7 +627,7 @@ public class MainActivity extends Activity {
         tabBar.setOrientation(LinearLayout.HORIZONTAL);
         tabBar.setPadding(dp(4), dp(4), dp(4), dp(4));
         tabBar.setBackground(rounded(C_SURFACE, 14, C_STROKE));
-        String[] tabLabels = {"テキスト→画像", "画像→画像", "API"};
+        String[] tabLabels = {"テキスト→画像", "画像→画像", "動画", "API"};
         tabViews = new TextView[tabLabels.length];
         for (int i = 0; i < tabLabels.length; i++) {
             final int index = i;
@@ -689,6 +700,8 @@ public class MainActivity extends Activity {
         img2imgPanel.addView(strengthCol,
                 new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         genArea.addView(img2imgPanel, marginLp(0, 0, 0, 10));
+        videoPanel = buildVideoPanel();
+        genArea.addView(videoPanel, marginLp(0, 0, 0, 10));
 
         // --- prompt ---
         promptEdit = field("どんな画像を作りますか？（日本語・英語）");
@@ -971,6 +984,8 @@ public class MainActivity extends Activity {
         }
         genArea.setVisibility(tab == TAB_API ? View.GONE : View.VISIBLE);
         img2imgPanel.setVisibility(tab == TAB_IMG2IMG ? View.VISIBLE : View.GONE);
+        videoPanel.setVisibility(tab == TAB_VIDEO ? View.VISIBLE : View.GONE);
+        countButton.setVisibility(tab == TAB_VIDEO ? View.GONE : View.VISIBLE);
         apiArea.setVisibility(tab == TAB_API ? View.VISIBLE : View.GONE);
         ui.removeCallbacks(apiPollTask);
         if (tab == TAB_API) apiPollTask.run();
@@ -1733,7 +1748,51 @@ public class MainActivity extends Activity {
 
     /** NPU backend possible for this model on this device (SD1.5 safetensors, Snapdragon). */
     static boolean npuUsable(ModelCatalog.ModelSpec spec) {
-        return spec != null && spec.npuCapable() && com.micklab.llamaimage.npu.NpuManager.deviceMayHaveHtp();
+        return spec != null && spec.npuCapable() && !NPU_BLOCKED.contains(spec.id)
+                && com.micklab.llamaimage.npu.NpuManager.deviceMayHaveHtp();
+    }
+
+    /** Models whose NPU run crashed the DSP again after a fresh compile (persisted; CPU is used). */
+    static final java.util.Set<String> NPU_BLOCKED = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+    static final String PREFS_NPU_BLOCKED = "npu_blocked", PREFS_NPU_CRASHED = "npu_crashed_once";
+
+    /**
+     * After a DSP crash (SdModelManager.NPU_CRASH; the NPU backend is already unloaded): the first
+     * time, delete the model's compiled contexts so the next load recompiles them (a broken context
+     * crashes the DSP on every run); if it crashes again after that, use the CPU for this model.
+     */
+    private void handleNpuCrash(String error) {
+        ModelCatalog.ModelSpec spec = currentSpec();
+        if (spec == null) return;
+        java.util.Set<String> once = new java.util.HashSet<>(prefs().getStringSet(PREFS_NPU_CRASHED, new java.util.HashSet<>()));
+        String msg;
+        if (!once.contains(spec.id)) {
+            once.add(spec.id);
+            prefs().edit().putStringSet(PREFS_NPU_CRASHED, once).apply();
+            npu().deleteCompiled(spec.id);
+            appendLog("NPU: DSP がクラッシュしたため、" + spec.title + " の NPU 最適化データを削除しました（次回作り直し）");
+            msg = "NPU（Hexagon DSP）が実行中にクラッシュしました。\n\n" + spec.title
+                    + " の NPU 最適化データが壊れている可能性があるため削除しました。もう一度「生成する」を押すと、"
+                    + "最適化をやり直してから生成します（数分かかります）。\n\n詳細: " + error;
+        } else {
+            NPU_BLOCKED.add(spec.id);
+            prefs().edit().putStringSet(PREFS_NPU_BLOCKED, new java.util.HashSet<>(NPU_BLOCKED)).apply();
+            appendLog("NPU: 最適化し直しても DSP がクラッシュするため、" + spec.title + " は CPU で生成します");
+            msg = "最適化をやり直しても NPU がクラッシュしました。この端末では " + spec.title
+                    + " を NPU で実行できないため、CPU で生成します（生成設定の「NPU を再度試す」で戻せます）。\n\n詳細: " + error;
+        }
+        new AlertDialog.Builder(this).setTitle("NPU エラー").setMessage(msg).setPositiveButton("OK", null).show();
+        ensureModelLoaded();
+    }
+
+    /** An NPU generation of {@code modelId} succeeded: forget an earlier crash. */
+    private void npuSucceeded(String modelId) {
+        java.util.Set<String> once = prefs().getStringSet(PREFS_NPU_CRASHED, null);
+        if (once != null && once.contains(modelId)) {
+            java.util.Set<String> n = new java.util.HashSet<>(once);
+            n.remove(modelId);
+            prefs().edit().putStringSet(PREFS_NPU_CRASHED, n).apply();
+        }
     }
 
     /**
@@ -1973,6 +2032,8 @@ public class MainActivity extends Activity {
                         (samplingEndMs - samplingStartMs) / 1000.0, (now - samplingEndMs) / 1000.0);
             }
             appendLog(batchTag() + "生成完了 seed=" + r.seed + " " + timing);
+            SdModelManager.LoadConfig lc = manager.getLoadedConfig();
+            if (lc != null && lc.npuModelId != null) npuSucceeded(lc.npuModelId);
             finishGeneration((batchTotal > 1 ? batchTotal + " 枚 " : "") + "完了 seed=" + r.seed
                     + " (" + String.format(Locale.US, "%.1fs", totalSec) + ")");
         } else if (r.cancelled) {
@@ -1982,6 +2043,7 @@ public class MainActivity extends Activity {
             String e = r.error.isEmpty() ? "原因不明（ログ参照）" : r.error;
             appendLog("生成失敗: " + e);
             finishGeneration("生成失敗 — " + e);
+            if (e.startsWith(SdModelManager.NPU_CRASH)) handleNpuCrash(e);
         }
     }
 
@@ -2145,6 +2207,380 @@ public class MainActivity extends Activity {
                     }
                 });
         iv.setOnTouchListener((v, e) -> gd.onTouchEvent(e));
+        dlg.setContentView(root);
+        dlg.show();
+    }
+
+    // =====================================================================================
+    // 動画 (video): frame k+1 = img2img(zoom(frame k)) with a fixed seed, encoded to a silent MP4
+    // =====================================================================================
+
+    private LinearLayout buildVideoPanel() {
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.VERTICAL);
+        v.setPadding(dp(14), dp(12), dp(14), dp(12));
+        v.setBackground(rounded(C_SURFACE, 16, C_STROKE));
+        String[] saved = prefs().getString(PREFS_VIDEO, "24,8,35,20,0,1").split(",");
+        vFromInput = saved.length > 4 && "1".equals(saved[4]);
+        vColorLock = saved.length <= 5 || "1".equals(saved[5]);
+
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        vFramesEdit = numField(saved[0]);
+        vFpsEdit = numField(saved[1]);
+        row1.addView(labeled("コマ数（2〜120）", vFramesEdit, true));
+        row1.addView(labeled("fps（1〜30）", vFpsEdit, true));
+        ((LinearLayout.LayoutParams) row1.getChildAt(1).getLayoutParams()).leftMargin = dp(8);
+        v.addView(row1);
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        vStrengthEdit = numField(saved[2]);
+        vZoomEdit = numField(saved[3]);
+        row2.addView(labeled("コマごとの変化量 %（10〜90）", vStrengthEdit, true));
+        row2.addView(labeled("ズーム ‰/コマ（0〜100）", vZoomEdit, true));
+        ((LinearLayout.LayoutParams) row2.getChildAt(1).getLayoutParams()).leftMargin = dp(8);
+        v.addView(row2, marginLp(0, 10, 0, 0));
+
+        LinearLayout row3 = new LinearLayout(this);
+        row3.setOrientation(LinearLayout.HORIZONTAL);
+        vStartButton = button("", BTN_GHOST);
+        vStartButton.setTextSize(13);
+        vStartButton.setOnClickListener(x -> {
+            vFromInput = !vFromInput;
+            updateVideoButtons();
+            saveVideoParams();
+        });
+        vColorButton = button("", BTN_GHOST);
+        vColorButton.setTextSize(13);
+        vColorButton.setOnClickListener(x -> {
+            vColorLock = !vColorLock;
+            updateVideoButtons();
+            saveVideoParams();
+        });
+        row3.addView(vStartButton, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        clp.leftMargin = dp(8);
+        row3.addView(vColorButton, clp);
+        v.addView(row3, marginLp(0, 10, 0, 0));
+
+        vPlayButton = button("▶  前回の動画を再生", BTN_SECONDARY);
+        vPlayButton.setVisibility(View.GONE);
+        vPlayButton.setOnClickListener(x -> openVideoPlayer(lastVideoUri));
+        v.addView(vPlayButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(44), 0, 10, 0, 0));
+
+        TextView hint = text("1 コマ目をプロンプトから（または「画像→画像」の入力画像から）作り、少しズームしながら"
+                + "画像→画像を繰り返して動画（音なし MP4）にします。シードは全コマ共通（-1 なら最初に決めた値）。"
+                + "変化量が大きいほど動きが大きく、ちらつきも増えます。保存先: Movies/llamaimage", 11, C_TEXT3);
+        hint.setLineSpacing(0, 1.2f);
+        v.addView(hint, marginLp(0, 10, 0, 0));
+        updateVideoButtons();
+        return v;
+    }
+
+    private EditText numField(String value) {
+        EditText e = field("");
+        e.setInputType(InputType.TYPE_CLASS_NUMBER);
+        e.setText(value);
+        return e;
+    }
+
+    private void updateVideoButtons() {
+        vStartButton.setText(vFromInput ? "開始: 入力画像から" : "開始: プロンプトから");
+        vColorButton.setText(onOff("色を固定", vColorLock));
+        if (vPlayButton != null) vPlayButton.setVisibility(lastVideoUri != null ? View.VISIBLE : View.GONE);
+    }
+
+    private void saveVideoParams() {
+        prefs().edit().putString(PREFS_VIDEO, vFramesEdit.getText() + "," + vFpsEdit.getText() + ","
+                + vStrengthEdit.getText() + "," + vZoomEdit.getText() + "," + (vFromInput ? 1 : 0) + ","
+                + (vColorLock ? 1 : 0)).apply();
+    }
+
+    private void startVideoGeneration() {
+        if (isBusy()) {
+            Toast.makeText(this, "処理中です", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (manager == null || !manager.isModelLoaded()) {
+            startGeneration(false);   // same "download / wait for the model" handling
+            return;
+        }
+        if (vFromInput && initBitmap == null) {
+            Toast.makeText(this, "「画像→画像」タブで入力画像を選ぶか、開始を「プロンプトから」にしてください",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        final String rawPrompt = promptEdit.getText().toString().trim();
+        if (rawPrompt.isEmpty()) {
+            Toast.makeText(this, "プロンプトを入力してください", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final int frames = clamp(parseInt(vFramesEdit.getText().toString(), 24), 2, 120);
+        final int fps = clamp(parseInt(vFpsEdit.getText().toString(), 8), 1, 30);
+        final float strength = clamp(parseInt(vStrengthEdit.getText().toString(), 35), 10, 90) / 100f;
+        final float zoom = clamp(parseIntAllowZero(vZoomEdit.getText().toString(), 20), 0, 100) / 1000f;
+        vFramesEdit.setText(String.valueOf(frames));
+        vFpsEdit.setText(String.valueOf(fps));
+        vStrengthEdit.setText(String.valueOf(Math.round(strength * 100)));
+        vZoomEdit.setText(String.valueOf(Math.round(zoom * 1000)));
+        saveVideoParams();
+        final String rawNegative = negativeEdit.getText().toString().trim();
+        final int steps = Math.min(MAX_STEPS, parseInt(stepsEdit.getText().toString(), 6));
+        SdModelManager.LoadConfig lc = manager.getLoadedConfig();
+        final boolean onNpu = lc != null && lc.npuModelId != null;
+        final int size = onNpu ? com.micklab.llamaimage.npu.NpuPipeline.SIZE : snapTo64(selectedSize);
+        final long seed0 = parseLong(seedEdit.getText().toString(), -1);
+        final float cfg = cfgScale;
+        final int method = sampler;
+        final boolean nsfw = nsfwRestriction;
+        final boolean colorLock = vColorLock;
+        final Bitmap start = vFromInput ? initBitmap : null;
+        persistInputs();
+
+        generating = true;
+        batchIndex = 0;
+        batchTotal = frames;
+        sampleSteps = 0;
+        samplingStartMs = 0;
+        samplingEndMs = 0;
+        genStartMs = SystemClock.elapsedRealtime();
+        final long videoStart = genStartMs;
+        manager.clearCancel();
+        cancelButton.setEnabled(true);
+        cancelButton.setText("中止（そこまでを保存）");
+        translatedPromptView.setVisibility(View.GONE);
+        progressBar.setVisibility(View.VISIBLE);
+        progressBar.setIndeterminate(true);
+        refreshControls();
+        setStatus(PromptTranslator.needsTranslation(rawPrompt) ? "翻訳中…" : "準備中…");
+        final PromptTranslator tr = translator();
+
+        worker.submit(() -> {
+            File tmp = new File(getCacheDir(), "video_tmp.mp4");
+            int done = 0;
+            String error = null;
+            long seedUsed = seed0;
+            try {
+                PromptTranslator.Prepared p = tr.prepare(rawPrompt, rawNegative, cfg != 1.0f, nsfw);
+                if (p.blocked) {
+                    final String why = p.note;
+                    runOnUiThread(() -> finishGeneration("生成中止: " + why));
+                    return;
+                }
+                runOnUiThread(() -> {
+                    if (!p.prompt.equals(rawPrompt)) {
+                        translatedPromptView.setText("英訳: " + p.prompt);
+                        translatedPromptView.setVisibility(View.VISIBLE);
+                    }
+                });
+                appendLogUi("動画: \"" + p.prompt + "\" " + frames + " コマ " + fps + "fps 変化量 " + strength
+                        + " ズーム " + zoom + " " + size + "px " + steps + "step " + samplerLabel(method) + " CFG " + cfg);
+                Bitmap prev = null, first = null;
+                try (VideoEncoder enc = new VideoEncoder(tmp, size, size, fps)) {
+                    for (int k = 0; k < frames; k++) {
+                        SdModelManager.Result r;
+                        if (k == 0 && start == null) {
+                            r = manager.txt2img(p.prompt, p.negative, size, size, steps, cfg, seedUsed, method);
+                        } else {
+                            Bitmap src = k == 0 ? Bitmap.createScaledBitmap(start, size, size, true) : zoomBitmap(prev, zoom);
+                            int[] sched = img2imgSchedule(steps, strength);
+                            float sdStrength = (sched[1] - 0.5f) / sched[0];
+                            r = manager.img2img(bitmapToRgb(src), p.prompt, p.negative, size, size, sched[0], cfg,
+                                    sdStrength, seedUsed, method);
+                        }
+                        if (!r.ok()) {
+                            if (!r.cancelled) error = r.error.isEmpty() ? "原因不明（ログ参照）" : r.error;
+                            break;
+                        }
+                        if (seedUsed < 0) seedUsed = r.seed;   // one seed for every frame (less flicker)
+                        Bitmap frame = rgbToBitmap(r.rgb, r.width, r.height);
+                        if (first == null) first = frame;
+                        else if (colorLock) frame = matchColors(frame, first);
+                        enc.addFrame(frame);
+                        prev = frame;
+                        done = k + 1;
+                        final Bitmap shown = frame;
+                        final int next = k + 1;
+                        runOnUiThread(() -> onVideoFrame(shown, next));
+                        if (manager.isCancelRequested()) break;
+                    }
+                    if (done >= 2) enc.finish();
+                }
+            } catch (Throwable t) {
+                error = t.toString();
+            }
+            Uri uri = null;
+            if (done >= 2) {
+                try {
+                    uri = publishVideo(tmp, seedUsed);
+                } catch (Throwable t) {
+                    error = "動画の保存に失敗: " + t;
+                }
+            }
+            tmp.delete();
+            final Uri saved = uri;
+            final int n = done;
+            final String err = error;
+            final long secs = (SystemClock.elapsedRealtime() - videoStart) / 1000;
+            runOnUiThread(() -> onVideoFinished(saved, n, frames, fps, err, secs));
+        });
+    }
+
+    private void onVideoFrame(Bitmap frame, int next) {
+        long now = SystemClock.elapsedRealtime();
+        if (samplingEndMs > 0) lastDecodeMs = now - samplingEndMs;
+        lastBitmap = frame;
+        showImage(frame);
+        batchIndex = next;
+        genStartMs = now;
+        sampleSteps = 0;
+        samplingStartMs = 0;
+        samplingEndMs = 0;
+        if (!manager.isCancelRequested()) {
+            cancelButton.setEnabled(true);
+            cancelButton.setText("中止（そこまでを保存）");
+        }
+        setStatus("[" + Math.min(next + 1, batchTotal) + "/" + batchTotal + "] 次のコマ…");
+    }
+
+    private void onVideoFinished(Uri uri, int done, int frames, int fps, String error, long secs) {
+        if (error != null) appendLog("動画: エラー " + error);
+        if (uri != null) {
+            lastVideoUri = uri;
+            appendLog("動画を保存: Movies/llamaimage（" + done + " コマ / " + fps + "fps / "
+                    + String.format(Locale.US, "%.1f", done / (float) fps) + " 秒、生成 " + formatDuration(secs) + "）");
+            finishGeneration("動画 " + done + "/" + frames + " コマを保存しました（" + formatDuration(secs) + "）");
+            updateVideoButtons();
+            openVideoPlayer(uri);
+        } else {
+            finishGeneration(error != null ? "動画の生成に失敗 — " + error
+                    : "中止しました（2 コマ未満のため動画は保存していません）");
+        }
+        if (error != null && error.startsWith(SdModelManager.NPU_CRASH)) handleNpuCrash(error);
+    }
+
+    private static int clamp(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    /** Center crop by {@code zoom} (e.g. 0.02 = 2 % closer) scaled back to the original size. */
+    static Bitmap zoomBitmap(Bitmap b, float zoom) {
+        if (zoom <= 0f) return b;
+        int w = b.getWidth(), h = b.getHeight();
+        int cw = Math.max(8, Math.round(w / (1f + zoom))), ch = Math.max(8, Math.round(h / (1f + zoom)));
+        Bitmap c = Bitmap.createBitmap(b, (w - cw) / 2, (h - ch) / 2, cw, ch);
+        return Bitmap.createScaledBitmap(c, w, h, true);
+    }
+
+    /** Per-channel mean / std transfer to {@code ref}: keeps chained img2img from drifting in color. */
+    static Bitmap matchColors(Bitmap img, Bitmap ref) {
+        int w = img.getWidth(), h = img.getHeight(), n = w * h;
+        int[] a = new int[n], r = new int[ref.getWidth() * ref.getHeight()];
+        img.getPixels(a, 0, w, 0, 0, w, h);
+        ref.getPixels(r, 0, ref.getWidth(), 0, 0, ref.getWidth(), ref.getHeight());
+        double[] ma = new double[3], sa = new double[3], mr = new double[3], sr = new double[3];
+        stats(a, ma, sa);
+        stats(r, mr, sr);
+        float[] gain = new float[3], off = new float[3];
+        for (int c = 0; c < 3; c++) {
+            gain[c] = (float) (sa[c] > 1e-3 ? Math.max(0.5, Math.min(2.0, sr[c] / sa[c])) : 1.0);
+            off[c] = (float) (mr[c] - ma[c] * gain[c]);
+        }
+        for (int i = 0; i < n; i++) {
+            int p = a[i], out = 0xFF000000;
+            for (int c = 0; c < 3; c++) {
+                int sh = 16 - 8 * c;
+                int v = Math.round(((p >> sh) & 0xFF) * gain[c] + off[c]);
+                out |= Math.max(0, Math.min(255, v)) << sh;
+            }
+            a[i] = out;
+        }
+        Bitmap o = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        o.setPixels(a, 0, w, 0, 0, w, h);
+        return o;
+    }
+
+    private static void stats(int[] px, double[] mean, double[] std) {
+        double[] s = new double[3], s2 = new double[3];
+        for (int p : px) {
+            for (int c = 0; c < 3; c++) {
+                int v = (p >> (16 - 8 * c)) & 0xFF;
+                s[c] += v;
+                s2[c] += (double) v * v;
+            }
+        }
+        for (int c = 0; c < 3; c++) {
+            mean[c] = s[c] / px.length;
+            std[c] = Math.sqrt(Math.max(0, s2[c] / px.length - mean[c] * mean[c]));
+        }
+    }
+
+    /** Copies the finished MP4 to Movies/llamaimage (MediaStore) and returns its Uri. */
+    private Uri publishVideo(File tmp, long seed) throws IOException {
+        String name = "llamaimage_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date())
+                + (seed >= 0 ? "_s" + seed : "") + ".mp4";
+        if (Build.VERSION.SDK_INT >= 29) {
+            ContentResolver cr = getContentResolver();
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Video.Media.DISPLAY_NAME, name);
+            cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+            cv.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/llamaimage");
+            cv.put(MediaStore.Video.Media.IS_PENDING, 1);
+            Uri u = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv);
+            if (u == null) throw new IOException("MediaStore に登録できません");
+            try (OutputStream os = cr.openOutputStream(u);
+                 java.io.InputStream in = new java.io.FileInputStream(tmp)) {
+                if (os == null) throw new IOException("書き込めません");
+                byte[] buf = new byte[1 << 16];
+                int n;
+                while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+            } catch (IOException e) {
+                cr.delete(u, null, null);
+                throw e;
+            }
+            cv.clear();
+            cv.put(MediaStore.Video.Media.IS_PENDING, 0);
+            cr.update(u, cv, null, null);
+            return u;
+        }
+        File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+        File f = new File(dir, name);
+        try (java.io.InputStream in = new java.io.FileInputStream(tmp); OutputStream os = new FileOutputStream(f)) {
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+        }
+        return Uri.fromFile(f);
+    }
+
+    /** Full-screen looping player for a saved video. */
+    private void openVideoPlayer(Uri uri) {
+        if (uri == null) return;
+        final android.app.Dialog dlg = new android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(0xFF000000);
+        final android.widget.VideoView vv = new android.widget.VideoView(this);
+        root.addView(vv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        TextView close = text("✕", 22, 0xFFEDEDF0);
+        close.setPadding(dp(18), dp(10), dp(18), dp(10));
+        close.setOnClickListener(v -> dlg.dismiss());
+        root.addView(close, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END));
+        TextView info = text("Movies/llamaimage に保存しました（ループ再生中）", 13, 0xFFEDEDF0);
+        info.setPadding(dp(16), dp(16), dp(16), dp(16));
+        root.addView(info, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START));
+        vv.setVideoURI(uri);
+        vv.setOnPreparedListener(mp -> {
+            mp.setLooping(true);
+            vv.start();
+        });
+        vv.setOnErrorListener((mp, what, extra) -> {
+            Toast.makeText(this, "再生できません (" + what + ")", Toast.LENGTH_SHORT).show();
+            return true;
+        });
+        dlg.setOnDismissListener(d -> vv.stopPlayback());
         dlg.setContentView(root);
         dlg.show();
     }
@@ -2365,6 +2801,21 @@ public class MainActivity extends Activity {
                 + "。 NPU：" + (npuOk ? "Snapdragon の NPU で高速生成（512px 固定。サンプラーは LCM／Euler a／Euler／DPM++ 2M）。初回のみ端末で変換（約 2GB）と最適化に数分"
                 : "このモデル／端末では利用不可（SD1.5 の safetensors モデル＋Snapdragon が必要）")
                 + "。読込に失敗した場合は自動で CPU に戻ります。");
+        if (spec != null && NPU_BLOCKED.contains(spec.id)) {
+            Button retry = new Button(this);
+            retry.setText("NPU を再度試す（" + spec.title + "）");
+            retry.setOnClickListener(v -> {
+                NPU_BLOCKED.remove(spec.id);
+                java.util.Set<String> once = new java.util.HashSet<>(prefs().getStringSet(PREFS_NPU_CRASHED, new java.util.HashSet<>()));
+                once.remove(spec.id);
+                prefs().edit().putStringSet(PREFS_NPU_BLOCKED, new java.util.HashSet<>(NPU_BLOCKED))
+                        .putStringSet(PREFS_NPU_CRASHED, once).apply();
+                retry.setEnabled(false);
+                Toast.makeText(this, "生成設定を開き直すと NPU を選べます", Toast.LENGTH_SHORT).show();
+            });
+            c.addView(retry);
+            addHint(c, "このモデルは NPU で繰り返しクラッシュしたため CPU で生成しています。");
+        }
 
         final boolean[] selTiling = {vaeTiling};
         addLabel(c, "省メモリ VAE（タイル処理）", dp(12));
@@ -2708,6 +3159,8 @@ public class MainActivity extends Activity {
         cfgScale = p.getFloat(PREFS_CFG, ModelCatalog.DEFAULT_MODEL.cfgScale);
         nThreads = p.getInt(PREFS_THREADS, 0);
         nsfwRestriction = p.getBoolean(PREFS_NSFW, false);
+        NPU_BLOCKED.clear();
+        NPU_BLOCKED.addAll(p.getStringSet(PREFS_NPU_BLOCKED, new java.util.HashSet<>()));
         selectedSize = p.getInt(PREFS_SIZE, 512);
         // On by default: the final decode drops from ~28s to ~2s at 512px with near-identical output.
         // (Old versions stored a picked TAESD file path; ModelStore adopts that file.)

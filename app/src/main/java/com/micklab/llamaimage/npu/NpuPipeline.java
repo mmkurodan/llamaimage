@@ -263,10 +263,28 @@ public final class NpuPipeline implements Closeable {
         return eps;
     }
 
+    /** session.run with the graph name in the error (the QNN message only names a hash). */
+    private static OrtSession.Result run(OrtSession s, String name, Map<String, OnnxTensor> in) throws OrtException {
+        try {
+            return s.run(in);
+        } catch (OrtException e) {
+            throw new OrtException("[" + name + "] " + e.getMessage());
+        }
+    }
+
+    /**
+     * True if {@code msg} reports that the Hexagon DSP itself crashed / restarted (SSR) while
+     * running a graph: the sessions are dead afterwards, and a broken compiled context is the
+     * usual cause when it repeats for one model only.
+     */
+    public static boolean isDspCrash(String msg) {
+        return msg != null && (msg.contains("SSR") || msg.contains("NPU crashed") || msg.contains("Error code: 1007"));
+    }
+
     private float[] encodeText(String text) throws OrtException {
         int[] ids = tokenizer.encode(text);
         try (OnnxTensor in = OnnxTensor.createTensor(env, IntBuffer.wrap(ids), new long[]{1, ClipTokenizer.LENGTH});
-             OrtSession.Result r = textEncoder.run(single("input_ids", in))) {
+             OrtSession.Result r = run(textEncoder, "text_encoder", single("input_ids", in))) {
             return floats(r);
         }
     }
@@ -287,7 +305,7 @@ public final class NpuPipeline implements Closeable {
                     if (v == null) throw new IllegalStateException(UNET_PARTS[p] + ": 入力 " + n + " がありません");
                     in.put(n, v);
                 }
-                OrtSession.Result r = unet[p].run(in);
+                OrtSession.Result r = run(unet[p], UNET_PARTS[p], in);
                 results.add(r);
                 for (Map.Entry<String, ai.onnxruntime.OnnxValue> e : r) vals.put(e.getKey(), (OnnxTensor) e.getValue());
             }
@@ -313,14 +331,14 @@ public final class NpuPipeline implements Closeable {
             for (int c = 0; c < 3; c++) chw[c * n + i] = (rgb[i * 3 + c] & 0xFF) / 255f;
         }
         try (OnnxTensor in = OnnxTensor.createTensor(env, FloatBuffer.wrap(chw), new long[]{1, 3, SIZE, SIZE});
-             OrtSession.Result r = encoder.run(single("image", in))) {
+             OrtSession.Result r = run(encoder, "taesd_encoder", single("image", in))) {
             return floats(r);
         }
     }
 
     private byte[] decode(float[] latents) throws OrtException {
         try (OnnxTensor in = OnnxTensor.createTensor(env, FloatBuffer.wrap(latents), new long[]{1, CHANNELS, LATENT, LATENT});
-             OrtSession.Result r = decoder.run(single("latents", in))) {
+             OrtSession.Result r = run(decoder, "taesd_decoder", single("latents", in))) {
             float[] chw = floats(r);
             int n = SIZE * SIZE;
             byte[] rgb = new byte[3 * n];
