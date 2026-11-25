@@ -59,6 +59,8 @@ def main():
         rng = np.random.default_rng(a.seed)
         sched.set_timesteps(a.steps, original_inference_steps=50,
                             strength=a.strength if init_image is not None else 1.0)
+        print(("img2img" if init_image is not None else "txt2img") + " timesteps:",
+              [int(t) for t in sched.timesteps])
         noise = rng.standard_normal((1, 4, 64, 64)).astype(np.float32)
         if init_image is None:
             latents = noise * float(sched.init_noise_sigma)
@@ -69,12 +71,14 @@ def main():
                                       sched.timesteps[:1]).numpy()
         import torch
         denoised = None
+        # ONE generator for the whole run: LCM re-noises between steps, and re-seeding per step
+        # injected the same noise every step (over-sharpened, grainy images).
+        gen = torch.Generator().manual_seed(a.seed)
         for t in sched.timesteps:
             t1 = time.time()
             eps = unet.run(None, {"sample": latents, "timestep": np.array([float(t)], np.float32),
                                   "encoder_hidden_states": hidden})[0]
-            out = sched.step(torch.from_numpy(eps), t, torch.from_numpy(latents),
-                             generator=torch.Generator().manual_seed(a.seed))
+            out = sched.step(torch.from_numpy(eps), t, torch.from_numpy(latents), generator=gen)
             latents, denoised = out.prev_sample.numpy(), out.denoised.numpy()
             print(f"  t={int(t)} {time.time() - t1:.2f}s")
         return dec.run(None, {"latents": denoised.astype(np.float32)})[0]
