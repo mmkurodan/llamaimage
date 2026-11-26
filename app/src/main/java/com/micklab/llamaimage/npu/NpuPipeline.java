@@ -183,9 +183,23 @@ public final class NpuPipeline implements Closeable {
      */
     public byte[] generate(String prompt, String negative, int steps, float cfg, long seed, byte[] initRgb,
                            float strength, int sampler, Listener listener) throws OrtException {
+        return generate(prompt, null, 0f, negative, steps, cfg, seed, initRgb, strength, sampler, listener);
+    }
+
+    /**
+     * Same, conditioned on a blend of two prompts: text embedding = (1 - mix) * E(prompt) + mix * E(prompt2)
+     * (prompt travel; used for in-between video frames). {@code prompt2} null or mix &lt;= 0 = prompt only.
+     */
+    public byte[] generate(String prompt, String prompt2, float mix, String negative, int steps, float cfg, long seed,
+                           byte[] initRgb, float strength, int sampler, Listener listener) throws OrtException {
         lastSeed = seed >= 0 ? seed : (new Random().nextLong() & 0x7FFFFFFFL);
         Random rng = new Random(lastSeed);
         float[] cond = encodeText(prompt);
+        if (prompt2 != null && mix > 0f) {
+            float[] c2 = encodeText(prompt2);
+            float m = Math.min(1f, mix);
+            for (int i = 0; i < cond.length; i++) cond[i] = (1 - m) * cond[i] + m * c2[i];
+        }
         float[] uncond = cfg > 1.0f ? encodeText(negative == null ? "" : negative) : null;
         if (KDiffusionSampler.supports(sampler)) {
             return generateK(sampler, steps, cfg, cond, uncond, rng, initRgb, strength, listener);

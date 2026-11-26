@@ -210,9 +210,9 @@ public class MainActivity extends Activity {
     private int galleryPos = -1;
 
     // 動画 (video) tab: chained img2img frames -> silent MP4 (Movies/llamaimage)
-    static final String PREFS_VIDEO = "video_params";   // "frames,fps,strengthPct,zoomPermille,fromInput,colorLock"
+    static final String PREFS_VIDEO = "video_params";   // "frames,fps,strengthPct,zoomPermille,fromInput,colorLock,cycle"
     private LinearLayout videoPanel;
-    private EditText vFramesEdit, vFpsEdit, vStrengthEdit, vZoomEdit;
+    private EditText vFramesEdit, vFpsEdit, vStrengthEdit, vZoomEdit, vCycleEdit;
     private Button vStartButton, vColorButton, vPlayButton;
     private boolean vFromInput = false, vColorLock = true;
     private Uri lastVideoUri;
@@ -2240,7 +2240,7 @@ public class MainActivity extends Activity {
         v.setOrientation(LinearLayout.VERTICAL);
         v.setPadding(dp(14), dp(12), dp(14), dp(12));
         v.setBackground(rounded(C_SURFACE, 16, C_STROKE));
-        String[] saved = prefs().getString(PREFS_VIDEO, "24,8,35,20,0,1").split(",");
+        String[] saved = prefs().getString(PREFS_VIDEO, "24,8,35,20,0,1,8").split(",");
         vFromInput = saved.length > 4 && "1".equals(saved[4]);
         vColorLock = saved.length <= 5 || "1".equals(saved[5]);
 
@@ -2260,6 +2260,9 @@ public class MainActivity extends Activity {
         row2.addView(labeled("ズーム ‰/コマ（0〜100）", vZoomEdit, true));
         ((LinearLayout.LayoutParams) row2.getChildAt(1).getLayoutParams()).leftMargin = dp(8);
         v.addView(row2, marginLp(0, 10, 0, 0));
+        vCycleEdit = numField(saved.length > 6 ? saved[6] : "8");
+        v.addView(labeled("ポーズ切替: 1 周のコマ数（2〜60、プロンプトが 2 行以上のとき）", vCycleEdit, false),
+                marginLp(0, 10, 0, 0));
 
         LinearLayout row3 = new LinearLayout(this);
         row3.setOrientation(LinearLayout.HORIZONTAL);
@@ -2302,7 +2305,11 @@ public class MainActivity extends Activity {
 
         TextView hint = text("1 コマ目をプロンプトから（または「画像→画像」の入力画像から）作り、少しズームしながら"
                 + "画像→画像を繰り返して動画（音なし MP4）にします。シードは全コマ共通（-1 なら最初に決めた値）。"
-                + "変化量が大きいほど動きが大きく、ちらつきも増えます。保存先: Movies/llamaimage", 11, C_TEXT3);
+                + "変化量が大きいほど動きが大きく、ちらつきも増えます。\n"
+                + "ポーズ切替: プロンプトを 1 行に 1 ポーズずつ 2 行以上書くと（例: 1 行目「手を広げている」、"
+                + "2 行目「胸の前で手を合わせている」）、1 コマ目を基準に各ポーズを描き、その間をつないで"
+                + "「1 周のコマ数」で繰り返すループ動画にします（ズームは使いません。変化量は 50〜65 % 程度がおすすめ）。"
+                + "NPU では中間コマのプロンプトを混ぜて滑らかにつなぎます。保存先: Movies/llamaimage", 11, C_TEXT3);
         hint.setLineSpacing(0, 1.2f);
         v.addView(hint, marginLp(0, 10, 0, 0));
         updateVideoButtons();
@@ -2327,7 +2334,7 @@ public class MainActivity extends Activity {
     private void saveVideoParams() {
         prefs().edit().putString(PREFS_VIDEO, vFramesEdit.getText() + "," + vFpsEdit.getText() + ","
                 + vStrengthEdit.getText() + "," + vZoomEdit.getText() + "," + (vFromInput ? 1 : 0) + ","
-                + (vColorLock ? 1 : 0)).apply();
+                + (vColorLock ? 1 : 0) + "," + vCycleEdit.getText()).apply();
     }
 
     private void startVideoGeneration() {
@@ -2357,6 +2364,9 @@ public class MainActivity extends Activity {
         vFpsEdit.setText(String.valueOf(fps));
         vStrengthEdit.setText(String.valueOf(Math.round(strength * 100)));
         vZoomEdit.setText(String.valueOf(Math.round(zoom * 1000)));
+        final String[] poses = poseLines(rawPrompt);   // 2+ lines = ポーズ切替 (looping pose cycle)
+        final int cycle = clamp(parseInt(vCycleEdit.getText().toString(), 8), Math.max(2, poses.length), 60);
+        vCycleEdit.setText(String.valueOf(cycle));
         saveVideoParams();
         final String rawNegative = negativeEdit.getText().toString().trim();
         final int steps = Math.min(MAX_STEPS, parseInt(stepsEdit.getText().toString(), 6));
@@ -2402,64 +2412,87 @@ public class MainActivity extends Activity {
             String error = null;
             long seedUsed = seed0;
             try {
-                PromptTranslator.Prepared p = tr.prepare(rawPrompt, rawNegative, cfg != 1.0f, nsfw);
-                if (p.blocked) {
-                    final String why = p.note;
-                    runOnUiThread(() -> finishGeneration("生成中止: " + why));
-                    return;
+                final String[] srcLines = poses.length >= 2 ? poses : new String[]{rawPrompt};
+                final String[] pp = new String[srcLines.length];
+                String neg = rawNegative;
+                for (int i = 0; i < srcLines.length; i++) {
+                    PromptTranslator.Prepared q = tr.prepare(srcLines[i], rawNegative, cfg != 1.0f, nsfw);
+                    if (q.blocked) {
+                        final String why = q.note;
+                        runOnUiThread(() -> finishGeneration("生成中止: " + why));
+                        return;
+                    }
+                    pp[i] = q.prompt;
+                    neg = q.negative;
                 }
+                final String shownPrompt = String.join(" / ", pp);
                 runOnUiThread(() -> {
-                    if (!p.prompt.equals(rawPrompt)) {
-                        translatedPromptView.setText("英訳: " + p.prompt);
+                    if (!shownPrompt.equals(String.join(" / ", srcLines))) {
+                        translatedPromptView.setText("英訳: " + shownPrompt);
                         translatedPromptView.setVisibility(View.VISIBLE);
                     }
                 });
-                appendLogUi("動画: \"" + p.prompt + "\" " + frames + " コマ " + fps + "fps 変化量 " + strength
-                        + " ズーム " + zoom + " " + size + "px " + steps + "step " + samplerLabel(method) + " CFG " + cfg);
-                Bitmap prev = null, first = null;
-                byte[] frameMask = paintedMask;   // follows the zoom frame by frame
-                int faceMisses = 0;
-                try (VideoEncoder enc = new VideoEncoder(tmp, size, size, fps)) {
-                    for (int k = 0; k < frames; k++) {
-                        SdModelManager.Result r;
-                        if (k == 0 && start == null) {
-                            r = manager.txt2img(p.prompt, p.negative, size, size, steps, cfg, seedUsed, method);
-                        } else {
-                            Bitmap src = k == 0 ? Bitmap.createScaledBitmap(start, size, size, true) : zoomBitmap(prev, zoom);
-                            int[] sched = img2imgSchedule(steps, strength);
-                            float sdStrength = (sched[1] - 0.5f) / sched[0];
-                            r = manager.img2img(bitmapToRgb(src), p.prompt, p.negative, size, size, sched[0], cfg,
-                                    sdStrength, seedUsed, method);
+                if (pp.length >= 2) {
+                    appendLogUi("動画（ポーズ切替）: " + pp.length + " ポーズ \"" + shownPrompt + "\" 1 周 " + cycle
+                            + " コマ / 全 " + frames + " コマ " + fps + "fps 変化量 " + strength + " " + size + "px "
+                            + steps + "step " + samplerLabel(method) + " CFG " + cfg
+                            + (manager.blendsPrompts() ? "（NPU: 中間コマはプロンプトを混合）" : "（中間コマは近い方のプロンプト）")
+                            + (zoom > 0 ? "（ズームは使いません）" : ""));
+                    PoseRun pr = new PoseRun(pp, neg, frames, cycle, size, steps, cfg, strength, method, seedUsed,
+                            start, maskMode, paintedMask, colorLock);
+                    pr.run(tmp, fps);
+                    done = pr.done;
+                    error = pr.error;
+                    seedUsed = pr.seed;
+                } else {
+                    final PromptTranslator.Prepared p = new PromptTranslator.Prepared(pp[0], neg, false, "");
+                    appendLogUi("動画: \"" + p.prompt + "\" " + frames + " コマ " + fps + "fps 変化量 " + strength
+                            + " ズーム " + zoom + " " + size + "px " + steps + "step " + samplerLabel(method) + " CFG " + cfg);
+                    Bitmap prev = null, first = null;
+                    byte[] frameMask = paintedMask;   // follows the zoom frame by frame
+                    int faceMisses = 0;
+                    try (VideoEncoder enc = new VideoEncoder(tmp, size, size, fps)) {
+                        for (int k = 0; k < frames; k++) {
+                            SdModelManager.Result r;
+                            if (k == 0 && start == null) {
+                                r = manager.txt2img(p.prompt, p.negative, size, size, steps, cfg, seedUsed, method);
+                            } else {
+                                Bitmap src = k == 0 ? Bitmap.createScaledBitmap(start, size, size, true) : zoomBitmap(prev, zoom);
+                                int[] sched = img2imgSchedule(steps, strength);
+                                float sdStrength = (sched[1] - 0.5f) / sched[0];
+                                r = manager.img2img(bitmapToRgb(src), p.prompt, p.negative, size, size, sched[0], cfg,
+                                        sdStrength, seedUsed, method);
+                            }
+                            if (!r.ok()) {
+                                if (!r.cancelled) error = r.error.isEmpty() ? "原因不明（ログ参照）" : r.error;
+                                break;
+                            }
+                            if (seedUsed < 0) seedUsed = r.seed;   // one seed for every frame (less flicker)
+                            Bitmap frame = rgbToBitmap(r.rgb, r.width, r.height);
+                            Bitmap base = k == 0 ? (start != null ? Bitmap.createScaledBitmap(start, size, size, true) : null)
+                                    : zoomBitmap(prev, zoom);
+                            if (base != null && maskMode == 1) {
+                                byte[] fm = ChangeMask.faces(base, 4);   // the face moves with the zoom: detect per frame
+                                if (fm != null) frame = ChangeMask.composite(frame, base, fm);
+                                else faceMisses++;
+                            } else if (base != null && maskMode == 2 && frameMask != null) {
+                                if (k > 0) frameMask = ChangeMask.zoom(frameMask, size, size, zoom);
+                                frame = ChangeMask.composite(frame, base, frameMask);
+                            }
+                            if (first == null) first = frame;
+                            else if (colorLock) frame = matchColors(frame, first);
+                            enc.addFrame(frame);
+                            prev = frame;
+                            done = k + 1;
+                            final Bitmap shown = frame;
+                            final int next = k + 1;
+                            runOnUiThread(() -> onVideoFrame(shown, next));
+                            if (manager.isCancelRequested()) break;
                         }
-                        if (!r.ok()) {
-                            if (!r.cancelled) error = r.error.isEmpty() ? "原因不明（ログ参照）" : r.error;
-                            break;
-                        }
-                        if (seedUsed < 0) seedUsed = r.seed;   // one seed for every frame (less flicker)
-                        Bitmap frame = rgbToBitmap(r.rgb, r.width, r.height);
-                        Bitmap base = k == 0 ? (start != null ? Bitmap.createScaledBitmap(start, size, size, true) : null)
-                                : zoomBitmap(prev, zoom);
-                        if (base != null && maskMode == 1) {
-                            byte[] fm = ChangeMask.faces(base, 4);   // the face moves with the zoom: detect per frame
-                            if (fm != null) frame = ChangeMask.composite(frame, base, fm);
-                            else faceMisses++;
-                        } else if (base != null && maskMode == 2 && frameMask != null) {
-                            if (k > 0) frameMask = ChangeMask.zoom(frameMask, size, size, zoom);
-                            frame = ChangeMask.composite(frame, base, frameMask);
-                        }
-                        if (first == null) first = frame;
-                        else if (colorLock) frame = matchColors(frame, first);
-                        enc.addFrame(frame);
-                        prev = frame;
-                        done = k + 1;
-                        final Bitmap shown = frame;
-                        final int next = k + 1;
-                        runOnUiThread(() -> onVideoFrame(shown, next));
-                        if (manager.isCancelRequested()) break;
+                        if (done >= 2) enc.finish();
                     }
-                    if (done >= 2) enc.finish();
+                    if (faceMisses > 0) appendLogUi("動画: 顔が見つからなかったコマ " + faceMisses + " 枚は全体を変化させました");
                 }
-                if (faceMisses > 0) appendLogUi("動画: 顔が見つからなかったコマ " + faceMisses + " 枚は全体を変化させました");
             } catch (Throwable t) {
                 error = t.toString();
             }
@@ -2478,6 +2511,169 @@ public class MainActivity extends Activity {
             final long secs = (SystemClock.elapsedRealtime() - videoStart) / 1000;
             runOnUiThread(() -> onVideoFinished(saved, n, frames, fps, err, secs));
         });
+    }
+
+    /** Non-empty prompt lines (each line = one pose for the ポーズ切替 video). */
+    static String[] poseLines(String prompt) {
+        java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        for (String l : prompt.split("\\r?\\n")) if (!l.trim().isEmpty()) out.add(l.trim());
+        return out.toArray(new String[0]);
+    }
+
+    /** a * (1 - w) + b * w per pixel. */
+    static Bitmap crossfade(Bitmap a, Bitmap b, float w) {
+        int width = a.getWidth(), h = a.getHeight(), n = width * h;
+        if (b.getWidth() != width || b.getHeight() != h) b = Bitmap.createScaledBitmap(b, width, h, true);
+        int[] pa = new int[n], pb = new int[n];
+        a.getPixels(pa, 0, width, 0, 0, width, h);
+        b.getPixels(pb, 0, width, 0, 0, width, h);
+        int wb = Math.round(w * 256), wa = 256 - wb;
+        for (int i = 0; i < n; i++) {
+            int out = 0xFF000000;
+            for (int sh = 0; sh <= 16; sh += 8) {
+                out |= ((((pa[i] >> sh) & 0xFF) * wa + ((pb[i] >> sh) & 0xFF) * wb + 128) >> 8) << sh;
+            }
+            pa[i] = out;
+        }
+        Bitmap o = Bitmap.createBitmap(width, h, Bitmap.Config.ARGB_8888);
+        o.setPixels(pa, 0, width, 0, 0, width, h);
+        return o;
+    }
+
+    /**
+     * ポーズ切替 video (worker thread): every pose is an img2img of the same base frame (frame 1 / the input
+     * image) with the same seed, so the subject stays put; in-between frames are img2img (lower strength) of
+     * the cross-faded neighbouring poses with a blended prompt (NPU) or the nearer prompt (CPU / GPU). One
+     * cycle of {@code cycle} frames is generated and repeated, so the video loops seamlessly.
+     */
+    private final class PoseRun {
+        final String[] prompts;
+        final String negative;
+        final int frames, cycle, size, steps, method, maskMode;
+        final float cfg, strength;
+        final Bitmap start;
+        final byte[] paintedMask;
+        final boolean colorLock;
+        long seed;
+        int done = 0, generated = 0;
+        String error;
+        private Bitmap base;
+        private byte[] mask;
+
+        PoseRun(String[] prompts, String negative, int frames, int cycle, int size, int steps, float cfg,
+                float strength, int method, long seed, Bitmap start, int maskMode, byte[] paintedMask,
+                boolean colorLock) {
+            this.prompts = prompts;
+            this.negative = negative;
+            this.frames = frames;
+            this.cycle = cycle;
+            this.size = size;
+            this.steps = steps;
+            this.cfg = cfg;
+            this.strength = strength;
+            this.method = method;
+            this.seed = seed;
+            this.start = start;
+            this.maskMode = maskMode;
+            this.paintedMask = paintedMask;
+            this.colorLock = colorLock;
+        }
+
+        void run(File out, int fps) throws IOException {
+            int poses = prompts.length, unique = Math.min(frames, cycle);
+            Bitmap[] key = new Bitmap[poses];
+            Bitmap[] loop = new Bitmap[unique];
+            int total = poses;
+            for (int c = 0; c < unique; c++) if (!isKey(c)) total++;
+            final int t = total;
+            runOnUiThread(() -> batchTotal = t);
+
+            // poses first (their order is the cycle order), then the in-betweens
+            if (start == null) {
+                SdModelManager.Result r = manager.txt2img(prompts[0], negative, size, size, steps, cfg, seed, method);
+                if (!accept(r)) return;
+                base = rgbToBitmap(r.rgb, r.width, r.height);
+                key[0] = base;
+                shown(base);
+            } else {
+                base = Bitmap.createScaledBitmap(start, size, size, true);
+            }
+            if (maskMode == 1) {
+                mask = ChangeMask.faces(base, 4);
+                if (mask == null) appendLogUi("動画: 1 コマ目に顔が見つからないため全体を変化させます");
+            } else if (maskMode == 2) {
+                mask = paintedMask;
+            }
+            for (int i = 0; i < poses; i++) {
+                if (key[i] != null) continue;
+                Bitmap k = gen(base, prompts[i], null, 0f, strength);
+                if (k == null) break;
+                key[i] = k;
+            }
+            boolean keysOk = true;
+            for (Bitmap k : key) keysOk &= k != null;
+            if (keysOk) {
+                float inStrength = Math.max(0.15f, strength * 0.6f);
+                for (int c = 0; c < unique; c++) {
+                    float u = c * (float) poses / cycle;
+                    int i = (int) u, j = (i + 1) % poses;
+                    float w = u - i;
+                    if (isKey(c)) {
+                        loop[c] = key[i];
+                        continue;
+                    }
+                    Bitmap f = gen(crossfade(key[i], key[j], w), prompts[i], prompts[j], w, inStrength);
+                    if (f == null) break;
+                    loop[c] = f;
+                }
+            }
+            // encode the generated prefix of the cycle, repeated up to `frames`
+            int have = 0;
+            while (have < unique && loop[have] != null) have++;
+            if (have < unique) {
+                appendLogUi("動画: 1 周ぶんがそろわなかったため、できた " + have + " コマだけを保存します");
+            }
+            int n = have < unique ? have : frames;
+            if (n < 2) return;
+            try (VideoEncoder enc = new VideoEncoder(out, size, size, fps)) {
+                for (int k = 0; k < n; k++) enc.addFrame(loop[k % have]);
+                enc.finish();
+            }
+            done = n;
+        }
+
+        private boolean isKey(int c) {
+            return (c * prompts.length) % cycle == 0;
+        }
+
+        /** img2img of {@code src}; null on error / cancel. */
+        private Bitmap gen(Bitmap src, String a, String b, float mix, float str) {
+            if (manager.isCancelRequested()) return null;
+            int[] sched = img2imgSchedule(steps, str);
+            float sdStrength = (sched[1] - 0.5f) / sched[0];
+            SdModelManager.Result r = manager.img2imgBlend(bitmapToRgb(src), a, b, mix, negative, size, size,
+                    sched[0], cfg, sdStrength, seed, method);
+            if (!accept(r)) return null;
+            Bitmap f = rgbToBitmap(r.rgb, r.width, r.height);
+            if (mask != null) f = ChangeMask.composite(f, base, mask);
+            if (colorLock) f = matchColors(f, base);
+            shown(f);
+            return f;
+        }
+
+        private boolean accept(SdModelManager.Result r) {
+            if (!r.ok()) {
+                if (!r.cancelled) error = r.error.isEmpty() ? "原因不明（ログ参照）" : r.error;
+                return false;
+            }
+            if (seed < 0) seed = r.seed;   // one seed for every pose (the subject stays the same)
+            return true;
+        }
+
+        private void shown(Bitmap f) {
+            final int next = ++generated;
+            runOnUiThread(() -> onVideoFrame(f, next));
+        }
     }
 
     private void onVideoFrame(Bitmap frame, int next) {

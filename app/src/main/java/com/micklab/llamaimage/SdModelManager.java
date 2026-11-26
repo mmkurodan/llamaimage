@@ -240,12 +240,20 @@ public final class SdModelManager {
     /** NPU generation (fixed 512x512; LCM / Euler a / Euler / DPM++ 2M). Caller holds the lock. */
     private Result npuGenerate(byte[] initRgb, String prompt, String negativePrompt, int width, int height,
                                int steps, float cfgScale, float strength, long seed, int sampleMethod) {
+        return npuGenerate(initRgb, prompt, null, 0f, negativePrompt, width, height, steps, cfgScale, strength, seed,
+                sampleMethod);
+    }
+
+    private Result npuGenerate(byte[] initRgb, String prompt, String prompt2, float mix, String negativePrompt,
+                               int width, int height, int steps, float cfgScale, float strength, long seed,
+                               int sampleMethod) {
         if (width != NpuPipeline.SIZE || height != NpuPipeline.SIZE) {
             return new Result(null, width, height, seed, false, "NPU は 512×512 のみ対応です");
         }
         busy = true;
         try {
-            byte[] rgb = npu.generate(prompt, negativePrompt, steps, cfgScale, seed, initRgb, strength, sampleMethod,
+            byte[] rgb = npu.generate(prompt, prompt2, mix, negativePrompt, steps, cfgScale, seed, initRgb, strength,
+                    sampleMethod,
                     new NpuPipeline.Listener() {
                         @Override public void onStep(int step, int total) {
                             Listener l = listener;
@@ -321,6 +329,26 @@ public final class SdModelManager {
         } finally {
             busy = false;
         }
+    }
+
+    /**
+     * img2img conditioned on a blend of two prompts ({@code mix} 0 = prompt, 1 = prompt2). The NPU pipeline
+     * blends the text embeddings; the CPU / GPU engine only takes one prompt, so it uses the nearer one.
+     */
+    public synchronized Result img2imgBlend(byte[] initRgb, String prompt, String prompt2, float mix,
+                                            String negativePrompt, int width, int height, int steps,
+                                            float cfgScale, float strength, long seed, int sampleMethod) {
+        if (loaded != null && !cancelRequested && npu != null) {
+            return npuGenerate(initRgb, prompt, prompt2, mix, negativePrompt, width, height, steps, cfgScale,
+                    strength, seed, sampleMethod);
+        }
+        return img2img(initRgb, mix < 0.5f || prompt2 == null ? prompt : prompt2, negativePrompt, width, height,
+                steps, cfgScale, strength, seed, sampleMethod);
+    }
+
+    /** True if {@link #img2imgBlend} really blends prompts (NPU), false if it picks the nearer one. */
+    public boolean blendsPrompts() {
+        return npu != null;
     }
 
     private Result finish(byte[] rgb, int width, int height) {
