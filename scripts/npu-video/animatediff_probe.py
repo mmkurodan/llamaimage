@@ -158,15 +158,21 @@ def main():
         del vae
 
     # --- 3. ONNX Runtime CPU vs PyTorch at the export shape ---
+    import gc
     import onnxruntime as ort
+    _, ref = adp.run_chain(mods, x, t, ehs)
+    del mods, unet          # free the PyTorch UNet (2.6 GB) before ORT loads the parts
+    gc.collect()
     so = ort.SessionOptions()
     so.intra_op_num_threads = 8
     # Host CPU only: the extended optimizer fuses Erf-GELU into com.microsoft.Gelu, which ORT-CPU
     # has no float16 kernel for (the HTP path does its own lowering).
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    # No per-session arena: each of the n sessions would keep its peak (batch-8 attention scores)
+    # and the CI runner (16 GB) was killed with 7 parts.
+    so.enable_cpu_mem_arena = False
     sess = {nm: ort.InferenceSession(os.path.join(a.out, f"{nm}.onnx"), so, providers=["CPUExecutionProvider"])
             for nm in names}
-    _, ref = adp.run_chain(mods, x, t, ehs)
     t1 = time.time()
     got = run_onnx(sess, names, x.float().numpy(), t.numpy(), ehs.float().numpy())
     dt = time.time() - t1

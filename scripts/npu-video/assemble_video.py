@@ -67,6 +67,7 @@ def verify(assembled, original):
 def run(out, names):
     import onnxruntime as ort
     so = ort.SessionOptions()
+    so.enable_cpu_mem_arena = False                       # n sessions: don't keep n peaks
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC   # no fp16 Gelu on CPU
     sess = [ort.InferenceSession(os.path.join(out, f"{video_name(p)}.onnx"), so,
                                  providers=["CPUExecutionProvider"]) for p in names]

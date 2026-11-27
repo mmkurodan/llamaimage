@@ -97,6 +97,7 @@ public final class NpuVideoPipeline implements Closeable {
         OrtSession.SessionOptions so = new OrtSession.SessionOptions();
         // The fp16 graphs: ORT-CPU has no float16 kernel for the fused com.microsoft.Gelu etc.
         so.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT);
+        so.setCPUArenaAllocator(false);   // several CPU sessions (JVM test: every UNet part)
         return env.createSession(model.getAbsolutePath(), so);
     }
 

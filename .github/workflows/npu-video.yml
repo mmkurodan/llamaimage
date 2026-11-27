@@ -47,15 +47,15 @@ jobs:
 
       - name: Export + check vs PyTorch + reference video (ORT CPU)
         run: |
-          python scripts/npu-video/animatediff_probe.py --checkpoint ck/ar181.safetensors --adapter ck/adl4.safetensors \
+          python -u scripts/npu-video/animatediff_probe.py --checkpoint ck/ar181.safetensors --adapter ck/adl4.safetensors \
             --out vmodels --frames "$FRAMES" --size "$SIZE" --budget-mb "$BUDGET_MB" --generate
 
       - name: Templates + device-equivalent assembly (byte-verified, one ORT pass)
         run: |
           set -e
-          python scripts/npu-video/make_video_template.py --models vmodels --checkpoint ck/ar181.safetensors \
+          python -u scripts/npu-video/make_video_template.py --models vmodels --checkpoint ck/ar181.safetensors \
             --motion ck/adl4.safetensors --out vtemplates
-          python scripts/npu-video/assemble_video.py --templates vtemplates --checkpoint ck/ar181.safetensors \
+          python -u scripts/npu-video/assemble_video.py --templates vtemplates --checkpoint ck/ar181.safetensors \
             --motion ck/adl4.safetensors --out vasm --verify vmodels --run
           cp vmodels/taesd_decoder_video.onnx vasm/
 
