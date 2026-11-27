@@ -52,6 +52,16 @@ public final class NpuVideoPipeline implements Closeable {
      */
     public NpuVideoPipeline(File baseDir, File videoDir, Map<String, String> qnnOptions, File cacheDir,
                             NpuPipeline.Log log) throws IOException {
+        this(baseDir, videoDir, qnnOptions, cacheDir, log, new java.util.HashSet<>());
+    }
+
+    /**
+     * @param failed parts known not to compile for the HTP (skipped; parts whose compile throws are
+     *               added). Every other part is still compiled and cached, so one run maps out all
+     *               problem parts; then this throws, naming them.
+     */
+    public NpuVideoPipeline(File baseDir, File videoDir, Map<String, String> qnnOptions, File cacheDir,
+                            NpuPipeline.Log log, java.util.Set<String> failed) throws IOException {
         parts = partsIn(videoDir, ".onnx");
         if (parts.length == 0) throw new IOException("動画 UNet がありません: " + videoDir);
         unet = new OrtSession[parts.length];
@@ -61,8 +71,23 @@ public final class NpuVideoPipeline implements Closeable {
             if (qnnOptions != null && cacheDir != null) {
                 for (int i = 0; i < parts.length; i++) {          // pass 1: compile + cache, one at a time
                     if (NpuPipeline.contextFile(cacheDir, parts[i]).isFile()) continue;
+                    if (failed.contains(parts[i])) {
+                        log.log("NPU " + parts[i] + ": 前回失敗したため飛ばします");
+                        continue;
+                    }
                     log.stage(i + 1, parts.length, parts[i]);
-                    unet[i] = NpuPipeline.compile(new File(videoDir, parts[i] + ".onnx"), qnnOptions, cacheDir, log);
+                    try {
+                        unet[i] = NpuPipeline.compile(new File(videoDir, parts[i] + ".onnx"), qnnOptions, cacheDir, log);
+                    } catch (OrtException e) {
+                        failed.add(parts[i]);
+                        log.log("NPU " + parts[i] + ": 最適化に失敗 — " + e.getMessage());
+                    }
+                }
+                log.stage(0, parts.length, null);                  // compiling finished
+                if (!failed.isEmpty()) {
+                    java.util.List<String> f = new java.util.ArrayList<>(failed);
+                    java.util.Collections.sort(f, (a, b) -> Integer.compare(index(a), index(b)));
+                    throw new IllegalStateException("NPU で最適化できないパート " + f.size() + " 個: " + f);
                 }
             }
             for (int i = 0; i < parts.length; i++) {              // pass 2: open from the cache
@@ -90,6 +115,19 @@ public final class NpuVideoPipeline implements Closeable {
             float beta = 0.00085f + (0.012f - 0.00085f) * t / (TRAIN_STEPS - 1);
             acp *= 1.0 - beta;
             sigmaTable[t] = Math.sqrt((1.0 - acp) / acp);
+        }
+    }
+
+    /** The video asset set this build expects (failed-part records are kept per set). */
+    public static String assetsVersion() {
+        return NpuVideoAssets.VERSION;
+    }
+
+    private static int index(String part) {
+        try {
+            return Integer.parseInt(part.substring(part.lastIndexOf('_') + 1));
+        } catch (RuntimeException e) {
+            return Integer.MAX_VALUE;
         }
     }
 

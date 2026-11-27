@@ -90,7 +90,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-export", action="store_true")
     ap.add_argument("--budget-mb", type=float, default=adp.DEFAULT_BUDGET_MB,
-                    help="max fp16 weights per part (layer granularity)")
+                    help="max fp16 weights per part (layer granularity); 0 = one layer per part")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     F, L = a.frames, a.size // 8
@@ -124,8 +124,13 @@ def main():
         raise SystemExit("rewrite/split does not match diffusers")
 
     mods = adp.parts(unet, F, a.budget_mb)
+    desc = []
     for nm, first, last, size in adp.describe(unet, a.budget_mb):
         print(f"[probe] {nm}: {first} .. {last}  {size} MB")
+        desc.append({"name": "v" + nm, "layers": first if first == last else f"{first} .. {last}", "mb": size})
+    import json
+    with open(os.path.join(a.out, "video_parts.json"), "w") as f:     # shipped: the app logs it
+        json.dump({"frames": F, "size": a.size, "budget_mb": a.budget_mb, "parts": desc}, f, indent=1)
     names = [m[0] for m in mods]
     x = torch.randn(F, 4, L, L, generator=g).half()
     t = torch.tensor([999.0])

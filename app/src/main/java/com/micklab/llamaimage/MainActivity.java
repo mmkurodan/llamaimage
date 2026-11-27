@@ -272,9 +272,23 @@ public class MainActivity extends Activity {
         }
         if (prefs().getBoolean(PREFS_NPU_VIDEO_PENDING, false)) {
             prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).apply();
-            appendLog("NPU 動画（試験）: 前回は NPU 向け最適化の途中でアプリが終了しました");
-            String why = lastExitReason();
-            if (why != null) appendLog(why);
+            String part = prefs().getString(PREFS_NPU_VIDEO_COMPILING, null);
+            String dog = prefs().getString(PREFS_NPU_VIDEO_WATCHDOG, null);
+            prefs().edit().remove(PREFS_NPU_VIDEO_COMPILING).remove(PREFS_NPU_VIDEO_WATCHDOG).apply();
+            appendLog("NPU 動画（試験）: 前回は NPU 向け最適化の途中でアプリが終了しました"
+                    + (part != null ? "（" + part + "）" : ""));
+            if (dog != null) appendLog("  → " + dog);
+            else {
+                String why = lastExitReason();
+                if (why != null) appendLog(why);
+            }
+            if (part != null) {
+                java.util.Set<String> failed = loadVideoFailed();
+                failed.add(part);
+                saveVideoFailed(failed);
+                appendLog("  → " + part + " を「最適化できないパート」に記録しました。次回はこれを飛ばして残りを最適化します"
+                        + "（ボタンの長押しで記録を消去）");
+            }
         }
 
         generateButton.setOnClickListener(v -> {
@@ -2312,6 +2326,12 @@ public class MainActivity extends Activity {
         Button npuVideo = button("NPU 動画（試験: AnimateDiff-Lightning 8 コマ 256px）", BTN_GHOST);
         npuVideo.setTextSize(13);
         npuVideo.setOnClickListener(x -> startNpuVideoTest());
+        npuVideo.setOnLongClickListener(x -> {
+            saveVideoFailed(new java.util.HashSet<>());
+            Toast.makeText(this, "NPU 動画: 失敗パートの記録を消去しました", Toast.LENGTH_SHORT).show();
+            appendLog("NPU 動画: 失敗パートの記録を消去");
+            return true;
+        });
         v.addView(npuVideo, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(44), 0, 10, 0, 0));
 
         TextView hint = text("1 コマ目をプロンプトから（または「画像→画像」の入力画像から）作り、少しズームしながら"
@@ -2328,6 +2348,27 @@ public class MainActivity extends Activity {
     }
 
     static final String PREFS_NPU_VIDEO_PENDING = "npu_video_pending";
+    static final String PREFS_NPU_VIDEO_COMPILING = "npu_video_compiling";
+    static final String PREFS_NPU_VIDEO_WATCHDOG = "npu_video_watchdog";
+    static final String PREFS_NPU_VIDEO_FAILED = "npu_video_failed";
+    /** Compile memory limit: the process is ended (part recorded) before Android kills it. */
+    static final int NPU_VIDEO_RSS_LIMIT_MB = 5000;
+
+    /** Parts that did not compile for the HTP, for the current video asset set. */
+    private java.util.Set<String> loadVideoFailed() {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        String v = prefs().getString(PREFS_NPU_VIDEO_FAILED, "");
+        String tag = com.micklab.llamaimage.npu.NpuVideoPipeline.assetsVersion() + "|";
+        if (v.startsWith(tag) && v.length() > tag.length()) {
+            out.addAll(java.util.Arrays.asList(v.substring(tag.length()).split(",")));
+        }
+        return out;
+    }
+
+    private void saveVideoFailed(java.util.Set<String> failed) {
+        prefs().edit().putString(PREFS_NPU_VIDEO_FAILED,
+                com.micklab.llamaimage.npu.NpuVideoPipeline.assetsVersion() + "|" + String.join(",", failed)).commit();
+    }
 
     /**
      * Experimental: text-to-video with AnimateDiff-Lightning on the NPU (NpuVideoPipeline). Frees
@@ -2404,6 +2445,8 @@ public class MainActivity extends Activity {
                 long t2 = SystemClock.elapsedRealtime();
                 vcModelId = spec.id;
                 com.micklab.llamaimage.npu.NpuPipeline.compileLogInfo = true;
+                java.util.Set<String> failed = loadVideoFailed();
+                if (!failed.isEmpty()) appendLogUi("NPU 動画: 前回までに失敗したパート " + failed.size() + " 個を飛ばします: " + failed);
                 try {
                     vp = nm.openVideo(spec.id, new com.micklab.llamaimage.npu.NpuPipeline.Log() {
                         @Override public void log(String msg) {
@@ -2411,11 +2454,16 @@ public class MainActivity extends Activity {
                         }
 
                         @Override public void stage(int index, int total, String name) {
+                            // on the worker, BEFORE the compile: survives a kill (next start marks it failed)
+                            if (name != null) prefs().edit().putString(PREFS_NPU_VIDEO_COMPILING, name).commit();
+                            else prefs().edit().remove(PREFS_NPU_VIDEO_COMPILING).commit();
                             runOnUiThread(() -> vCompileStage(index, total, name));
                         }
-                    });
+                    }, failed);
                 } finally {
                     com.micklab.llamaimage.npu.NpuPipeline.compileLogInfo = false;
+                    prefs().edit().remove(PREFS_NPU_VIDEO_COMPILING).commit();
+                    saveVideoFailed(failed);   // + parts whose compile threw
                     runOnUiThread(() -> vCompileStage(0, 0, null));
                 }
                 prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).commit();
@@ -2505,8 +2553,8 @@ public class MainActivity extends Activity {
             long now = SystemClock.elapsedRealtime();
             double el = (now - vcStageStart) / 1000.0;
             int mb = vPartMb(vcName);
-            StringBuilder sb = new StringBuilder("NPU 向け最適化 " + vcIndex + "/" + vcTotal + "（" + vcName + "・" + mb
-                    + " MB）経過 " + formatDuration((long) el) + "／合計 " + formatDuration((now - vcStart) / 1000));
+            StringBuilder sb = new StringBuilder("NPU 向け最適化 " + vcIndex + "/" + vcTotal + "（" + vcName + ": "
+                    + partInfo(vcName) + "）経過 " + formatDuration((long) el) + "／合計 " + formatDuration((now - vcStart) / 1000));
             int pct;
             if (vcRate > 0) {
                 double est = vcRate * mb;
@@ -2518,7 +2566,7 @@ public class MainActivity extends Activity {
                 sb.append("／残り時間は 1 パート目の完了後に表示");
                 pct = (int) Math.round(100.0 * vcMbDone / Math.max(1, vcMbAll));
             }
-            sb.append("\n").append(memLine());
+            sb.append("\n").append(memLine()).append("・このパートのピーク ").append(vcPeakMb).append(" MB");
             String ort = vcOrtLine;
             if (!ort.isEmpty()) sb.append("\nORT: ").append(ort.length() > 140 ? ort.substring(0, 140) + "…" : ort);
             setStatus(sb.toString());
@@ -2539,7 +2587,8 @@ public class MainActivity extends Activity {
             double secs = (now - vcStageStart) / 1000.0;
             vcMbDone += mb;
             vcSecsDone += secs;
-            appendLog("NPU 動画: " + vcName + " 最適化 " + formatDuration((long) secs) + "（" + mb + " MB）/ " + memLine());
+            appendLog("NPU 動画: " + vcName + " 最適化 " + formatDuration((long) secs) + "・ピーク " + vcPeakMb
+                    + " MB（" + partInfo(vcName) + "）/ " + memLine());
             if (vcSecsDone > 5) {                // this run's measured s/MB (replaces the last run's)
                 vcRate = vcSecsDone / vcMbDone;
                 prefs().edit().putFloat(PREFS_NPU_VIDEO_RATE, (float) vcRate).apply();
@@ -2550,6 +2599,7 @@ public class MainActivity extends Activity {
             vcIndex = 0;
             stopMemWatch();
             stopOrtLogTail();
+            stopVcWatchdog();
             return;
         }
         if (vcStart == 0) {                      // first part compiled in this run
@@ -2563,14 +2613,69 @@ public class MainActivity extends Activity {
             vcRate = prefs().getFloat(PREFS_NPU_VIDEO_RATE, 0f);
             startMemWatch();
             startOrtLogTail();
+            startVcWatchdog();
         }
         vcIndex = index;
         vcTotal = total;
         vcName = name;
         vcStageStart = now;
-        appendLog("NPU 動画: " + name + " の最適化を開始（" + index + "/" + total + "）/ " + memLine());
+        vcPeakMb = rssMb();
+        appendLog("NPU 動画: " + name + " 最適化開始 " + index + "/" + total + "（" + partInfo(name) + "）/ " + memLine());
         ui.removeCallbacks(vcTicker);
         vcTicker.run();
+    }
+
+    private volatile int vcPeakMb = 0;
+    private Thread vcWatchdog;
+
+    private String partInfo(String part) {
+        String i = vcModelId == null ? null : npu().videoPartInfo(part);
+        return i != null ? i : vPartMb(part) + " MB";
+    }
+
+    private static int rssMb() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/self/status"))) {
+            String l;
+            while ((l = r.readLine()) != null) {
+                if (l.startsWith("VmRSS:")) return (int) (Long.parseLong(l.replaceAll("[^0-9]", "")) / 1024);
+            }
+        } catch (Exception ignore) {
+        }
+        return -1;
+    }
+
+    /**
+     * Samples RSS 4x/s while compiling: keeps the part's peak and, past NPU_VIDEO_RSS_LIMIT_MB
+     * (the HTP compile of one part blew up by ~2 GB per 3 s up to an Android kill), records the
+     * part and ends the process itself, so the next start knows which part it was.
+     */
+    private void startVcWatchdog() {
+        stopVcWatchdog();
+        vcWatchdog = new Thread(() -> {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    int r = rssMb();
+                    if (r > vcPeakMb) vcPeakMb = r;
+                    if (r > NPU_VIDEO_RSS_LIMIT_MB) {
+                        String msg = "メモリ監視: " + vcName + "（" + partInfo(vcName) + "）の最適化中にアプリのメモリが "
+                                + r + " MB（上限 " + NPU_VIDEO_RSS_LIMIT_MB + " MB）に達したため中止しました";
+                        prefs().edit().putString(PREFS_NPU_VIDEO_WATCHDOG, msg).commit();
+                        persistLog(msg);
+                        android.os.Process.killProcess(android.os.Process.myPid());
+                    }
+                    Thread.sleep(250);
+                }
+            } catch (InterruptedException ignore) {
+            }
+        }, "npu-video-watchdog");
+        vcWatchdog.start();
+    }
+
+    private void stopVcWatchdog() {
+        if (vcWatchdog != null) {
+            vcWatchdog.interrupt();
+            vcWatchdog = null;
+        }
     }
 
     /** Follows this process's logcat (allowed for its own lines) for ORT/QNN messages. */

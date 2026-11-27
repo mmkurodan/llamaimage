@@ -216,8 +216,24 @@ public final class NpuManager {
     }
 
     /** Opens the video pipeline (compiles + caches the 3 video UNet parts on first use). */
-    public NpuVideoPipeline openVideo(String modelId, NpuPipeline.Log log) throws IOException {
-        return new NpuVideoPipeline(modelDir(modelId), videoDir(modelId), htpOptions(log), videoCacheDir(modelId), log);
+    public NpuVideoPipeline openVideo(String modelId, NpuPipeline.Log log, java.util.Set<String> failed)
+            throws IOException {
+        return new NpuVideoPipeline(modelDir(modelId), videoDir(modelId), htpOptions(log), videoCacheDir(modelId), log,
+                failed);
+    }
+
+    /** "d0.mm0（5 MB）" for a video part, from the release's video_parts.json (null if unknown). */
+    public String videoPartInfo(String part) {
+        try {
+            org.json.JSONArray a = new org.json.JSONObject(IoUtil.readString(new File(videoAssetDir(), "video_parts.json")))
+                    .getJSONArray("parts");
+            for (int i = 0; i < a.length(); i++) {
+                org.json.JSONObject o = a.getJSONObject(i);
+                if (part.equals(o.getString("name"))) return o.getString("layers") + "（" + o.getInt("mb") + " MB）";
+            }
+        } catch (Exception ignore) {
+        }
+        return null;
     }
 
     /** Removes only the compiled HTP contexts of {@code modelId}: the next open recompiles them. */
