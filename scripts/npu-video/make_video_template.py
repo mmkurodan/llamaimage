@@ -5,7 +5,7 @@ Weights come from TWO files on the device: the SD1.5 checkpoint (keys "model.dif
 and the motion module (AnimateDiff-Lightning diffusers safetensors). Motion keys are written to
 the map with a "motion:" prefix; the app reads those from the motion file.
 
-Outputs: vunet_{0,1,2}.template.onnx + .map.json (weights file vunet_N.weights).
+Outputs: vunet_{0..n-1}.template.onnx + .map.json (weights file vunet_N.weights).
 """
 import argparse
 import os
@@ -17,9 +17,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(1, os.path.join(HERE, "..", "npu"))
 import make_template  # noqa: E402
-from animatediff_parts import NAMES  # noqa: E402
 
 MOTION_PREFIX = "motion:"
+
+
+def part_names(models_dir):
+    """unet_0 .. unet_{n-1} as exported (the count depends on the split budget)."""
+    n = 0
+    while os.path.isfile(os.path.join(models_dir, f"unet_{n}.onnx")):
+        n += 1
+    if n == 0:
+        raise SystemExit(f"no unet_*.onnx in {models_dir}")
+    return [f"unet_{k}" for k in range(n)]
 
 
 def video_name(part):
@@ -48,7 +57,7 @@ def main():
     must = make_template.MUST_MATCH_ELEMS
     make_template.MUST_MATCH_ELEMS = 1 << 62
     try:
-        for part in NAMES:
+        for part in part_names(a.models):
             make_template.make(os.path.join(a.models, f"{part}.onnx"), ck, video_name(part), a.out)
             check_inline(os.path.join(a.out, f"{video_name(part)}.template.onnx"), must)
     finally:

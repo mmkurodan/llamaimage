@@ -270,6 +270,12 @@ public class MainActivity extends Activity {
             String why = lastExitReason();
             if (why != null) appendLog(why);
         }
+        if (prefs().getBoolean(PREFS_NPU_VIDEO_PENDING, false)) {
+            prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).apply();
+            appendLog("NPU 動画（試験）: 前回は NPU 向け最適化の途中でアプリが終了しました");
+            String why = lastExitReason();
+            if (why != null) appendLog(why);
+        }
 
         generateButton.setOnClickListener(v -> {
             if (currentTab == TAB_VIDEO) startVideoGeneration();
@@ -2307,10 +2313,6 @@ public class MainActivity extends Activity {
         npuVideo.setTextSize(13);
         npuVideo.setOnClickListener(x -> startNpuVideoTest());
         v.addView(npuVideo, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(44), 0, 10, 0, 0));
-        if (prefs().getBoolean(PREFS_NPU_VIDEO_PENDING, false)) {
-            prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).apply();
-            appendLog("NPU 動画（試験）: 前回は途中でアプリが終了しました（NPU 向け最適化中のメモリ不足で強制終了された可能性）");
-        }
 
         TextView hint = text("1 コマ目をプロンプトから（または「画像→画像」の入力画像から）作り、少しズームしながら"
                 + "画像→画像を繰り返して動画（音なし MP4）にします。シードは全コマ共通（-1 なら最初に決めた値）。"
@@ -2398,17 +2400,24 @@ public class MainActivity extends Activity {
                 nm.ensureVideoBuilt(spec.id, file, spec.sha256, this::setStatusUi);
                 appendLogUi("NPU 動画: ファイル準備 " + (SystemClock.elapsedRealtime() - t1) / 1000 + "s / " + memInfo());
                 prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, true).commit();   // killed while compiling?
-                setStatusUi("NPU 動画: NPU 向け最適化中…（初回は数分）");
+                setStatusUi("NPU 動画: セッション準備中…");
                 long t2 = SystemClock.elapsedRealtime();
-                vp = nm.openVideo(spec.id, new com.micklab.llamaimage.npu.NpuPipeline.Log() {
-                    @Override public void log(String msg) {
-                        appendLogUi(msg + " / " + memInfo());
-                    }
+                vcModelId = spec.id;
+                com.micklab.llamaimage.npu.NpuPipeline.compileLogInfo = true;
+                try {
+                    vp = nm.openVideo(spec.id, new com.micklab.llamaimage.npu.NpuPipeline.Log() {
+                        @Override public void log(String msg) {
+                            appendLogUi(msg + " / " + memInfo());
+                        }
 
-                    @Override public void stage(int index, int total, String name) {
-                        setStatusUi("NPU 動画: 最適化中 " + index + "/" + total + "（" + name + "）… 初回は数分");
-                    }
-                });
+                        @Override public void stage(int index, int total, String name) {
+                            runOnUiThread(() -> vCompileStage(index, total, name));
+                        }
+                    });
+                } finally {
+                    com.micklab.llamaimage.npu.NpuPipeline.compileLogInfo = false;
+                    runOnUiThread(() -> vCompileStage(0, 0, null));
+                }
                 prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).commit();
                 appendLogUi("NPU 動画: セッション準備 " + (SystemClock.elapsedRealtime() - t2) / 1000 + "s（"
                         + vp.frames + " コマ " + vp.size + "px）/ " + memInfo());
@@ -2469,6 +2478,134 @@ public class MainActivity extends Activity {
                 ensureModelLoaded();   // the image model was released for the test
             });
         });
+    }
+
+    // --- NPU video: compile progress ---------------------------------------------------------
+    // ORT compiles a graph in one blocking call with no progress, so this shows what is knowable:
+    // part i/n and its size, elapsed time (part / total), an ETA from the measured s/MB (earlier
+    // parts of this run, else the last run's rate), live memory, and the newest ORT/QNN log line
+    // (INFO while compiling, read back from this app's own logcat; best effort).
+    private String vcModelId;
+
+    private int vPartMb(String part) {
+        int mb = vcModelId == null ? 0 : npu().videoPartMb(vcModelId, part);
+        return mb > 0 ? mb : 500;
+    }
+    private static final String PREFS_NPU_VIDEO_RATE = "npu_video_s_per_mb";
+    private int vcIndex = 0, vcTotal = 0, vcMbDone = 0, vcMbAll = 0;
+    private String vcName;
+    private long vcStageStart = 0, vcStart = 0;
+    private double vcRate = 0, vcSecsDone = 0;   // s per MB (measured), compile seconds so far
+    private volatile String vcOrtLine = "";
+    private Process vcLogcat;
+
+    private final Runnable vcTicker = new Runnable() {
+        @Override public void run() {
+            if (vcIndex <= 0) return;
+            long now = SystemClock.elapsedRealtime();
+            double el = (now - vcStageStart) / 1000.0;
+            int mb = vPartMb(vcName);
+            StringBuilder sb = new StringBuilder("NPU 向け最適化 " + vcIndex + "/" + vcTotal + "（" + vcName + "・" + mb
+                    + " MB）経過 " + formatDuration((long) el) + "／合計 " + formatDuration((now - vcStart) / 1000));
+            int pct;
+            if (vcRate > 0) {
+                double est = vcRate * mb;
+                double rest = Math.max(0, est - el) + vcRate * (vcMbAll - vcMbDone - mb);
+                sb.append("／残り約 ").append(formatDuration((long) rest)).append(el > est ? "（予想より長くかかっています）" : "");
+                double within = Math.min(0.97, el / Math.max(1, est));
+                pct = (int) Math.round(100.0 * (vcMbDone + within * mb) / Math.max(1, vcMbAll));
+            } else {
+                sb.append("／残り時間は 1 パート目の完了後に表示");
+                pct = (int) Math.round(100.0 * vcMbDone / Math.max(1, vcMbAll));
+            }
+            sb.append("\n").append(memLine());
+            String ort = vcOrtLine;
+            if (!ort.isEmpty()) sb.append("\nORT: ").append(ort.length() > 140 ? ort.substring(0, 140) + "…" : ort);
+            setStatus(sb.toString());
+            progressBar.setVisibility(View.VISIBLE);
+            progressBar.setIndeterminate(false);
+            progressBar.setMax(100);
+            progressBar.setProgress(pct);
+            progressBar.setSecondaryProgress((int) Math.round(100.0 * (vcMbDone + mb) / Math.max(1, vcMbAll)));
+            ui.postDelayed(this, 1000);
+        }
+    };
+
+    /** Part {@code index} of {@code total} starts compiling; index 0 = compiling finished. */
+    private void vCompileStage(int index, int total, String name) {
+        long now = SystemClock.elapsedRealtime();
+        if (vcIndex > 0) {                       // the previous part finished
+            int mb = vPartMb(vcName);
+            double secs = (now - vcStageStart) / 1000.0;
+            vcMbDone += mb;
+            vcSecsDone += secs;
+            appendLog("NPU 動画: " + vcName + " 最適化 " + formatDuration((long) secs) + "（" + mb + " MB）/ " + memLine());
+            if (vcSecsDone > 5) {                // this run's measured s/MB (replaces the last run's)
+                vcRate = vcSecsDone / vcMbDone;
+                prefs().edit().putFloat(PREFS_NPU_VIDEO_RATE, (float) vcRate).apply();
+            }
+        }
+        if (index <= 0) {
+            ui.removeCallbacks(vcTicker);
+            vcIndex = 0;
+            stopMemWatch();
+            stopOrtLogTail();
+            return;
+        }
+        if (vcStart == 0) {                      // first part compiled in this run
+            vcStart = now;
+            vcMbDone = 0;
+            vcSecsDone = 0;
+            vcMbAll = 0;
+            for (int i = index; i <= total; i++) {
+                vcMbAll += vPartMb("vunet_" + (i - 1));
+            }
+            vcRate = prefs().getFloat(PREFS_NPU_VIDEO_RATE, 0f);
+            startMemWatch();
+            startOrtLogTail();
+        }
+        vcIndex = index;
+        vcTotal = total;
+        vcName = name;
+        vcStageStart = now;
+        appendLog("NPU 動画: " + name + " の最適化を開始（" + index + "/" + total + "）/ " + memLine());
+        ui.removeCallbacks(vcTicker);
+        vcTicker.run();
+    }
+
+    /** Follows this process's logcat (allowed for its own lines) for ORT/QNN messages. */
+    private void startOrtLogTail() {
+        stopOrtLogTail();
+        vcOrtLine = "";
+        try {
+            vcLogcat = new ProcessBuilder("logcat", "-v", "brief", "-T", "1",
+                    "--pid=" + android.os.Process.myPid(), "onnxruntime:V", "*:S").redirectErrorStream(true).start();
+        } catch (IOException e) {
+            vcLogcat = null;
+            return;
+        }
+        final Process p = vcLogcat;
+        new Thread(() -> {
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    int c = line.indexOf("): ");
+                    String msg = (c >= 0 ? line.substring(c + 3) : line).trim();
+                    if (msg.isEmpty() || msg.startsWith("---------")) continue;
+                    vcOrtLine = msg;
+                    persistLog("  ORT: " + msg);
+                }
+            } catch (IOException ignore) {
+            }
+        }, "npu-ortlog").start();
+    }
+
+    private void stopOrtLogTail() {
+        if (vcLogcat != null) {
+            vcLogcat.destroy();
+            vcLogcat = null;
+        }
+        vcStart = 0;
     }
 
     /** "RSS 1234 MB（ピーク 2345 MB）、空き 6789 MB" for the experiment logs. */

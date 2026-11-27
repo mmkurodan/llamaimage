@@ -94,6 +94,9 @@ public final class NpuPipeline implements Closeable {
         encoder = s[names.length - 1];
     }
 
+    /** When set, graph compiles log at INFO (read back from the app's own logcat for progress). */
+    public static volatile boolean compileLogInfo = false;
+
     static File contextFile(File cacheDir, String name) {
         return new File(cacheDir, name + "_ctx.onnx");
     }
@@ -127,6 +130,10 @@ public final class NpuPipeline implements Closeable {
         File ctx = cacheDir == null ? null : contextFile(cacheDir, name);
         if (cacheDir != null && !cacheDir.isDirectory()) cacheDir.mkdirs();
         OrtSession.SessionOptions so = qnnOptions(qnn);
+        if (compileLogInfo) {   // ORT/QNN INFO messages to logcat while compiling (progress display)
+            so.setSessionLogLevel(ai.onnxruntime.OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO);
+            so.setLoggerId("npu-" + name);
+        }
         if (cacheDir != null) {
             so.addConfigEntry("ep.context_enable", "1");
             so.addConfigEntry("ep.context_file_path", ctx.getAbsolutePath());

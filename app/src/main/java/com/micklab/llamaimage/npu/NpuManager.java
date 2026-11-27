@@ -160,6 +160,10 @@ public final class NpuManager {
     public void ensureVideoAssets(Status status) throws IOException {
         File dir = videoAssetDir();
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("作成できません: " + dir);
+        java.util.Set<String> wanted = new java.util.HashSet<>();
+        for (Object[] f : NpuVideoAssets.FILES) wanted.add((String) f[0]);
+        File[] old = dir.listFiles();                      // parts of an older asset set
+        if (old != null) for (File f : old) if (!wanted.contains(f.getName())) f.delete();
         for (Object[] f : NpuVideoAssets.FILES) {
             fetch(NpuVideoAssets.BASE + f[0], new File(dir, (String) f[0]), (Long) f[1], (String) f[2], status);
         }
@@ -192,16 +196,23 @@ public final class NpuManager {
             if (stamp.isFile() && IoUtil.readString(stamp).equals(want)) return;
         } catch (IOException ignore) {
         }
-        stamp.delete();
+        deleteTree(out);                      // an older split may have had more parts
         deleteTree(videoCacheDir(modelId));
         File assets = videoAssetDir();
-        for (int i = 0; i < NpuVideoPipeline.PARTS.length; i++) {
-            String label = "動画 UNet " + (i + 1) + "/" + NpuVideoPipeline.PARTS.length;
-            NpuModelAssembler.assemble(assets, NpuVideoPipeline.PARTS[i], checkpoint, motionFile(), out,
+        String[] parts = NpuVideoPipeline.partsIn(assets, ".map.json");
+        if (parts.length == 0) throw new IOException("動画用テンプレートがありません");
+        for (int i = 0; i < parts.length; i++) {
+            String label = "動画 UNet " + (i + 1) + "/" + parts.length;
+            NpuModelAssembler.assemble(assets, parts[i], checkpoint, motionFile(), out,
                     p -> status.onStatus("NPU 用に変換中（" + label + "） " + p + "%"));
         }
         IoUtil.copy(new File(assets, "taesd_decoder_video.onnx"), new File(out, "taesd_decoder_video.onnx"));
         IoUtil.writeString(stamp, want);
+    }
+
+    /** Size of a built video UNet part's weights in MB (0 if not built). */
+    public int videoPartMb(String modelId, String part) {
+        return (int) (new File(videoDir(modelId), part + ".weights").length() / 1_000_000);
     }
 
     /** Opens the video pipeline (compiles + caches the 3 video UNet parts on first use). */

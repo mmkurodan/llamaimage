@@ -2,7 +2,7 @@ name: NPU video models (AnimateDiff-Lightning)
 
 # 動画モデル（AnimateDiff-Lightning, 8 コマ x 256px）の NPU 用テンプレートを作る。SD1.5 UNet + 動きモジュールを
 # 静的形状 fp16 ONNX に書き出し、PyTorch と一致すること・端末と同じ組み立てがバイト一致することを確かめて
-# Release npu-video-v1 に公開する（重みは含まない。端末で SD1.5 モデル + 動きモジュールから組み立てる）。
+# Release npu-video-v2 に公開する（重みは含まない。端末で SD1.5 モデル + 動きモジュールから組み立てる）。
 on:
   workflow_dispatch:
   push:
@@ -14,7 +14,8 @@ permissions:
   contents: write
 
 env:
-  RELEASE_TAG: npu-video-v1
+  RELEASE_TAG: npu-video-v2
+  BUDGET_MB: '450'
   FRAMES: '8'
   SIZE: '256'
 
@@ -47,7 +48,7 @@ jobs:
       - name: Export + check vs PyTorch + reference video (ORT CPU)
         run: |
           python scripts/npu-video/animatediff_probe.py --checkpoint ck/ar181.safetensors --adapter ck/adl4.safetensors \
-            --out vmodels --frames "$FRAMES" --size "$SIZE" --generate
+            --out vmodels --frames "$FRAMES" --size "$SIZE" --budget-mb "$BUDGET_MB" --generate
 
       - name: Templates + device-equivalent assembly (byte-verified, one ORT pass)
         run: |
@@ -91,7 +92,8 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/madebyollin/taesd/main/LICENSE -o release/LICENSE-TAESD-MIT.txt
           cat > release/README.txt <<'EOF'
           Video UNet templates for llamaimage's NPU path (ONNX Runtime QNN EP, Hexagon HTP), experimental.
-          Static shapes: 8 frames x 256x256 (latents [8,4,32,32]), fp16 weights, float32 I/O, 3 chained parts.
+          Static shapes: 8 frames x 256x256 (latents [8,4,32,32]), fp16 weights, float32 I/O, chained parts of <= 450 MB
+          (layer-level split: a 1.1 GB part killed the app while compiling for the HTP).
           The templates contain NO model weights: the app writes vunet_N.weights on the device from the
           user's SD1.5 checkpoint and AnimateDiff-Lightning (ByteDance, 4-step diffusers file, CreativeML
           OpenRAIL-M: https://huggingface.co/ByteDance/AnimateDiff-Lightning) — the use restrictions of
@@ -111,7 +113,7 @@ jobs:
             echo "release $RELEASE_TAG exists — not republishing"; exit 0
           fi
           gh release create "$RELEASE_TAG" release/* --target "$GITHUB_SHA" --prerelease \
-            --title "NPU video v1: AnimateDiff-Lightning UNet templates (8 frames, 256px)" \
+            --title "NPU video v2: AnimateDiff-Lightning UNet templates (8 frames, 256px, parts <= 450 MB)" \
             --notes-file release/README.txt
 
       - name: Upload reference video

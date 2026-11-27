@@ -89,6 +89,8 @@ def main():
     ap.add_argument("--prompt", default="a woman walking on a beach at sunset, waves, wind in her hair")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-export", action="store_true")
+    ap.add_argument("--budget-mb", type=float, default=adp.DEFAULT_BUDGET_MB,
+                    help="max fp16 weights per part (layer granularity)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     F, L = a.frames, a.size // 8
@@ -113,7 +115,7 @@ def main():
         n = adp.patch_4d(unet)
         unet.set_attn_processor(adp.PlainAttnProcessor())   # ref above used diffusers' default (SDPA)
         x4 = xs[0].permute(1, 0, 2, 3).contiguous()                               # [F,4,h,w]
-        _, chained = adp.run_chain(adp.parts(unet, tf), x4, ts, eh)
+        _, chained = adp.run_chain(adp.parts(unet, tf, a.budget_mb), x4, ts, eh)
     ref4 = ref[0].permute(1, 0, 2, 3)
     d = (ref4 - chained).abs().max().item()
     print(f"[probe] patched {n} motion modules to rank<=4; max|diffusers(SDPA) - chained parts (rank-4 + plain attention)| = {d:.4g} "
@@ -121,7 +123,10 @@ def main():
     if d > 2e-2:
         raise SystemExit("rewrite/split does not match diffusers")
 
-    mods = adp.parts(unet, F)
+    mods = adp.parts(unet, F, a.budget_mb)
+    for nm, first, last, size in adp.describe(unet, a.budget_mb):
+        print(f"[probe] {nm}: {first} .. {last}  {size} MB")
+    names = [m[0] for m in mods]
     x = torch.randn(F, 4, L, L, generator=g).half()
     t = torch.tensor([999.0])
     ehs = torch.randn(1, 77, 768, generator=g).half()
@@ -130,9 +135,8 @@ def main():
         import onnx
         # Each part: fp32 copy of just its modules -> export_onnx.export (fp32 trace, fp16 convert).
         args16, out16 = adp.run_chain(mods, x, t, ehs)
-        for (name, mod, ins, outs), pargs in zip(mods, args16):
+        for (name, mod, ins, outs, subs), pargs in zip(mods, args16):
             t1 = time.time()
-            subs = adp.submodules(unet, name)
             for sm in subs:
                 sm.float()
             export_onnx.export(mod, tuple(p.float() for p in pargs), os.path.join(a.out, f"{name}.onnx"), ins, outs)
@@ -161,10 +165,10 @@ def main():
     # has no float16 kernel for (the HTP path does its own lowering).
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     sess = {nm: ort.InferenceSession(os.path.join(a.out, f"{nm}.onnx"), so, providers=["CPUExecutionProvider"])
-            for nm in adp.NAMES}
+            for nm in names}
     _, ref = adp.run_chain(mods, x, t, ehs)
     t1 = time.time()
-    got = run_onnx(sess, x.float().numpy(), t.numpy(), ehs.float().numpy())
+    got = run_onnx(sess, names, x.float().numpy(), t.numpy(), ehs.float().numpy())
     dt = time.time() - t1
     r = ref.float().numpy()
     cos = float((r * got).sum() / np.linalg.norm(r) / np.linalg.norm(got))
@@ -172,19 +176,19 @@ def main():
           f"one UNet pass {F}x{a.size}^2 on ORT-CPU {dt:.1f}s")
 
     if a.generate:
-        generate(a, sess, te, tok)
+        generate(a, sess, names, te, tok)
 
 
-def run_onnx(sess, sample, timestep, hidden):
+def run_onnx(sess, names, sample, timestep, hidden):
     env = {"sample": sample, "timestep": timestep.astype(np.float32), "encoder_hidden_states": hidden}
-    for nm in adp.NAMES:
+    for nm in names:
         s = sess[nm]
         outs = s.run(None, {i.name: env[i.name] for i in s.get_inputs()})
         env.update({o.name: v for o, v in zip(s.get_outputs(), outs)})
     return env["noise_pred"]
 
 
-def generate(a, sess, te, tok):
+def generate(a, sess, names, te, tok):
     from diffusers import AutoencoderTiny, EulerDiscreteScheduler
     from PIL import Image
     F, L = a.frames, a.size // 8
@@ -203,7 +207,7 @@ def generate(a, sess, te, tok):
     for i, ts in enumerate(sch.timesteps):
         inp = sch.scale_model_input(lat, ts)
         t1 = time.time()
-        eps = torch.from_numpy(run_onnx(sess, inp.numpy(), np.array([float(ts)], np.float32), hidden))
+        eps = torch.from_numpy(run_onnx(sess, names, inp.numpy(), np.array([float(ts)], np.float32), hidden))
         lat = sch.step(eps, ts, lat).prev_sample
         print(f"[gen] step {i + 1}/{a.steps} t={int(ts)} {time.time() - t1:.1f}s")
     print(f"[gen] sampling {time.time() - t0:.1f}s")

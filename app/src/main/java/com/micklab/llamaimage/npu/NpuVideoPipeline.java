@@ -18,7 +18,7 @@ import ai.onnxruntime.OrtSession;
 
 /**
  * Text-to-video with AnimateDiff-Lightning (ByteDance, CreativeML OpenRAIL-M) on an SD1.5
- * checkpoint: the video UNet ({@link #PARTS}, scripts/npu-video) runs on the NPU, the text encoder
+ * checkpoint: the video UNet ({@link #parts}, scripts/npu-video) runs on the NPU, the text encoder
  * and the TAESD decoder (small, run once / per frame) on the ORT CPU provider.
  *
  * Static shapes come from the graph: sample [F, 4, h, w] (the frames are the batch), timestep [1],
@@ -27,12 +27,20 @@ import ai.onnxruntime.OrtSession;
  * UNet pass per step, no negative prompt).
  */
 public final class NpuVideoPipeline implements Closeable {
-    /** Video UNet parts in execution order (chained by tensor name like NpuPipeline.UNET_PARTS). */
-    public static final String[] PARTS = {"vunet_0", "vunet_1", "vunet_2"};
+        /** vunet_0 .. vunet_{n-1} present in {@code dir} as {@code <name><suffix>} (count set by the export). */
+    public static String[] partsIn(File dir, String suffix) {
+        int n = 0;
+        while (new File(dir, "vunet_" + n + suffix).isFile()) n++;
+        String[] p = new String[n];
+        for (int i = 0; i < n; i++) p[i] = "vunet_" + i;
+        return p;
+    }
+
+    private final String[] parts;
     private static final int TRAIN_STEPS = 1000;
 
     private final OrtEnvironment env = OrtEnvironment.getEnvironment();
-    private final OrtSession[] unet = new OrtSession[PARTS.length];
+    private final OrtSession[] unet;
     private final OrtSession textEncoder, decoder;
     private final ClipTokenizer tokenizer;
     public final int frames, latent, size;
@@ -44,18 +52,21 @@ public final class NpuVideoPipeline implements Closeable {
      */
     public NpuVideoPipeline(File baseDir, File videoDir, Map<String, String> qnnOptions, File cacheDir,
                             NpuPipeline.Log log) throws IOException {
+        parts = partsIn(videoDir, ".onnx");
+        if (parts.length == 0) throw new IOException("動画 UNet がありません: " + videoDir);
+        unet = new OrtSession[parts.length];
         tokenizer = new ClipTokenizer(new File(baseDir, "tokenizer_vocab.json"), new File(baseDir, "tokenizer_merges.txt"));
         OrtSession te = null, dec = null;
         try {
             if (qnnOptions != null && cacheDir != null) {
-                for (int i = 0; i < PARTS.length; i++) {          // pass 1: compile + cache, one at a time
-                    if (NpuPipeline.contextFile(cacheDir, PARTS[i]).isFile()) continue;
-                    log.stage(i + 1, PARTS.length, PARTS[i]);
-                    unet[i] = NpuPipeline.compile(new File(videoDir, PARTS[i] + ".onnx"), qnnOptions, cacheDir, log);
+                for (int i = 0; i < parts.length; i++) {          // pass 1: compile + cache, one at a time
+                    if (NpuPipeline.contextFile(cacheDir, parts[i]).isFile()) continue;
+                    log.stage(i + 1, parts.length, parts[i]);
+                    unet[i] = NpuPipeline.compile(new File(videoDir, parts[i] + ".onnx"), qnnOptions, cacheDir, log);
                 }
             }
-            for (int i = 0; i < PARTS.length; i++) {              // pass 2: open from the cache
-                File model = new File(videoDir, PARTS[i] + ".onnx");
+            for (int i = 0; i < parts.length; i++) {              // pass 2: open from the cache
+                File model = new File(videoDir, parts[i] + ".onnx");
                 if (unet[i] == null) unet[i] = qnnOptions == null ? cpuSession(model)   // JVM test
                         : NpuPipeline.open(model, qnnOptions, cacheDir, log);
             }
@@ -152,10 +163,10 @@ public final class NpuVideoPipeline implements Closeable {
                 Map<String, OnnxTensor> in = new HashMap<>();
                 for (String name : unet[p].getInputNames()) {
                     OnnxTensor v = vals.get(name);
-                    if (v == null) throw new IllegalStateException(PARTS[p] + ": 入力 " + name + " がありません");
+                    if (v == null) throw new IllegalStateException(parts[p] + ": 入力 " + name + " がありません");
                     in.put(name, v);
                 }
-                OrtSession.Result r = NpuPipeline.run(unet[p], PARTS[p], in);
+                OrtSession.Result r = NpuPipeline.run(unet[p], parts[p], in);
                 results.add(r);
                 for (Map.Entry<String, ai.onnxruntime.OnnxValue> e : r) vals.put(e.getKey(), (OnnxTensor) e.getValue());
             }

@@ -16,8 +16,14 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(1, os.path.join(HERE, "..", "npu"))
-from animatediff_parts import NAMES  # noqa: E402
 from make_video_template import MOTION_PREFIX, video_name  # noqa: E402
+
+
+def template_names(templates):
+    n = 0
+    while os.path.isfile(os.path.join(templates, f"vunet_{n}.map.json")):
+        n += 1
+    return [f"unet_{k}" for k in range(n)]
 
 
 def assemble(templates, name, ckpt_path, motion_path, out):
@@ -58,12 +64,12 @@ def verify(assembled, original):
         raise SystemExit(f"mismatch: {bad[:10]}")
 
 
-def run(out):
+def run(out, names):
     import onnxruntime as ort
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC   # no fp16 Gelu on CPU
     sess = [ort.InferenceSession(os.path.join(out, f"{video_name(p)}.onnx"), so,
-                                 providers=["CPUExecutionProvider"]) for p in NAMES]
+                                 providers=["CPUExecutionProvider"]) for p in names]
     shape = sess[0].get_inputs()[0].shape        # [F, 4, h, w]
     rng = np.random.default_rng(0)
     env = {"sample": rng.standard_normal(shape).astype(np.float32),
@@ -88,12 +94,13 @@ def main():
     ap.add_argument("--verify")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
-    for part in NAMES:
+    names = template_names(a.templates)
+    for part in names:
         p = assemble(a.templates, video_name(part), a.checkpoint, a.motion, a.out)
         if a.verify:
             verify(p, os.path.join(a.verify, f"{part}.onnx"))
     if a.run:
-        run(a.out)
+        run(a.out, names)
 
 
 if __name__ == "__main__":

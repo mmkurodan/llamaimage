@@ -15,7 +15,7 @@ public class NpuVideoJavaTest {
         long t0 = System.currentTimeMillis();
         NpuModelAssembler.assemble(ba, "text_encoder", ck, base, null);
         for (String f : new String[]{"tokenizer_vocab.json", "tokenizer_merges.txt"}) IoUtil.copy(new File(ba, f), new File(base, f));
-        for (String p : NpuVideoPipeline.PARTS) {
+        for (String p : NpuVideoPipeline.partsIn(vt, ".map.json")) {
             NpuModelAssembler.assemble(vt, p, ck, mo, video, null);
             String j = sha(new File(video, p + ".weights")), py = sha(new File(a[5], p + ".weights"));
             System.out.println("[java] " + p + ".weights java=" + j.substring(0, 16) + " python=" + py.substring(0, 16) + (j.equals(py) ? " SAME" : " DIFF"));

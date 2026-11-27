@@ -2,8 +2,8 @@ package com.micklab.llamaimage.npu;
 
 /**
  * Files for the experimental NPU video path (AnimateDiff-Lightning): weightless templates + weight
- * maps of the video UNet (8 frames x 256 px, NpuVideoPipeline.PARTS) and a TAESD decoder for that
- * latent size, published with GitHub Release npu-video-v1 (scripts/npu-video, workflow
+ * maps of the video UNet (8 frames x 256 px, vunet_0..n-1) and a TAESD decoder for that
+ * latent size, published with GitHub Release npu-video-v2 (scripts/npu-video, workflow
  * "NPU video models"); the motion module itself comes from ByteDance's Hugging Face repo
  * (CreativeML OpenRAIL-M), pinned to a commit.
  */
@@ -11,7 +11,7 @@ public final class NpuVideoAssets {
     private NpuVideoAssets() {}
 
     public static final String BASE =
-            "https://github.com/mmkurodan/llamaimage/releases/download/npu-video-v1/";
+            "https://github.com/mmkurodan/llamaimage/releases/download/npu-video-v2/";
 
     /** {name, size, sha256} */
     static final Object[][] FILES = {
