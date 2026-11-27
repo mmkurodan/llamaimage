@@ -50,7 +50,8 @@ public final class NpuPipeline implements Closeable {
     private static final float[][] LATENT_RGB = {   // same projection as the CPU engine's previews
             {0.298f, 0.207f, 0.208f}, {0.187f, 0.286f, 0.173f}, {-0.158f, 0.189f, 0.264f}, {-0.184f, -0.271f, -0.473f}};
 
-    private final OrtEnvironment env = OrtEnvironment.getEnvironment();
+    private static final OrtEnvironment ENV = OrtEnvironment.getEnvironment();
+    private final OrtEnvironment env = ENV;
     /** UNet parts in execution order (= unet_parts.NAMES). */
     public static final String[] UNET_PARTS = {"unet_0", "unet_1", "unet_2"};
 
@@ -93,22 +94,22 @@ public final class NpuPipeline implements Closeable {
         encoder = s[names.length - 1];
     }
 
-    private static File contextFile(File cacheDir, String name) {
+    static File contextFile(File cacheDir, String name) {
         return new File(cacheDir, name + "_ctx.onnx");
     }
 
-    private OrtSession open(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
+    static OrtSession open(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
         String name = model.getName().replace(".onnx", "");
         long t0 = System.currentTimeMillis();
         if (qnn == null) {
-            OrtSession s = env.createSession(model.getAbsolutePath(), new OrtSession.SessionOptions());
+            OrtSession s = ENV.createSession(model.getAbsolutePath(), new OrtSession.SessionOptions());
             log.log("NPU(CPU EP) " + name + ": " + (System.currentTimeMillis() - t0) + "ms");
             return s;
         }
         File ctx = cacheDir == null ? null : contextFile(cacheDir, name);
         if (ctx != null && ctx.isFile()) {
             try {
-                OrtSession s = env.createSession(ctx.getAbsolutePath(), qnnOptions(qnn));
+                OrtSession s = ENV.createSession(ctx.getAbsolutePath(), qnnOptions(qnn));
                 log.log("NPU " + name + ": キャッシュから読込 " + (System.currentTimeMillis() - t0) + "ms");
                 return s;
             } catch (OrtException e) {
@@ -120,7 +121,7 @@ public final class NpuPipeline implements Closeable {
     }
 
     /** Compiles {@code model} for the HTP (writing the context cache when {@code cacheDir} is set). */
-    private OrtSession compileSession(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
+    private static OrtSession compileSession(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
         String name = model.getName().replace(".onnx", "");
         long t0 = System.currentTimeMillis();
         File ctx = cacheDir == null ? null : contextFile(cacheDir, name);
@@ -135,7 +136,7 @@ public final class NpuPipeline implements Closeable {
         log.log("NPU " + name + ": NPU 向け最適化を開始（" + (model.length() + new File(model.getParentFile(),
                 name + ".weights").length()) / 1_000_000 + " MB, Java heap 空き " + (rt.maxMemory() - rt.totalMemory()
                 + rt.freeMemory()) / 1_000_000 + " MB）");
-        OrtSession s = env.createSession(model.getAbsolutePath(), so);
+        OrtSession s = ENV.createSession(model.getAbsolutePath(), so);
         log.log("NPU " + name + ": 最適化 完了 " + (System.currentTimeMillis() - t0) / 1000 + "s");
         return s;
     }
@@ -144,7 +145,7 @@ public final class NpuPipeline implements Closeable {
      * Compiles and caches; the session is closed again in pass 1 (the cache is opened in pass 2),
      * and kept only when there is no cache to reopen it from.
      */
-    private OrtSession compile(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
+    static OrtSession compile(File model, Map<String, String> qnn, File cacheDir, Log log) throws OrtException {
         OrtSession s = compileSession(model, qnn, cacheDir, log);
         if (cacheDir == null) return s;
         String name = model.getName().replace(".onnx", "");
@@ -278,7 +279,7 @@ public final class NpuPipeline implements Closeable {
     }
 
     /** session.run with the graph name in the error (the QNN message only names a hash). */
-    private static OrtSession.Result run(OrtSession s, String name, Map<String, OnnxTensor> in) throws OrtException {
+    static OrtSession.Result run(OrtSession s, String name, Map<String, OnnxTensor> in) throws OrtException {
         try {
             return s.run(in);
         } catch (OrtException e) {
@@ -380,20 +381,20 @@ public final class NpuPipeline implements Closeable {
         return rgb;
     }
 
-    private static Map<String, OnnxTensor> single(String name, OnnxTensor t) {
+    static Map<String, OnnxTensor> single(String name, OnnxTensor t) {
         Map<String, OnnxTensor> m = new HashMap<>();
         m.put(name, t);
         return m;
     }
 
-    private static float[] floats(OrtSession.Result r) throws OrtException {
+    static float[] floats(OrtSession.Result r) throws OrtException {
         FloatBuffer fb = ((OnnxTensor) r.get(0)).getFloatBuffer();
         float[] out = new float[fb.remaining()];
         fb.get(out);
         return out;
     }
 
-    private static void closeQuietly(OrtSession s) {
+    static void closeQuietly(OrtSession s) {
         if (s == null) return;
         try {
             s.close();

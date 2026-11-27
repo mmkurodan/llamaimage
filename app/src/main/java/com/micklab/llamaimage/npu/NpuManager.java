@@ -120,6 +120,10 @@ public final class NpuManager {
 
     /** Opens the pipeline on the HTP (compiles + caches the graphs on first use: minutes). */
     public NpuPipeline open(String modelId, NpuPipeline.Log log) throws IOException {
+        return new NpuPipeline(modelDir(modelId), htpOptions(log), cacheDir(modelId), log);
+    }
+
+    private Map<String, String> htpOptions(NpuPipeline.Log log) {
         String libDir = ctx.getApplicationInfo().nativeLibraryDir;
         try {
             // FastRPC loads the HTP skel (libQnnHtpV**Skel.so, extracted from the APK) from here.
@@ -131,7 +135,78 @@ public final class NpuManager {
         qnn.put("backend_path", "libQnnHtp.so");
         qnn.put("htp_performance_mode", "burst");
         qnn.put("enable_htp_fp16_precision", "1");
-        return new NpuPipeline(modelDir(modelId), qnn, cacheDir(modelId), log);
+        return qnn;
+    }
+
+    // ---- video (AnimateDiff-Lightning, experimental) -------------------------------------------
+
+    private File videoAssetDir() {
+        return new File(root(), "video-assets");
+    }
+
+    private File motionFile() {
+        return new File(root(), "motion/" + NpuVideoAssets.MOTION_NAME);
+    }
+
+    private File videoDir(String modelId) {
+        return new File(modelDir(modelId), "video");
+    }
+
+    private File videoCacheDir(String modelId) {
+        return new File(cacheDir(modelId), "video");
+    }
+
+    /** Video templates (small) + the motion module (907 MB, Hugging Face). Blocking. */
+    public void ensureVideoAssets(Status status) throws IOException {
+        File dir = videoAssetDir();
+        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("作成できません: " + dir);
+        for (Object[] f : NpuVideoAssets.FILES) {
+            fetch(NpuVideoAssets.BASE + f[0], new File(dir, (String) f[0]), (Long) f[1], (String) f[2], status);
+        }
+        File m = motionFile();
+        File md = m.getParentFile();
+        if (md != null && !md.isDirectory() && !md.mkdirs()) throw new IOException("作成できません: " + md);
+        fetch(NpuVideoAssets.MOTION_URL, m, NpuVideoAssets.MOTION_SIZE, NpuVideoAssets.MOTION_SHA256, status);
+    }
+
+    private void fetch(String url, File dst, long size, String sha, Status status) throws IOException {
+        if (dst.isFile() && dst.length() == size && sha.equals(sha256(dst))) return;
+        status.onStatus("動画用ファイルを取得中… " + dst.getName() + "（" + size / 1_000_000 + " MB）");
+        File tmp = new File(dst.getParentFile(), dst.getName() + ".tmp");
+        download(url, tmp, size, status, dst.getName());
+        status.onStatus("検証中… " + dst.getName());
+        if (tmp.length() != size || !sha.equals(sha256(tmp))) {
+            tmp.delete();
+            throw new IOException("ファイルの検証に失敗しました: " + dst.getName());
+        }
+        if (dst.exists()) dst.delete();
+        if (!tmp.renameTo(dst)) throw new IOException("配置できません: " + dst);
+    }
+
+    /** Builds the video UNet for {@code modelId} (checkpoint + motion module, ~2.6 GB). Blocking. */
+    public void ensureVideoBuilt(String modelId, File checkpoint, String ckptSha, Status status) throws IOException {
+        File out = videoDir(modelId);
+        File stamp = new File(out, ".built");
+        String want = NpuVideoAssets.VERSION + " " + ckptSha;
+        try {
+            if (stamp.isFile() && IoUtil.readString(stamp).equals(want)) return;
+        } catch (IOException ignore) {
+        }
+        stamp.delete();
+        deleteTree(videoCacheDir(modelId));
+        File assets = videoAssetDir();
+        for (int i = 0; i < NpuVideoPipeline.PARTS.length; i++) {
+            String label = "動画 UNet " + (i + 1) + "/" + NpuVideoPipeline.PARTS.length;
+            NpuModelAssembler.assemble(assets, NpuVideoPipeline.PARTS[i], checkpoint, motionFile(), out,
+                    p -> status.onStatus("NPU 用に変換中（" + label + "） " + p + "%"));
+        }
+        IoUtil.copy(new File(assets, "taesd_decoder_video.onnx"), new File(out, "taesd_decoder_video.onnx"));
+        IoUtil.writeString(stamp, want);
+    }
+
+    /** Opens the video pipeline (compiles + caches the 3 video UNet parts on first use). */
+    public NpuVideoPipeline openVideo(String modelId, NpuPipeline.Log log) throws IOException {
+        return new NpuVideoPipeline(modelDir(modelId), videoDir(modelId), htpOptions(log), videoCacheDir(modelId), log);
     }
 
     /** Removes only the compiled HTP contexts of {@code modelId}: the next open recompiles them. */
@@ -152,6 +227,10 @@ public final class NpuManager {
     }
 
     private static void download(String url, File dst) throws IOException {
+        download(url, dst, 0, null, null);
+    }
+
+    private static void download(String url, File dst, long size, Status status, String label) throws IOException {
         for (int redirects = 0; redirects < 6; redirects++) {
             HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
             c.setConnectTimeout(20000);
@@ -172,7 +251,19 @@ public final class NpuManager {
             try (InputStream in = c.getInputStream(); OutputStream out = new FileOutputStream(dst)) {
                 byte[] buf = new byte[65536];
                 int n;
-                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                long got = 0;
+                int lastPct = -1;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                    got += n;
+                    if (status != null && size > 0) {
+                        int pct = (int) (got * 100 / size);
+                        if (pct != lastPct) {
+                            lastPct = pct;
+                            status.onStatus("ダウンロード中… " + label + " " + pct + "%");
+                        }
+                    }
+                }
             } finally {
                 c.disconnect();
             }

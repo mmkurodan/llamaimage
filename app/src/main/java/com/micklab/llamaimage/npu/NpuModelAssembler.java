@@ -30,6 +30,18 @@ public final class NpuModelAssembler {
      */
     public static File assemble(File templateDir, String name, File checkpoint, File outDir, Progress progress)
             throws IOException {
+        return assemble(templateDir, name, checkpoint, null, outDir, progress);
+    }
+
+    /** Map keys starting with this are read from the motion module file (video UNet, AnimateDiff). */
+    public static final String MOTION_PREFIX = "motion:";
+
+    /**
+     * Same, with a second weight source: keys "motion:&lt;key&gt;" are read from {@code motion}
+     * (scripts/npu-video/make_video_template.py), the rest from the checkpoint.
+     */
+    public static File assemble(File templateDir, String name, File checkpoint, File motion, File outDir,
+                                Progress progress) throws IOException {
         JSONObject map;
         try {
             map = new JSONObject(IoUtil.readString(new File(templateDir, name + ".map.json")));
@@ -50,6 +62,7 @@ public final class NpuModelAssembler {
         File weights = new File(outDir, weightsName);
         File tmpWeights = new File(outDir, weightsName + ".tmp");
         try (SafetensorsFile ck = new SafetensorsFile(checkpoint);
+             SafetensorsFile mo = motion != null ? new SafetensorsFile(motion) : null;
              FileOutputStream fos = new FileOutputStream(tmpWeights);
              FileChannel out = fos.getChannel()) {
             long written = 0;
@@ -57,16 +70,22 @@ public final class NpuModelAssembler {
             for (int i = 0; i < tensors.length(); i++) {
                 JSONObject t = tensors.getJSONObject(i);
                 String key = t.getString("key");
+                SafetensorsFile src = ck;
+                if (key.startsWith(MOTION_PREFIX)) {
+                    if (mo == null) throw new IOException("動きモジュールが必要です: " + key);
+                    src = mo;
+                    key = key.substring(MOTION_PREFIX.length());
+                }
                 JSONArray dims = t.getJSONArray("dims");
                 long offset = t.getLong("offset"), length = t.getLong("length");
                 if (offset != written) throw new IOException("map のオフセットが不連続です: " + t.getString("name"));
-                short[] v = ck.readFp16(key);
+                short[] v = src.readFp16(key);
                 if ((long) v.length * 2 != length) {
                     throw new IOException("テンソルの大きさが一致しません（SD1.5 系ではないモデル？）: " + key);
                 }
                 if (t.getBoolean("transpose")) {
                     // Source viewed as [rows, cols] with rows = first dim; result is its transpose.
-                    SafetensorsFile.Entry e = ck.entries.get(key);
+                    SafetensorsFile.Entry e = src.entries.get(key);
                     int rows = (int) e.shape[0];
                     int cols = v.length / rows;
                     short[] tr = new short[v.length];

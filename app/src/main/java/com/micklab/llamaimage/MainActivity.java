@@ -2303,6 +2303,15 @@ public class MainActivity extends Activity {
         vPlayButton.setOnClickListener(x -> openVideoPlayer(lastVideoUri));
         v.addView(vPlayButton, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(44), 0, 10, 0, 0));
 
+        Button npuVideo = button("NPU 動画（試験: AnimateDiff-Lightning 8 コマ 256px）", BTN_GHOST);
+        npuVideo.setTextSize(13);
+        npuVideo.setOnClickListener(x -> startNpuVideoTest());
+        v.addView(npuVideo, sizedLp(ViewGroup.LayoutParams.MATCH_PARENT, dp(44), 0, 10, 0, 0));
+        if (prefs().getBoolean(PREFS_NPU_VIDEO_PENDING, false)) {
+            prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).apply();
+            appendLog("NPU 動画（試験）: 前回は途中でアプリが終了しました（NPU 向け最適化中のメモリ不足で強制終了された可能性）");
+        }
+
         TextView hint = text("1 コマ目をプロンプトから（または「画像→画像」の入力画像から）作り、少しズームしながら"
                 + "画像→画像を繰り返して動画（音なし MP4）にします。シードは全コマ共通（-1 なら最初に決めた値）。"
                 + "変化量が大きいほど動きが大きく、ちらつきも増えます。\n"
@@ -2314,6 +2323,169 @@ public class MainActivity extends Activity {
         v.addView(hint, marginLp(0, 10, 0, 0));
         updateVideoButtons();
         return v;
+    }
+
+    static final String PREFS_NPU_VIDEO_PENDING = "npu_video_pending";
+
+    /**
+     * Experimental: text-to-video with AnimateDiff-Lightning on the NPU (NpuVideoPipeline). Frees
+     * the loaded model first (RAM / HTP memory), builds the video UNet from the selected SD1.5
+     * model + the motion module on first use, compiles it for the HTP (cached), generates 8 frames
+     * at 256 px in 4 steps and saves an MP4. Logs time and memory of every stage.
+     */
+    private void startNpuVideoTest() {
+        if (isBusy()) {
+            Toast.makeText(this, "処理中です", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final ModelCatalog.ModelSpec spec = currentSpec();
+        if (spec == null || !spec.npuCapable() || !com.micklab.llamaimage.npu.NpuManager.deviceMayHaveHtp()) {
+            Toast.makeText(this, "NPU 対応の SD1.5 モデル（Snapdragon 端末）を選んでください", Toast.LENGTH_LONG).show();
+            return;
+        }
+        final File file = store.installedFile(spec);
+        if (file == null) {
+            Toast.makeText(this, "「" + spec.title + "」をダウンロードしてください", Toast.LENGTH_LONG).show();
+            return;
+        }
+        final String rawPrompt = promptEdit.getText().toString().trim().replace('\n', ' ');
+        if (rawPrompt.isEmpty()) {
+            Toast.makeText(this, "プロンプトを入力してください", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final long seed0 = parseLong(seedEdit.getText().toString(), -1);
+        final int fps = clamp(parseInt(vFpsEdit.getText().toString(), 8), 1, 30);
+        final boolean nsfw = nsfwRestriction;
+        persistInputs();
+        generating = true;
+        batchIndex = 0;
+        batchTotal = 1;
+        manager.clearCancel();
+        cancelButton.setEnabled(true);
+        cancelButton.setText("中止");
+        translatedPromptView.setVisibility(View.GONE);
+        progressBar.setVisibility(View.VISIBLE);
+        progressBar.setIndeterminate(true);
+        refreshControls();
+        setStatus("NPU 動画（試験）: 準備中…");
+        final PromptTranslator tr = translator();
+        final long t0 = SystemClock.elapsedRealtime();
+        appendLog("NPU 動画（試験）: 開始 " + spec.title + " / " + memInfo());
+        worker.submit(() -> {
+            String error = null;
+            Uri uri = null;
+            com.micklab.llamaimage.npu.NpuVideoPipeline vp = null;
+            File tmp = new File(getCacheDir(), "npu_video_tmp.mp4");
+            try {
+                PromptTranslator.Prepared q = tr.prepare(rawPrompt, "", false, nsfw);
+                if (q.blocked) throw new IOException("生成中止: " + q.note);
+                final String prompt = q.prompt;
+                if (!prompt.equals(rawPrompt)) runOnUiThread(() -> {
+                    translatedPromptView.setText("英訳: " + prompt);
+                    translatedPromptView.setVisibility(View.VISIBLE);
+                });
+                manager.release();   // free the image model (RAM + HTP) before the video UNet
+                runOnUiThread(this::refreshControls);
+                appendLogUi("NPU 動画: 画像モデルを解放 / " + memInfo());
+                com.micklab.llamaimage.npu.NpuManager nm = npu();
+                nm.ensureAssets(this::setStatusUi);
+                if (!nm.isBuilt(spec.id, spec.sha256)) {
+                    appendLogUi("NPU 動画: 画像用 NPU モデルを作成（テキストエンコーダ・トークナイザを共用）");
+                    nm.ensureBuilt(spec.id, file, spec.sha256, this::setStatusUi);
+                }
+                long t1 = SystemClock.elapsedRealtime();
+                nm.ensureVideoAssets(this::setStatusUi);
+                nm.ensureVideoBuilt(spec.id, file, spec.sha256, this::setStatusUi);
+                appendLogUi("NPU 動画: ファイル準備 " + (SystemClock.elapsedRealtime() - t1) / 1000 + "s / " + memInfo());
+                prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, true).commit();   // killed while compiling?
+                setStatusUi("NPU 動画: NPU 向け最適化中…（初回は数分）");
+                long t2 = SystemClock.elapsedRealtime();
+                vp = nm.openVideo(spec.id, new com.micklab.llamaimage.npu.NpuPipeline.Log() {
+                    @Override public void log(String msg) {
+                        appendLogUi(msg + " / " + memInfo());
+                    }
+
+                    @Override public void stage(int index, int total, String name) {
+                        setStatusUi("NPU 動画: 最適化中 " + index + "/" + total + "（" + name + "）… 初回は数分");
+                    }
+                });
+                prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).commit();
+                appendLogUi("NPU 動画: セッション準備 " + (SystemClock.elapsedRealtime() - t2) / 1000 + "s（"
+                        + vp.frames + " コマ " + vp.size + "px）/ " + memInfo());
+                final long seed = seed0 >= 0 ? seed0 : (new java.util.Random().nextLong() & 0x7fffffffL);
+                final int steps = 4;
+                final long t3 = SystemClock.elapsedRealtime();
+                java.util.List<byte[]> frames = vp.generate(prompt, steps, seed,
+                        new com.micklab.llamaimage.npu.NpuVideoPipeline.Listener() {
+                            @Override public void onStep(int step, int n, long ms) {
+                                appendLogUi("NPU 動画: ステップ " + step + "/" + n + " " + ms + "ms");
+                                setStatusUi("NPU 動画: ステップ " + step + "/" + n + "（" + ms / 1000.0 + "s）");
+                            }
+
+                            @Override public boolean isCancelled() {
+                                return manager.isCancelRequested();
+                            }
+                        });
+                if (frames == null) throw new IOException("中止しました");
+                appendLogUi("NPU 動画: 生成+デコード " + (SystemClock.elapsedRealtime() - t3) / 1000.0 + "s / " + memInfo());
+                Bitmap last = null;
+                try (VideoEncoder enc = new VideoEncoder(tmp, vp.size, vp.size, fps)) {
+                    for (int loop = 0; loop < 3; loop++) {          // 8 frames is short: play it 3 times
+                        for (byte[] f : frames) {
+                            last = rgbToBitmap(f, vp.size, vp.size);
+                            enc.addFrame(last);
+                        }
+                    }
+                    enc.finish();
+                }
+                final Bitmap shown = last;
+                runOnUiThread(() -> {
+                    lastBitmap = shown;
+                    showImage(shown);
+                });
+                uri = publishVideo(tmp, seed);
+                appendLogUi("NPU 動画: seed " + seed + "、prompt \"" + prompt + "\"");
+            } catch (Throwable t) {
+                error = t.getMessage() != null ? t.getMessage() : t.toString();
+            } finally {
+                if (vp != null) vp.close();
+                prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).commit();
+                tmp.delete();
+            }
+            final String err = error;
+            final Uri u = uri;
+            final long secs = (SystemClock.elapsedRealtime() - t0) / 1000;
+            runOnUiThread(() -> {
+                if (u != null) {
+                    lastVideoUri = u;
+                    appendLog("NPU 動画（試験）: 保存 Movies/llamaimage（合計 " + formatDuration(secs) + "）");
+                    finishGeneration("NPU 動画を保存しました（" + formatDuration(secs) + "）");
+                    updateVideoButtons();
+                    openVideoPlayer(u);
+                } else {
+                    appendLog("NPU 動画（試験）: " + err);
+                    finishGeneration("NPU 動画（試験）失敗 — " + err);
+                }
+                ensureModelLoaded();   // the image model was released for the test
+            });
+        });
+    }
+
+    /** "RSS 1234 MB（ピーク 2345 MB）、空き 6789 MB" for the experiment logs. */
+    private String memInfo() {
+        long rss = -1, hwm = -1;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/self/status"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("VmRSS:")) rss = Long.parseLong(line.replaceAll("[^0-9]", "")) / 1024;
+                if (line.startsWith("VmHWM:")) hwm = Long.parseLong(line.replaceAll("[^0-9]", "")) / 1024;
+            }
+        } catch (Exception ignore) {
+        }
+        android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+        android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        if (am != null) am.getMemoryInfo(mi);
+        return "RSS " + rss + " MB（ピーク " + hwm + " MB）、端末の空き " + mi.availMem / 1_000_000 + " MB";
     }
 
     private EditText numField(String value) {

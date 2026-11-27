@@ -1,0 +1,125 @@
+name: NPU video models (AnimateDiff-Lightning)
+
+# 動画モデル（AnimateDiff-Lightning, 8 コマ x 256px）の NPU 用テンプレートを作る。SD1.5 UNet + 動きモジュールを
+# 静的形状 fp16 ONNX に書き出し、PyTorch と一致すること・端末と同じ組み立てがバイト一致することを確かめて
+# Release npu-video-v1 に公開する（重みは含まない。端末で SD1.5 モデル + 動きモジュールから組み立てる）。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/npu-video/**'
+      - '.github/workflows/npu-video.yml'
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: npu-video-v1
+  FRAMES: '8'
+  SIZE: '256'
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+
+      - name: Install
+        run: pip install -r scripts/npu-video/requirements.txt
+
+      - name: Download checkpoint + motion module (pinned, SHA-256 checked)
+        run: |
+          set -e
+          mkdir -p ck
+          curl -fsSL -o ck/ar181.safetensors "https://huggingface.co/Lykon/AbsoluteReality/resolve/df7c3efce8f54d02cf73a21fcecd908a0fde2898/AbsoluteReality_1.8.1_pruned.safetensors"
+          curl -fsSL -o ck/adl4.safetensors "https://huggingface.co/ByteDance/AnimateDiff-Lightning/resolve/027c893eec01df7330f5d4b733bc9485ee02e8b2/animatediff_lightning_4step_diffusers.safetensors"
+          echo "463d6a9fe8a4b56a4d69ef3692074c0617428dfd8e8f12f9efe3b1e9a71717ce  ck/ar181.safetensors" | sha256sum -c
+          echo "8f3330914edd8fc2ee5659e6944323858feb0ec21cc913789202d043f69b5e17  ck/adl4.safetensors" | sha256sum -c
+
+      - name: Export + check vs PyTorch + reference video (ORT CPU)
+        run: |
+          python scripts/npu-video/animatediff_probe.py --checkpoint ck/ar181.safetensors --adapter ck/adl4.safetensors \
+            --out vmodels --frames "$FRAMES" --size "$SIZE" --generate
+
+      - name: Templates + device-equivalent assembly (byte-verified, one ORT pass)
+        run: |
+          set -e
+          python scripts/npu-video/make_video_template.py --models vmodels --checkpoint ck/ar181.safetensors \
+            --motion ck/adl4.safetensors --out vtemplates
+          python scripts/npu-video/assemble_video.py --templates vtemplates --checkpoint ck/ar181.safetensors \
+            --motion ck/adl4.safetensors --out vasm --verify vmodels --run
+          cp vmodels/taesd_decoder_video.onnx vasm/
+
+      # The app's Java code (NpuModelAssembler with the motion file, NpuVideoPipeline sampler) on a
+      # JVM with the ORT CPU provider: Java assembly == Python assembly, then a whole video.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Java video pipeline test
+        run: |
+          set -e
+          mkdir -p jt/lib jt/base jt/classes
+          curl -fsSL -o jt/lib/onnxruntime.jar https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime/1.24.3/onnxruntime-1.24.3.jar
+          curl -fsSL -o jt/lib/json.jar https://repo1.maven.org/maven2/org/json/json/20260814/json-20260814.jar
+          for f in text_encoder.template.onnx text_encoder.map.json tokenizer_vocab.json tokenizer_merges.txt; do
+            curl -fsSL -o jt/base/$f https://github.com/${{ github.repository }}/releases/download/npu-models-v2/$f
+          done
+          javac -d jt/classes -cp "jt/lib/*" $(find app/src/main/java/com/micklab/llamaimage/npu scripts/npu-video/java-test -name '*.java' ! -name NpuManager.java ! -name NpuAssets.java)
+          java -Xmx6g -cp "jt/classes:jt/lib/*" com.micklab.llamaimage.npu.NpuVideoJavaTest vtemplates jt/base \
+            ck/ar181.safetensors ck/adl4.safetensors jt/out vasm vmodels/taesd_decoder_video.onnx \
+            "a woman walking on a beach at sunset, waves, wind in her hair"
+          cp jt/out/java_sheet.png vmodels/
+          rm -rf vasm jt/out
+
+      - name: Stage release assets
+        run: |
+          set -e
+          mkdir -p release
+          cp vtemplates/*.template.onnx vtemplates/*.map.json vmodels/taesd_decoder_video.onnx release/
+          curl -fsSL "https://huggingface.co/ByteDance/AnimateDiff-Lightning/raw/027c893eec01df7330f5d4b733bc9485ee02e8b2/LICENSE.md" \
+            -o release/LICENSE-AnimateDiff-Lightning-CreativeML-OpenRAIL-M.md
+          curl -fsSL https://raw.githubusercontent.com/madebyollin/taesd/main/LICENSE -o release/LICENSE-TAESD-MIT.txt
+          cat > release/README.txt <<'EOF'
+          Video UNet templates for llamaimage's NPU path (ONNX Runtime QNN EP, Hexagon HTP), experimental.
+          Static shapes: 8 frames x 256x256 (latents [8,4,32,32]), fp16 weights, float32 I/O, 3 chained parts.
+          The templates contain NO model weights: the app writes vunet_N.weights on the device from the
+          user's SD1.5 checkpoint and AnimateDiff-Lightning (ByteDance, 4-step diffusers file, CreativeML
+          OpenRAIL-M: https://huggingface.co/ByteDance/AnimateDiff-Lightning) — the use restrictions of
+          that license apply to the outputs. Only the motion modules' sinusoidal position tables are inline.
+          taesd_decoder_video.onnx: TAESD by Ollin Boer Bohan (madebyollin/taesd), MIT License.
+          Checksums: SHA256SUMS.
+          EOF
+          sed -i 's/^          //' release/README.txt
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -la release; cat release/SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "release $RELEASE_TAG exists — not republishing"; exit 0
+          fi
+          gh release create "$RELEASE_TAG" release/* --target "$GITHUB_SHA" --prerelease \
+            --title "NPU video v1: AnimateDiff-Lightning UNet templates (8 frames, 256px)" \
+            --notes-file release/README.txt
+
+      - name: Upload reference video
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: npu-video-reference
+          path: |
+            vmodels/*.gif
+            vmodels/*.png
+            release/SHA256SUMS

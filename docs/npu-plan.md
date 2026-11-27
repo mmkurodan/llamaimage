@@ -56,3 +56,24 @@ init image (img2img) ─ taesd_encoder.onnx ─ add noise ──┘             
 4. App: add the ORT-QNN dependency (+ NOTICE), Java NPU pipeline, backend choice CPU / GPU / NPU,
    first-run compile progress ("NPU 用に最適化中…"), fallback.
 5. Measure on the device (the DSP is not reachable from the proot dev shell — test in the app).
+
+## Video (experimental): AnimateDiff-Lightning
+
+Status: host-verified, device untested. Button 「NPU 動画（試験）」 in the 動画 tab.
+
+- Model: SD1.5 checkpoint (the selected NPU-capable model) + AnimateDiff-Lightning 4-step motion
+  module (ByteDance, CreativeML OpenRAIL-M, HF commit-pinned, 907 MB, downloaded by the app).
+  Euler, "trailing" timesteps (999/749/499/249), **linear** betas, CFG 1 → one UNet pass per step.
+- Static shape 8 frames × 256 px: sample `[8,4,32,32]` (frames = batch), timestep `[1]`,
+  encoder_hidden_states `[1,77,768]` (broadcast inside). Same 3-part split and tensor names as the
+  image UNet; fp16 weights 1103 / 541 / 981 MB (motion modules +906 MB in total).
+- HTP-friendly export (`scripts/npu-video/animatediff_parts.py`): the motion module's 5-D
+  reshapes/permutes rewritten at rank ≤ 4; attention as plain `softmax(q·s @ kᵀ) @ v` with a
+  constant scale (no Shape-derived scale, no folded zero score tensor).
+- On-device conversion like the image path: `vunet_N.template.onnx` + map (keys `motion:*` come
+  from the motion file, the rest from the checkpoint); only the sinusoidal position tables
+  `[1,8,C]` are inline. Release `npu-video-v1` (workflow "NPU video models").
+- Only the UNet runs on the HTP; text encoder (shared with the image model dir) and a 256 px TAESD
+  decoder run on the ORT CPU provider. The image model is released before the test.
+- Host results (ORT-CPU, same ONNX): parts vs diffusers max diff 0.006 (fp16), ORT vs PyTorch
+  cos 0.99998, 15 s/step on CPU. Device: compile memory (parts up to 1.1 GB) and s/step unknown.
