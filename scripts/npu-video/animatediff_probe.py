@@ -114,6 +114,8 @@ def main():
         ref = unet(xs, ts, eh.repeat_interleave(tf, 0), return_dict=False)[0]      # [1,4,F,h,w]
         n = adp.patch_4d(unet)
         unet.set_attn_processor(adp.PlainAttnProcessor())   # ref above used diffusers' default (SDPA)
+        n_t = adp.patch_temporal_attention(unet)             # motion modules: no batched MatMul
+        print(f"[probe] temporal attentions rewritten without MatMul: {n_t}")
         x4 = xs[0].permute(1, 0, 2, 3).contiguous()                               # [F,4,h,w]
         _, chained = adp.run_chain(adp.parts(unet, tf, a.budget_mb), x4, ts, eh)
     ref4 = ref[0].permute(1, 0, 2, 3)

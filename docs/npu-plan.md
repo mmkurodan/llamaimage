@@ -77,3 +77,9 @@ Status: host-verified, device untested. Button 「NPU 動画（試験）」 in t
   decoder run on the ORT CPU provider. The image model is released before the test.
 - Host results (ORT-CPU, same ONNX): parts vs diffusers max diff 0.006 (fp16), ORT vs PyTorch
   cos 0.99998, 15 s/step on CPU. Device: compile memory (parts up to 1.1 GB) and s/step unknown.
+
+Device findings (SM8850): a 1.1 GB and then a 397 MB video part were killed while compiling (RSS
+grew ~2 GB / 3 s at the end of the HTP finalize). One-layer-per-part diagnosis: every layer up to
+`d0.mm0` compiled in seconds (<0.7 GB), `d0.mm0` (motion module, 5 MB of weights) grew past 5 GB.
+Its temporal attention was a batched MatMul of H·W·heads = 8192 tiny 8×8 products; it is now
+written as F Mul+ReduceSum / Mul+Add steps (`TemporalElementwiseAttnProcessor`, same math).

@@ -59,6 +59,52 @@ def patch_4d(unet):
     return n
 
 
+class TemporalElementwiseAttnProcessor:
+    """Motion-module (temporal) self-attention without MatMul: the sequence is the F frames of one
+    pixel (F = 8), the batch is H*W pixels. As a batched MatMul that is H*W*heads tiny F x F
+    products (8192 at the 256 px top level), and the HTP compile of that one 5 MB layer grew
+    > 5 GB on the device (2026-11-27). Same math with F Mul + ReduceSum for the scores and F
+    Mul + Add for the output, all rank <= 4:
+        s[p,i,h,j] = sum_d q[p,i,h,d] * k[p,j,h,d] * scale ;  w = softmax_j(s)
+        o[p,i,h,:] = sum_j w[p,i,h,j] * v[p,j,h,:]
+    """
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None,
+                 *args, **kwargs):
+        assert attention_mask is None and attn.spatial_norm is None and attn.group_norm is None
+        ctx = hidden_states if encoder_hidden_states is None else encoder_hidden_states
+        q, k, v = attn.to_q(hidden_states), attn.to_k(ctx), attn.to_v(ctx)
+        p, n, inner = q.shape
+        m, hd = ctx.shape[1], attn.heads
+        d = inner // hd
+        q = (q * attn.scale).reshape(p, n, hd, d)                       # [p, n, h, d]
+        k = k.reshape(p, m, hd, d)
+        v = v.reshape(p, m, hd, d)
+        s = torch.cat([(q * k[:, j:j + 1]).sum(dim=-1, keepdim=True) for j in range(m)], dim=-1)  # [p,n,h,m]
+        w = torch.softmax(s, dim=-1)
+        o = w[..., 0:1] * v[:, 0:1]
+        for j in range(1, m):
+            o = o + w[..., j:j + 1] * v[:, j:j + 1]                     # [p, n, h, d]
+        o = o.reshape(p, n, inner)
+        o = attn.to_out[1](attn.to_out[0](o))
+        if attn.residual_connection:
+            o = o + hidden_states
+        return o / attn.rescale_output_factor
+
+
+def patch_temporal_attention(unet):
+    """Motion-module attentions -> TemporalElementwiseAttnProcessor (after set_attn_processor)."""
+    from diffusers.models.unets.unet_motion_model import AnimateDiffTransformer3D
+    n = 0
+    for mod in unet.modules():
+        if isinstance(mod, AnimateDiffTransformer3D):
+            for sub in mod.modules():
+                if hasattr(sub, "set_processor") and hasattr(sub, "to_q"):
+                    sub.set_processor(TemporalElementwiseAttnProcessor())
+                    n += 1
+    return n
+
+
 class PlainAttnProcessor:
     """softmax((q * scale) @ k^T) @ v with a constant scale and rank <= 4 tensors: no Shape-derived
     1/sqrt(d) (SDPA export) and no zero score tensor (AttnProcessor's baddbmm folds into a
