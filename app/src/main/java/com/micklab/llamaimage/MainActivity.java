@@ -251,7 +251,12 @@ public class MainActivity extends Activity {
         store = new ModelStore(this);
         loadSettings();
         String prevLog = previousLogTail(80);
-        boolean npuCrashed = prefs().getBoolean(PREFS_NPU_PENDING, false);
+        // The "pending" crash guards only mean a crash when the PROCESS is new: the activity can be
+        // recreated while the old worker is still compiling (2026-11-28: a second "起動" during an
+        // NPU compile switched to CPU and could have marked a video part as failed).
+        boolean freshProcess = !sProcessStarted;
+        sProcessStarted = true;
+        boolean npuCrashed = freshProcess && prefs().getBoolean(PREFS_NPU_PENDING, false);
         if (npuCrashed) {
             // The previous NPU preparation never finished (the process died): don't retry it
             // automatically, or the app is stuck in "NPU を準備中…" on every launch.
@@ -270,7 +275,7 @@ public class MainActivity extends Activity {
             String why = lastExitReason();
             if (why != null) appendLog(why);
         }
-        if (prefs().getBoolean(PREFS_NPU_VIDEO_PENDING, false)) {
+        if (freshProcess && prefs().getBoolean(PREFS_NPU_VIDEO_PENDING, false)) {
             prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).apply();
             String part = prefs().getString(PREFS_NPU_VIDEO_COMPILING, null);
             String dog = prefs().getString(PREFS_NPU_VIDEO_WATCHDOG, null);
@@ -4162,7 +4167,9 @@ public class MainActivity extends Activity {
     }
 
     private static final String APP_LOG = "app_log.txt";
-    private static final String PREFS_NPU_PENDING = "npu_load_pending";   // set while an NPU load runs
+    private static final String PREFS_NPU_PENDING = "npu_load_pending";
+    /** Set by the first onCreate of this process (later ones are activity re-creations). */
+    private static volatile boolean sProcessStarted;   // set while an NPU load runs
 
     /** Also appended to files/app_log.txt so the next launch can show what happened before a crash. */
     private void persistLog(String line) {
