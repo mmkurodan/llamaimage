@@ -52,7 +52,7 @@ def main():
     ck = make_template.load_checkpoint(a.checkpoint, ["model.diffusion_model."])
     ck.update(load_motion(a.motion))
     # The motion modules' positional encodings are sliced to the frame count at export ([1, F, C]
-    # constants). They match no stored tensor, are tiny and deterministic: keep them inline. Any
+    # constants, [F, 1, C] frame-major). They match no stored tensor, are tiny and deterministic: keep them inline. Any
     # other unmatched large initializer is still an error (it would ship checkpoint weights).
     must = make_template.MUST_MATCH_ELEMS
     make_template.MUST_MATCH_ELEMS = 1 << 62
@@ -72,7 +72,8 @@ def check_inline(path, must):
     for i in m.graph.initializer:
         n = int(np.prod(i.dims)) if i.dims else 1
         if i.data_location != TensorProto.EXTERNAL and n >= must:
-            if not (len(i.dims) == 3 and i.dims[0] == 1 and i.dims[1] <= 32):   # pos. encoding [1, F, C]
+            d = list(i.dims)   # pos. encoding [F, 1, C] (frame-major) or [1, F, C]
+            if not (len(d) == 3 and min(d[0], d[1]) == 1 and max(d[0], d[1]) <= 32):
                 bad.append((i.name, list(i.dims)))
     if bad:
         raise SystemExit(f"[template] {path}: unmatched initializers (not positional encodings): {bad[:10]}")

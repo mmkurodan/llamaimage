@@ -7,7 +7,7 @@ encoder_hidden_states [1,77,768] are shared by all frames and broadcast inside t
 
 HTP friendliness: diffusers' motion module (AnimateDiffTransformer3D) goes through 5-D tensors
 ([B,C,F,H,W] for the GroupNorm, [B,H,W,F,C] permutes). `patch_4d` replaces its forward with an
-equivalent that stays at rank <= 4 (B = 1 is fixed), checked against the original in the probe.
+equivalent that stays at rank <= 4 (B = 1 is fixed) with frame-major tokens [F, H*W, C], checked against the original in the probe.
 
 Parts: the UNet is flattened into LAYERS (conv_in+time embedding, every resnet / spatial
 attention / motion module / down- or upsampler, the mid block's layers, conv_out) and greedily
@@ -32,21 +32,29 @@ DEFAULT_BUDGET_MB = 450
 
 def _temporal_forward_4d(self, hidden_states, encoder_hidden_states=None, timestep=None,
                          class_labels=None, num_frames=1, cross_attention_kwargs=None):
-    # hidden_states [F,C,H,W] (batch 1). Same math as AnimateDiffTransformer3D.forward.
+    # hidden_states [F,C,H,W] (batch 1). Same math as AnimateDiffTransformer3D.forward, but the
+    # tokens stay FRAME-MAJOR [F, H*W, C] (the layout of the spatial transformers, which compile
+    # fine on the HTP) instead of diffusers' [H*W, F, C]: with H*W as the leading (batch) axis every
+    # Linear / LayerNorm / attention op became a 1024-batch of tiny 8-row ops, and the HTP compile
+    # of that 5 MB layer grew > 5 GB on the device (v3, and v4 even without the attention MatMul).
     f, c, h, w = hidden_states.shape
     residual = hidden_states
     # GroupNorm over (C groups) x (F,H,W): as [1, C, F*H*W]
     x = hidden_states.permute(1, 0, 2, 3).reshape(1, c, f * h * w)
     x = self.norm(x)
-    # -> [H*W, F, C]
-    x = x.reshape(c, f, h * w).permute(2, 1, 0)
+    x = x.reshape(c, f, h * w).permute(1, 2, 0)      # -> [F, H*W, C]
     x = self.proj_in(input=x)
     for block in self.transformer_blocks:
         x = block(hidden_states=x, encoder_hidden_states=encoder_hidden_states, timestep=timestep,
                   cross_attention_kwargs=cross_attention_kwargs, class_labels=class_labels)
-    x = self.proj_out(input=x)                       # [H*W, F, C]
-    x = x.permute(1, 2, 0).reshape(f, c, h, w)
+    x = self.proj_out(input=x)                       # [F, H*W, C]
+    x = x.permute(0, 2, 1).reshape(f, c, h, w)
     return x + residual
+
+
+def _pos_embed_frame_major(self, x):
+    # x [F, P, C]: the sinusoidal table indexed by frame = axis 0 (diffusers: axis 1 of [P, F, C])
+    return x + self.pe[0, :x.shape[0]].unsqueeze(1)
 
 
 def patch_4d(unet):
@@ -55,37 +63,38 @@ def patch_4d(unet):
     for m in unet.modules():
         if isinstance(m, AnimateDiffTransformer3D):
             m.forward = types.MethodType(_temporal_forward_4d, m)
+            for blk in m.transformer_blocks:
+                if blk.pos_embed is not None:
+                    blk.pos_embed.forward = types.MethodType(_pos_embed_frame_major, blk.pos_embed)
             n += 1
     return n
 
 
 class TemporalElementwiseAttnProcessor:
-    """Motion-module (temporal) self-attention without MatMul: the sequence is the F frames of one
-    pixel (F = 8), the batch is H*W pixels. As a batched MatMul that is H*W*heads tiny F x F
-    products (8192 at the 256 px top level), and the HTP compile of that one 5 MB layer grew
-    > 5 GB on the device (2026-11-27). Same math with F Mul + ReduceSum for the scores and F
-    Mul + Add for the output, all rank <= 4:
-        s[p,i,h,j] = sum_d q[p,i,h,d] * k[p,j,h,d] * scale ;  w = softmax_j(s)
-        o[p,i,h,:] = sum_j w[p,i,h,j] * v[p,j,h,:]
+    """Motion-module (temporal) self-attention on FRAME-MAJOR tokens [F, P, C] (see
+    _temporal_forward_4d): the sequence is axis 0 (F = 8 frames), P = H*W pixels. No MatMul,
+    no transpose: F Mul + ReduceSum for the scores and F Mul + Add for the output, rank <= 4:
+        s[i,p,h,j] = sum_d q[i,p,h,d] * k[j,p,h,d] * scale ;  w = softmax_j(s)
+        o[i,p,h,:] = sum_j w[i,p,h,j] * v[j,p,h,:]
     """
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None,
                  *args, **kwargs):
         assert attention_mask is None and attn.spatial_norm is None and attn.group_norm is None
-        ctx = hidden_states if encoder_hidden_states is None else encoder_hidden_states
-        q, k, v = attn.to_q(hidden_states), attn.to_k(ctx), attn.to_v(ctx)
-        p, n, inner = q.shape
-        m, hd = ctx.shape[1], attn.heads
+        assert encoder_hidden_states is None          # temporal self-attention only
+        q, k, v = attn.to_q(hidden_states), attn.to_k(hidden_states), attn.to_v(hidden_states)
+        f, p, inner = q.shape
+        hd = attn.heads
         d = inner // hd
-        q = (q * attn.scale).reshape(p, n, hd, d)                       # [p, n, h, d]
-        k = k.reshape(p, m, hd, d)
-        v = v.reshape(p, m, hd, d)
-        s = torch.cat([(q * k[:, j:j + 1]).sum(dim=-1, keepdim=True) for j in range(m)], dim=-1)  # [p,n,h,m]
+        q = (q * attn.scale).reshape(f, p, hd, d)                       # [f, p, h, d]
+        k = k.reshape(f, p, hd, d)
+        v = v.reshape(f, p, hd, d)
+        s = torch.cat([(q * k[j:j + 1]).sum(dim=-1, keepdim=True) for j in range(f)], dim=-1)  # [f,p,h,f]
         w = torch.softmax(s, dim=-1)
-        o = w[..., 0:1] * v[:, 0:1]
-        for j in range(1, m):
-            o = o + w[..., j:j + 1] * v[:, j:j + 1]                     # [p, n, h, d]
-        o = o.reshape(p, n, inner)
+        o = w[..., 0:1] * v[0:1]
+        for j in range(1, f):
+            o = o + w[..., j:j + 1] * v[j:j + 1]                        # [f, p, h, d]
+        o = o.reshape(f, p, inner)
         o = attn.to_out[1](attn.to_out[0](o))
         if attn.residual_connection:
             o = o + hidden_states
@@ -93,7 +102,8 @@ class TemporalElementwiseAttnProcessor:
 
 
 def patch_temporal_attention(unet):
-    """Motion-module attentions -> TemporalElementwiseAttnProcessor (after set_attn_processor)."""
+    """Motion-module attentions -> TemporalElementwiseAttnProcessor (after set_attn_processor).
+    Requires patch_4d (frame-major tokens)."""
     from diffusers.models.unets.unet_motion_model import AnimateDiffTransformer3D
     n = 0
     for mod in unet.modules():
