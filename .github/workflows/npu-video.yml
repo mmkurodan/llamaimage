@@ -2,7 +2,7 @@ name: NPU video models (AnimateDiff-Lightning)
 
 # 動画モデル（AnimateDiff-Lightning, 8 コマ x 256px）の NPU 用テンプレートを作る。SD1.5 UNet + 動きモジュールを
 # 静的形状 fp16 ONNX に書き出し、PyTorch と一致すること・端末と同じ組み立てがバイト一致することを確かめて
-# Release npu-video-v5 に公開する（重みは含まない。端末で SD1.5 モデル + 動きモジュールから組み立てる）。
+# Release npu-video-v6 に公開する（重みは含まない。端末で SD1.5 モデル + 動きモジュールから組み立てる）。
 on:
   workflow_dispatch:
   push:
@@ -14,8 +14,8 @@ permissions:
   contents: write
 
 env:
-  RELEASE_TAG: npu-video-v5
-  BUDGET_MB: '0'   # diagnostic: one layer per part (find the layer whose HTP compile explodes)
+  RELEASE_TAG: npu-video-v6
+  BUDGET_MB: '450'   # parts <= 450 MB (v5's one-layer-per-part diagnosis: every layer compiles)
   FRAMES: '8'
   SIZE: '256'
 
@@ -92,11 +92,11 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/madebyollin/taesd/main/LICENSE -o release/LICENSE-TAESD-MIT.txt
           cat > release/README.txt <<'EOF'
           Video UNet templates for llamaimage's NPU path (ONNX Runtime QNN EP, Hexagon HTP), experimental.
-          Static shapes: 8 frames x 256x256 (latents [8,4,32,32]), fp16 weights, float32 I/O, ONE LAYER PER PART (diagnostic build: the
+          Static shapes: 8 frames x 256x256 (latents [8,4,32,32]), fp16 weights, float32 I/O, parts of <= 450 MB of layers (the
           HTP compile of a 397 MB part blew up to >8 GB; the culprit was the motion modules' temporal
           attention as batched MatMul; v4 made it elementwise and d0.mm0 still blew up, so v5 keeps the
           motion-module tokens frame-major [F, H*W, C] like the spatial transformers; video_parts.json
-          names each part's layer).
+          names each part's layers). v5 (one layer per part) compiled all 67 layers on the device.
           The templates contain NO model weights: the app writes vunet_N.weights on the device from the
           user's SD1.5 checkpoint and AnimateDiff-Lightning (ByteDance, 4-step diffusers file, CreativeML
           OpenRAIL-M: https://huggingface.co/ByteDance/AnimateDiff-Lightning) — the use restrictions of
@@ -116,7 +116,7 @@ jobs:
             echo "release $RELEASE_TAG exists — not republishing"; exit 0
           fi
           gh release create "$RELEASE_TAG" release/* --target "$GITHUB_SHA" --prerelease \
-            --title "NPU video v5 (diagnostic): one layer per part, frame-major motion modules (8 frames, 256px)" \
+            --title "NPU video v6: parts <= 450 MB, frame-major motion modules (8 frames, 256px)" \
             --notes-file release/README.txt
 
       - name: Upload reference video

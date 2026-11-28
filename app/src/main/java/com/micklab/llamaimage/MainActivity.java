@@ -2381,6 +2381,36 @@ public class MainActivity extends Activity {
      * model + the motion module on first use, compiles it for the HTP (cached), generates 8 frames
      * at 256 px in 4 steps and saves an MP4. Logs time and memory of every stage.
      */
+    /** Full log of one NPU video test in Download/llamaimage (the in-app log keeps only the tail). */
+    private volatile java.io.Writer vLogFile;
+    private String vLogName;
+
+    private void openVideoLog() {
+        closeVideoLog();
+        if (Build.VERSION.SDK_INT < 29) return;
+        try {
+            vLogName = "llamaimage_npu_video_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".txt";
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Downloads.DISPLAY_NAME, vLogName);
+            cv.put(MediaStore.Downloads.MIME_TYPE, "text/plain");
+            cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/llamaimage");
+            Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            OutputStream os = u == null ? null : getContentResolver().openOutputStream(u);
+            if (os != null) vLogFile = new java.io.OutputStreamWriter(os, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (RuntimeException | IOException e) {
+            vLogFile = null;
+        }
+    }
+
+    private void closeVideoLog() {
+        java.io.Writer w = vLogFile;
+        vLogFile = null;
+        if (w != null) try {
+            w.close();
+        } catch (IOException ignore) {
+        }
+    }
+
     private void startNpuVideoTest() {
         if (isBusy()) {
             Toast.makeText(this, "処理中です", Toast.LENGTH_SHORT).show();
@@ -2418,7 +2448,9 @@ public class MainActivity extends Activity {
         setStatus("NPU 動画（試験）: 準備中…");
         final PromptTranslator tr = translator();
         final long t0 = SystemClock.elapsedRealtime();
-        appendLog("NPU 動画（試験）: 開始 " + spec.title + " / " + memInfo());
+        openVideoLog();
+        appendLog("NPU 動画（試験）: 開始 " + spec.title + " / " + memInfo()
+                + (vLogFile != null ? "（全ログ: Download/llamaimage/" + vLogName + "）" : ""));
         worker.submit(() -> {
             String error = null;
             Uri uri = null;
@@ -2509,6 +2541,10 @@ public class MainActivity extends Activity {
                 appendLogUi("NPU 動画: seed " + seed + "、prompt \"" + prompt + "\"");
             } catch (Throwable t) {
                 error = t.getMessage() != null ? t.getMessage() : t.toString();
+                String[] st = android.util.Log.getStackTraceString(t).split("\n");
+                StringBuilder sb = new StringBuilder("NPU 動画: 例外 " + t.getClass().getName());
+                for (int i = 0; i < Math.min(st.length, 12); i++) sb.append("\n    ").append(st[i].trim());
+                appendLogUi(sb.toString());
             } finally {
                 if (vp != null) vp.close();
                 prefs().edit().putBoolean(PREFS_NPU_VIDEO_PENDING, false).commit();
@@ -2527,7 +2563,11 @@ public class MainActivity extends Activity {
                 } else {
                     appendLog("NPU 動画（試験）: " + err);
                     finishGeneration("NPU 動画（試験）失敗 — " + err);
+                    new AlertDialog.Builder(this).setTitle("NPU 動画（試験）失敗")
+                            .setMessage(err + (vLogName != null ? "\n\n全ログ: Download/llamaimage/" + vLogName : ""))
+                            .setPositiveButton("OK", null).show();
                 }
+                closeVideoLog();
                 ensureModelLoaded();   // the image model was released for the test
             });
         });
@@ -4209,6 +4249,14 @@ public class MainActivity extends Activity {
     private void appendLog(String msg) {
         if (msg == null || logText == null) return;
         persistLog(msg.trim());
+        java.io.Writer vl = vLogFile;
+        if (vl != null) {
+            try {
+                vl.write(new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + " " + msg.trim() + "\n");
+                vl.flush();   // survives a kill
+            } catch (IOException ignore) {
+            }
+        }
         logText.append(msg.endsWith("\n") ? msg : msg + "\n");
         CharSequence t = logText.getText();
         if (t.length() > MAX_LOG_CHARS) {
